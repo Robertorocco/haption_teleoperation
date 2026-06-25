@@ -92,7 +92,8 @@ install(FILES lib/libVirtuoseAPI.so
 # Deploys the Python executable scripts into the ROS 2 package library space
 install(PROGRAMS
   scripts/haption_plotter.py
-  scripts/haptic_force_manager.py
+  scripts/haptic_force_manager_battery.py
+  scripts/haptic_force_manager_tutorial.py
   scripts/teleop_demo_integrator.py
   scripts/teleop_triago.py
   scripts/teleop_triago_clutch.py 
