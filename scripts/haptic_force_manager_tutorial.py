@@ -125,6 +125,20 @@ class HapticForceManager(Node):
         # --- Tunable Force Parameters ---
         self.Kp_sync = 10.0#15.0  
         self.Kd_sync = 0.0  #if global damping is added, set this to 0 to avoid overdamping
+        self.Kp_sync_ang = 0.3   # Nm/rad — orientation sync spring (handle -> real EE orientation)
+
+        # --- Adaptive sync authority (anti reference-runaway) ---
+        # When the cartesian REFERENCE drifts far from the REAL EE (the robot can't
+        # follow the guidance/CBF push), the pushing forces are attenuated so the
+        # sync spring takes over and reins the reference back in. The sync SHARE of
+        # the wrench grows linearly to SYNC_SHARE_AT_FULL at the "full" error
+        # (SYNC_FULL_POS_ERR / SYNC_FULL_ANG_ERR) and keeps growing up to
+        # SYNC_SHARE_CAP beyond it. Sync itself is never attenuated, so free-space
+        # tracking (small error -> share ~0) is unchanged.
+        self.SYNC_SHARE_AT_FULL = 0.5      # sync = 50% of the wrench at the full error
+        self.SYNC_FULL_POS_ERR  = 0.30     # m   "full" reference-real position error
+        self.SYNC_FULL_ANG_ERR  = np.pi / 2  # rad "full" reference-real orientation error (90 deg)
+        self.SYNC_SHARE_CAP     = 0.85     # max sync share beyond the full error
         self.K_cbf_force = 2.0   
         self.K_cbf_torque = 0.1  
         self.MAX_FORCE = 10.0 
@@ -493,7 +507,19 @@ class HapticForceManager(Node):
         # FIXED: Slice vel_haption to [0:3] to match the 3D spring array
         F_damped_haption = F_spring_haption - (self.Kd_sync * self.vel_haption[0:3])
         F_sync[0:3] = F_damped_haption
-        
+
+        # Orientation sync spring: pull the handle orientation toward the REAL EE
+        # orientation (not the reference). Critical for the anti-runaway balance —
+        # when the reference orientation flies away but the robot can't follow,
+        # this torque reins the handle back. R_err = R_real * R_target^T.
+        if self.rot_real is not None and self.rot_target is not None:
+            err_rot = R.from_matrix(
+                self.rot_real.as_matrix() @ self.rot_target.as_matrix().T).as_rotvec()
+            Tau_tiago = self.Kp_sync_ang * err_rot
+            F_sync[3] = -Tau_tiago[0]
+            F_sync[4] = -Tau_tiago[1]
+            F_sync[5] =  Tau_tiago[2]
+
         return F_sync
 
     def compute_F_cbf(self):
@@ -534,6 +560,22 @@ class HapticForceManager(Node):
             return 0.0
         x = min((p - lo) / (hi - lo), 1.0)
         return 3.0 * x**2 - 2.0 * x**3
+
+    @staticmethod
+    def _sync_share_factor(sync_mag, push_mag, share):
+        """Attenuation factor (<=1) for the pushing forces so the sync spring
+        reaches at least `share` of the (sync + push) magnitude.
+
+        Solve  sync / (sync + k*push) = share   ->   k = sync*(1-share)/(share*push).
+        Returns 1.0 (no attenuation) when share is negligible or magnitudes are
+        tiny; clamps to [0, 1] so it only ever weakens the pushers, never boosts.
+        """
+        if share <= 1e-3 or push_mag < 1e-6 or sync_mag < 1e-6:
+            return 1.0
+        max_push = sync_mag * (1.0 - share) / share
+        if push_mag > max_push:
+            return float(np.clip(max_push / push_mag, 0.0, 1.0))
+        return 1.0
     
     # Expected layout of /shared_autonomy/goal_names (published by triago_control):
     #   "Red_Top,Red_Side,Blue_Top,Blue_Side,Platform_Place"
@@ -738,8 +780,36 @@ class HapticForceManager(Node):
         f_fix = self.compute_F_fixture()
         f_vib = self.compute_F_limit_warning()
 
+        # --- ADAPTIVE SYNC AUTHORITY (anti reference-runaway) --------------- #
+        # When the reference (target) has drifted far from the real EE — i.e. the
+        # robot couldn't follow the push from guidance/CBF and the reference flew
+        # away — attenuate the PUSHING forces (cbf + guide + fix) so the sync
+        # spring's share of the wrench rises to SYNC_SHARE_AT_FULL at the full
+        # error and beyond (cap SYNC_SHARE_CAP), pulling the handle back to where
+        # the robot actually is and establishing an equilibrium. Sync is never
+        # attenuated; small error -> ~no attenuation -> free-space feel unchanged.
+        pos_err = (np.linalg.norm(self.pos_real - self.pos_target)
+                   if (self.pos_real is not None and self.pos_target is not None) else 0.0)
+        ang_err = 0.0
+        if self.rot_real is not None and self.rot_target is not None:
+            ang_err = float(np.linalg.norm(R.from_matrix(
+                self.rot_real.as_matrix() @ self.rot_target.as_matrix().T).as_rotvec()))
+        divergence = max(pos_err / self.SYNC_FULL_POS_ERR, ang_err / self.SYNC_FULL_ANG_ERR)
+        sync_share = min(self.SYNC_SHARE_AT_FULL * divergence, self.SYNC_SHARE_CAP)
+
+        push_force_mag  = np.linalg.norm(f_cbf[0:3] + f_guide[0:3] + f_fix[0:3])
+        push_torque_mag = np.linalg.norm(f_cbf[3:6] + f_guide[3:6] + f_fix[3:6])
+        k_f = self._sync_share_factor(np.linalg.norm(f_sync[0:3]), push_force_mag, sync_share)
+        k_t = self._sync_share_factor(np.linalg.norm(f_sync[3:6]), push_torque_mag, sync_share)
+        kvec = np.array([k_f, k_f, k_f, k_t, k_t, k_t])
+        # Scaled copies (do NOT mutate compute_* return values — f_cbf aliases the
+        # LPF state, mutating it would corrupt the filter).
+        f_cbf_s = f_cbf * kvec
+        f_guide_s = f_guide * kvec
+        f_fix_s = f_fix * kvec
+
         # Calculate the normal running force
-        f_total_normal = f_sync + f_cbf + f_guide + f_fix + f_vib
+        f_total_normal = f_sync + f_cbf_s + f_guide_s + f_fix_s + f_vib
 
         # --- AUTHORITY CAP -------------------------------------------------- #
         # Bound the MAGNITUDE of the assistive wrench so the autonomy can never
@@ -820,10 +890,11 @@ class HapticForceManager(Node):
         msg.torque.x, msg.torque.y, msg.torque.z = float(f_total[3]), float(f_total[4]), float(f_total[5])
         self.force_pub.publish(msg)
 
-        # Buffer Data for Plotting
+        # Buffer Data for Plotting (use the SCALED pushers so the % shares reflect
+        # what was actually sent after the adaptive-sync attenuation).
         t = time.time() - self.start_time
-        guide_comb = f_guide + f_fix   # guidance share = viscous guide + position fixture
-        components = {'Sync': f_sync, 'CBF': f_cbf, 'Guide': guide_comb, 'Limit': f_vib}
+        guide_comb = f_guide_s + f_fix_s   # guidance share = viscous guide + position fixture
+        components = {'Sync': f_sync, 'CBF': f_cbf_s, 'Guide': guide_comb, 'Limit': f_vib}
 
         # Per-source contribution share (% of summed component magnitudes).
         nF = {'Sync': np.linalg.norm(f_sync[0:3]),
