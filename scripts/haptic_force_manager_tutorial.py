@@ -40,11 +40,6 @@ class HapticForceManager(Node):
         self.MAX_CBF_FORCE = 15.0       # N (Maximum comfortable repulsion force)
         self.MAX_CBF_TORQUE = 1.0      # Nm (Maximum comfortable repulsion torque)
 
-        # --- NEW: Passivity Smoothing Parameters ---
-        # (velocity-measurement LPF removed: vel_haption is now used raw)
-        self.MAX_PC_FORCE = 5.0        # N (Max allowed PC damping force)
-        self.MAX_PC_TORQUE = 0.5       # Nm (Max allowed PC damping torque)
-
          # --- NEW: Inference State Variables ---
         self.goal_names = []
         self.goal_probs = []
@@ -81,10 +76,10 @@ class HapticForceManager(Node):
         self.fix_goal_pos = None
         self.fix_goal_rot = None
         self.fix_confidence = 0.0
-        self.K_fix_force  = 60.0      # N/m   position spring toward the grasp pose
-        self.K_fix_torque = 0.4       # Nm/rad orientation spring toward grasp orientation
-        self.MAX_FIX_FORCE  = 8.0     # N     saturation
-        self.MAX_FIX_TORQUE = 0.6     # Nm    saturation
+        self.K_fix_force  = 20.0      # N/m   position spring toward the grasp pose (gentle nudge)
+        self.K_fix_torque = 0.15      # Nm/rad orientation spring toward grasp orientation
+        self.MAX_FIX_FORCE  = 3.0     # N     saturation (just a slight end-of-approach help)
+        self.MAX_FIX_TORQUE = 0.25    # Nm    saturation
         self.FIX_CONF_LO = 0.55       # below this belief -> fixture OFF
         self.FIX_CONF_HI = 0.85       # at/above this belief -> full fixture
         self.alpha_fix = 0.15         # LPF on the fixture wrench (C0 continuity)
@@ -116,10 +111,6 @@ class HapticForceManager(Node):
         self.AMP_MAX = 0.07           # Nm torque at the inner boundary
         self.vib_toggle = 1.0         # Toggles between 1 and -1 every frame for 75Hz square wave
 
-        # --- NEW: Passivity Observer Variables ---
-        self.energy_observer = 0.0
-        self.ENABLE_PASSIVITY_CONTROL = False  # Toggle to apply or ignore the PC damping force
-
         # --- Tunable Force Parameters ---
         self.Kp_sync = 10.0#15.0  
         self.Kd_sync = 0.0  #if global damping is added, set this to 0 to avoid overdamping
@@ -128,25 +119,41 @@ class HapticForceManager(Node):
         self.MAX_FORCE = 10.0 
         self.MAX_TORQUE = 1.0 
 
+        # --- Assistive-wrench authority cap ---
+        # Hard ceiling on the MAGNITUDE of the assistive wrench (f_total_normal =
+        # sync + cbf + guide + fix). When the sum exceeds this, the WHOLE vector
+        # is scaled down proportionally — so the relative contribution proportions
+        # are preserved, but the autonomy can never overpower the operator. Tune
+        # these to set "how much the assistance is allowed to push".
+        self.MAX_TOTAL_FORCE  = 5.0   # N
+        self.MAX_TOTAL_TORQUE = 0.4   # Nm
+
         # --- Data Buffers & Synchronization ---
         self.plot_lock = threading.Lock()
         self.plot_window_sec = 10.0
         self.buffer_size = int(150 * self.plot_window_sec)
         self.t_data = deque(maxlen=self.buffer_size)
         self.start_time = time.time()
-        self.e_data = deque(maxlen=self.buffer_size) # NEW: Energy buffer
-        self.f_pc_data = deque(maxlen=self.buffer_size) # NEW: Tracks PC Force magnitude
-        self.t_pc_data = deque(maxlen=self.buffer_size) # NEW: Tracks PC Torque magnitude (Nm)
         self.v_lin_data = [deque(maxlen=self.buffer_size) for _ in range(3)]
         self.v_ang_data = [deque(maxlen=self.buffer_size) for _ in range(3)]
-        
+
+        # Per-component wrench history (Superposition window: no Total here).
         self.f_data = {
-            'Total': {'F': [deque(maxlen=self.buffer_size) for _ in range(3)], 'T': [deque(maxlen=self.buffer_size) for _ in range(3)]},
             'Sync':  {'F': [deque(maxlen=self.buffer_size) for _ in range(3)], 'T': [deque(maxlen=self.buffer_size) for _ in range(3)]},
             'CBF':   {'F': [deque(maxlen=self.buffer_size) for _ in range(3)], 'T': [deque(maxlen=self.buffer_size) for _ in range(3)]},
             'Guide': {'F': [deque(maxlen=self.buffer_size) for _ in range(3)], 'T': [deque(maxlen=self.buffer_size) for _ in range(3)]},
             'Limit': {'F': [deque(maxlen=self.buffer_size) for _ in range(3)], 'T': [deque(maxlen=self.buffer_size) for _ in range(3)]}
         }
+
+        # Dedicated f_total window: final published wrench + per-source % breakdown.
+        self.ftot_data = {'F': [deque(maxlen=self.buffer_size) for _ in range(3)],
+                          'T': [deque(maxlen=self.buffer_size) for _ in range(3)]}
+        self.pct_force  = {'Sync': deque(maxlen=self.buffer_size),
+                           'CBF':  deque(maxlen=self.buffer_size),
+                           'Guide': deque(maxlen=self.buffer_size)}
+        self.pct_torque = {'Sync': deque(maxlen=self.buffer_size),
+                           'CBF':  deque(maxlen=self.buffer_size),
+                           'Guide': deque(maxlen=self.buffer_size)}
 
         # --- ROS 2 Interfaces ---
         self.create_subscription(Float64MultiArray, '/arm_right/cartesian_reference', self.target_cb, 10)
@@ -172,19 +179,19 @@ class HapticForceManager(Node):
         self.timer = self.create_timer(self.dt, self.control_loop)
         
         self.setup_plot()
-        self.get_logger().info("Haptic Force Manager started. Max Freq (75Hz) Square Wave Vibration enabled.")
+        self.get_logger().info("Haptic Force Manager (tutorial) started.")
 
     # =========================
     # PLOT SETUP & UPDATE
     # =========================
     def setup_plot(self):
-        """Initializes the 5x2 grid of Matplotlib subplots for live drawing."""
+        """Initializes the live Matplotlib windows."""
         plt.ion()
-        self.fig, self.axs = plt.subplots(5, 2, figsize=(12, 11))
+        self.fig, self.axs = plt.subplots(4, 2, figsize=(12, 9))
         self.fig.canvas.manager.set_window_title('Haptic Force Superposition')
         
         self.lines = {}
-        categories = ['Total', 'Sync', 'CBF', 'Guide', 'Limit']
+        categories = ['Sync', 'CBF', 'Guide', 'Limit']
         colors = ['r', 'g', 'b']
         labels = ['X', 'Y', 'Z']
         
@@ -213,46 +220,61 @@ class HapticForceManager(Node):
 
         # Format X-axis for the bottom row only
         for col in range(2):
-            self.axs[4, col].set_xlabel("Time (s)")
+            self.axs[3, col].set_xlabel("Time (s)")
             
         self.fig.tight_layout()
-       # ========================================================
-        # --- Passivity Architecture Window (3 Stacked Subplots) ---
+
         # ========================================================
-        # Create a figure with 3 subplots. Top gets more vertical space.
-        self.fig_e, (self.ax_e, self.ax_fpc, self.ax_tpc) = plt.subplots(
-            3, 1, figsize=(8, 8), gridspec_kw={'height_ratios': [2, 1, 1]}
-        )
-        self.fig_e.canvas.manager.set_window_title('Passivity Architecture')
-        
-        # --- TOP SUBPLOT: Energy Observer ---
-        self.ax_e.set_title("Real-Time Energy Flow (PO)", fontsize=12, fontweight='bold')
-        self.ax_e.set_ylabel("Energy (Joules)")
-        
-        self.ax_e.axhspan(0, 1000, color='green', alpha=0.1, label='Passive Region (Safe)')
-        self.ax_e.axhspan(-1000, 0, color='red', alpha=0.1, label='Active Region')
-        self.ax_e.axhline(0, color='black', linestyle='--', linewidth=1.5)
-        
-        self.line_e, = self.ax_e.plot([], [], color='purple', linewidth=2.5, label='Observed Energy')
-        self.ax_e.legend(loc='upper right')
-        
-        # --- MIDDLE SUBPLOT: PC Force ---
-        self.ax_fpc.set_ylabel("PC Force (N)")
-        self.ax_fpc.grid(True, linestyle='--', alpha=0.6)
-        
-        # Continuous blue line
-        self.line_fpc, = self.ax_fpc.plot([], [], color='blue', linewidth=2.0, linestyle='-', label='||F_pc||')
-        self.ax_fpc.legend(loc='upper right')
-        
-        # --- BOTTOM SUBPLOT: PC Torque ---
-        self.ax_tpc.set_ylabel("PC Torque (Nm)")
-        self.ax_tpc.set_xlabel("Time (s)")
-        self.ax_tpc.grid(True, linestyle='--', alpha=0.6)
-        
-        # Continuous blue line
-        self.line_tpc, = self.ax_tpc.plot([], [], color='blue', linewidth=2.0, linestyle='-', label='||T_pc||')
-        self.ax_tpc.legend(loc='upper right')
-        self.fig_e.tight_layout()
+        # --- F_total Window (final published wrench + % breakdown) ---
+        # ========================================================
+        self.fig_tot, self.axs_tot = plt.subplots(4, 1, figsize=(9, 10))
+        self.fig_tot.canvas.manager.set_window_title('Total Wrench (published to device)')
+        colors = ['r', 'g', 'b']
+        labels = ['X', 'Y', 'Z']
+        src_colors = {'Sync': '#1f77b4', 'CBF': '#d62728', 'Guide': '#2ca02c'}
+
+        # Subplot 0: f_total FORCE components + ±MAX_TOTAL_FORCE dashed
+        ax = self.axs_tot[0]
+        ax.set_title("f_total — FORCE components (N)", fontsize=10, fontweight='bold')
+        ax.set_ylabel("Force (N)")
+        ax.grid(True, linestyle='--', alpha=0.6)
+        self.lines_ftot_F = [ax.plot([], [], color=colors[i], label=f"F{labels[i]}")[0] for i in range(3)]
+        ax.axhline( self.MAX_TOTAL_FORCE, color='k', linestyle='--', linewidth=1.0, alpha=0.7, label='±max')
+        ax.axhline(-self.MAX_TOTAL_FORCE, color='k', linestyle='--', linewidth=1.0, alpha=0.7)
+        ax.legend(loc='upper left', fontsize=8, ncol=4)
+
+        # Subplot 1: f_total TORQUE components + ±MAX_TOTAL_TORQUE dashed
+        ax = self.axs_tot[1]
+        ax.set_title("f_total — TORQUE components (Nm)", fontsize=10, fontweight='bold')
+        ax.set_ylabel("Torque (Nm)")
+        ax.grid(True, linestyle='--', alpha=0.6)
+        self.lines_ftot_T = [ax.plot([], [], color=colors[i], label=f"T{labels[i]}")[0] for i in range(3)]
+        ax.axhline( self.MAX_TOTAL_TORQUE, color='k', linestyle='--', linewidth=1.0, alpha=0.7, label='±max')
+        ax.axhline(-self.MAX_TOTAL_TORQUE, color='k', linestyle='--', linewidth=1.0, alpha=0.7)
+        ax.legend(loc='upper left', fontsize=8, ncol=4)
+
+        # Subplot 2: % of FORCE magnitude from each source
+        ax = self.axs_tot[2]
+        ax.set_title("Force contribution share (%)", fontsize=10, fontweight='bold')
+        ax.set_ylabel("%")
+        ax.set_ylim(0, 100)
+        ax.grid(True, linestyle='--', alpha=0.6)
+        self.lines_pctF = {k: ax.plot([], [], color=src_colors[k], label=k)[0]
+                           for k in ['Sync', 'CBF', 'Guide']}
+        ax.legend(loc='upper left', fontsize=8, ncol=3)
+
+        # Subplot 3: % of TORQUE magnitude from each source
+        ax = self.axs_tot[3]
+        ax.set_title("Torque contribution share (%)", fontsize=10, fontweight='bold')
+        ax.set_ylabel("%")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylim(0, 100)
+        ax.grid(True, linestyle='--', alpha=0.6)
+        self.lines_pctT = {k: ax.plot([], [], color=src_colors[k], label=k)[0]
+                           for k in ['Sync', 'CBF', 'Guide']}
+        ax.legend(loc='upper left', fontsize=8, ncol=3)
+
+        self.fig_tot.tight_layout()
 
         # ========================================================
         # --- Twist Analyzer Window (2 Stacked Subplots) ---
@@ -297,87 +319,71 @@ class HapticForceManager(Node):
             if len(self.t_data) == 0:
                 return
             t_list = list(self.t_data)
-            e_list = list(self.e_data) # NEW: Extract energy data
-            fpc_list = list(self.f_pc_data) # NEW: Extract PC Force
-            tpc_list = list(self.t_pc_data) # NEW: Extract PC Torque
             f_lists = {
                 cat: {
                     'F': [list(self.f_data[cat]['F'][i]) for i in range(3)],
                     'T': [list(self.f_data[cat]['T'][i]) for i in range(3)]
-                } for cat in ['Total', 'Sync', 'CBF', 'Guide', 'Limit']
+                } for cat in ['Sync', 'CBF', 'Guide', 'Limit']
             }
-
+            ftot_F = [list(self.ftot_data['F'][i]) for i in range(3)]
+            ftot_T = [list(self.ftot_data['T'][i]) for i in range(3)]
+            pctF = {k: list(self.pct_force[k]) for k in ['Sync', 'CBF', 'Guide']}
+            pctT = {k: list(self.pct_torque[k]) for k in ['Sync', 'CBF', 'Guide']}
             v_lin_lists = [list(self.v_lin_data[i]) for i in range(3)]
             v_ang_lists = [list(self.v_ang_data[i]) for i in range(3)]
 
         # 2. Update Matplotlib outside the lock to prevent stalling the ROS 2 loop
         current_t = t_list[-1]
-        
-        for row, cat in enumerate(['Total', 'Sync', 'CBF', 'Guide', 'Limit']):
-            # Update Forces
+        win = (current_t - self.plot_window_sec, current_t)
+
+        # --- Superposition window (Sync / CBF / Guide / Limit) ---
+        for row, cat in enumerate(['Sync', 'CBF', 'Guide', 'Limit']):
             for i in range(3):
                 self.lines[cat]['F'][i].set_data(t_list, f_lists[cat]['F'][i])
-            self.axs[row, 0].set_xlim(current_t - self.plot_window_sec, current_t)
+            self.axs[row, 0].set_xlim(*win)
             self.axs[row, 0].relim()
             self.axs[row, 0].autoscale_view(scalex=False, scaley=True)
 
-            # Update Torques
             for i in range(3):
                 self.lines[cat]['T'][i].set_data(t_list, f_lists[cat]['T'][i])
-            self.axs[row, 1].set_xlim(current_t - self.plot_window_sec, current_t)
+            self.axs[row, 1].set_xlim(*win)
             self.axs[row, 1].relim()
             self.axs[row, 1].autoscale_view(scalex=False, scaley=True)
 
-        ## --- Update Passivity Windows ---
-        self.line_e.set_data(t_list, e_list)
-        self.line_fpc.set_data(t_list, fpc_list) 
-        self.line_tpc.set_data(t_list, tpc_list) 
-        
-        current_t = t_list[-1]
-        
-        # 1. Update Top Subplot (Energy)
-        self.ax_e.set_xlim(current_t - self.plot_window_sec, current_t)
-        if len(e_list) > 0:
-            min_e, max_e = min(e_list), max(e_list)
-            pad = max(abs(max_e - min_e) * 0.1, 0.1)
-            self.ax_e.set_ylim(min(min_e - pad, -0.2), max(max_e + pad, 0.2))
-            
-        # 2. Update Middle Subplot (Force)
-        self.ax_fpc.set_xlim(current_t - self.plot_window_sec, current_t)
-        if len(fpc_list) > 0:
-            max_f = max(fpc_list)
-            self.ax_fpc.set_ylim(-0.1, max(max_f * 1.2, 1.0))
+        # --- F_total window ---
+        for i in range(3):
+            self.lines_ftot_F[i].set_data(t_list, ftot_F[i])
+            self.lines_ftot_T[i].set_data(t_list, ftot_T[i])
+        for k in ['Sync', 'CBF', 'Guide']:
+            self.lines_pctF[k].set_data(t_list, pctF[k])
+            self.lines_pctT[k].set_data(t_list, pctT[k])
 
-        # 3. Update Bottom Subplot (Torque)
-        self.ax_tpc.set_xlim(current_t - self.plot_window_sec, current_t)
-        if len(tpc_list) > 0:
-            max_t = max(tpc_list)
-            self.ax_tpc.set_ylim(-0.01, max(max_t * 1.2, 0.1))
-            
-        # ========================================================
-        # --- Update Twist Window ---
-        # ========================================================
-        current_t = t_list[-1]
-        
-        # 1. Update Linear Velocity Plot
+        # Force components: y-range pinned a little beyond the cap for context
+        self.axs_tot[0].set_xlim(*win)
+        self.axs_tot[0].set_ylim(-self.MAX_TOTAL_FORCE * 1.4, self.MAX_TOTAL_FORCE * 1.4)
+        self.axs_tot[1].set_xlim(*win)
+        self.axs_tot[1].set_ylim(-self.MAX_TOTAL_TORQUE * 1.4, self.MAX_TOTAL_TORQUE * 1.4)
+        self.axs_tot[2].set_xlim(*win)
+        self.axs_tot[3].set_xlim(*win)
+
+        self.fig_tot.canvas.draw_idle()
+
+        # --- Twist window ---
         for i in range(3):
             self.lines_v_lin[i].set_data(t_list, v_lin_lists[i])
-            
-        self.ax_v_lin.set_xlim(current_t - self.plot_window_sec, current_t)
+        self.ax_v_lin.set_xlim(*win)
         self.ax_v_lin.relim()
         self.ax_v_lin.autoscale_view(scalex=False, scaley=True)
 
-        # 2. Update Angular Velocity Plot
         for i in range(3):
             self.lines_v_ang[i].set_data(t_list, v_ang_lists[i])
-            
-        self.ax_v_ang.set_xlim(current_t - self.plot_window_sec, current_t)
+        self.ax_v_ang.set_xlim(*win)
         self.ax_v_ang.relim()
         self.ax_v_ang.autoscale_view(scalex=False, scaley=True)
 
         self.fig_v.canvas.draw_idle()
-        
-        # Flush events once at the very end to update all 3 windows simultaneously
+
+        # Flush events once at the very end to update all windows simultaneously
         self.fig.canvas.flush_events()
 
     # =========================
@@ -664,28 +670,31 @@ class HapticForceManager(Node):
         return self.f_fix_filtered.copy()
 
     def compute_F_limit_warning(self):
-        """Calculates a 75Hz square wave rumble with variable intensity inside a specific boundary zone."""
+        """Joint-limit vibration warning — DISABLED for now (returns zero wrench).
+
+        The 75 Hz square-wave rumble is commented out pending a redesign of the
+        vibration pattern. Kept as a no-op so the force-superposition pipeline and
+        the 'Limit' plot trace stay structurally intact.
+        """
         F_vib = np.zeros(6)
-        
-        dist_to_min = self.joint_pos - self.joint_min
-        dist_to_max = self.joint_max - self.joint_pos
-        min_margin = np.min(np.concatenate([dist_to_min, dist_to_max]))
-
-        if min_margin <= self.LIMIT_OUTER:
-            
-            if min_margin <= self.LIMIT_INNER:
-                amplitude = self.AMP_MAX
-            else:
-                ratio = (self.LIMIT_OUTER - min_margin) / (self.LIMIT_OUTER - self.LIMIT_INNER)
-                amplitude = self.AMP_MIN + ratio * (self.AMP_MAX - self.AMP_MIN)
-            
-            self.vib_toggle *= -1.0
-            
-            F_vib[3] = amplitude * self.vib_toggle
-            F_vib[4] = amplitude * self.vib_toggle
-            F_vib[5] = amplitude * self.vib_toggle
-
         return F_vib
+
+        # --- VIBRATION SIGNAL (commented out) ---
+        # dist_to_min = self.joint_pos - self.joint_min
+        # dist_to_max = self.joint_max - self.joint_pos
+        # min_margin = np.min(np.concatenate([dist_to_min, dist_to_max]))
+        #
+        # if min_margin <= self.LIMIT_OUTER:
+        #     if min_margin <= self.LIMIT_INNER:
+        #         amplitude = self.AMP_MAX
+        #     else:
+        #         ratio = (self.LIMIT_OUTER - min_margin) / (self.LIMIT_OUTER - self.LIMIT_INNER)
+        #         amplitude = self.AMP_MIN + ratio * (self.AMP_MAX - self.AMP_MIN)
+        #     self.vib_toggle *= -1.0
+        #     F_vib[3] = amplitude * self.vib_toggle
+        #     F_vib[4] = amplitude * self.vib_toggle
+        #     F_vib[5] = amplitude * self.vib_toggle
+        # return F_vib
 
     # =========================
     # MAIN LOOP
@@ -700,6 +709,18 @@ class HapticForceManager(Node):
 
         # Calculate the normal running force
         f_total_normal = f_sync + f_cbf + f_guide + f_fix + f_vib
+
+        # --- AUTHORITY CAP -------------------------------------------------- #
+        # Bound the MAGNITUDE of the assistive wrench so the autonomy can never
+        # overpower the operator. Scaling the whole vector preserves the relative
+        # proportions of sync/cbf/guide/fix (the "feel" we tuned) while limiting
+        # the total push to MAX_TOTAL_FORCE / MAX_TOTAL_TORQUE.
+        f_norm = np.linalg.norm(f_total_normal[0:3])
+        if f_norm > self.MAX_TOTAL_FORCE:
+            f_total_normal[0:3] *= self.MAX_TOTAL_FORCE / f_norm
+        t_norm = np.linalg.norm(f_total_normal[3:6])
+        if t_norm > self.MAX_TOTAL_TORQUE:
+            f_total_normal[3:6] *= self.MAX_TOTAL_TORQUE / t_norm
 
         # ========================================================
         # CLUTCHING ARCHITECTURE & ALIGNMENT GUIDANCE
@@ -758,42 +779,6 @@ class HapticForceManager(Node):
         f_total[3:6] -= Kd_global_ang * self.vel_haption[3:6]
 
         # ========================================================
-        # PASSIVITY OBSERVER (PO)
-        # ========================================================
-        # Power = - (Wrench dot Twist). 6D dot product.
-        power = -np.dot(f_total, self.vel_haption)
-        self.energy_observer += power * self.dt
-
-        # ========================================================
-        # FULL 6D PASSIVITY CONTROLLER (PC)
-        # ========================================================
-        f_pc = np.zeros(6) 
-
-        if self.energy_observer < 0.0:
-            v_squared = np.dot(self.vel_haption, self.vel_haption)
-            
-            # Increased threshold to prevent division by near-zero
-            if v_squared > 1e-4: 
-                beta = -self.energy_observer / (v_squared * self.dt)
-                
-                # 1. Calculate raw damping required
-                f_pc_raw = -beta * self.vel_haption
-                
-                # 2. SATURATE THE BRAKE: Prevent massive hammer blows
-                f_pc[0:3] = np.clip(f_pc_raw[0:3], -self.MAX_PC_FORCE, self.MAX_PC_FORCE)
-                f_pc[3:6] = np.clip(f_pc_raw[3:6], -self.MAX_PC_TORQUE, self.MAX_PC_TORQUE)
-                
-                if self.ENABLE_PASSIVITY_CONTROL:
-                    f_total += f_pc
-            
-            # 3. SMOOTH RESET: Decay the energy instead of snapping to 0.0
-            # This prevents the PC from toggling on and off every other tick
-            self.energy_observer *= 0.1 
-            
-        else:
-            self.energy_observer *= 0.99
-
-        # ========================================================
         # CLIPPING & PUBLISHING
         # ========================================================
         f_total[0:3] = np.clip(f_total[0:3], -self.MAX_FORCE, self.MAX_FORCE)
@@ -806,26 +791,39 @@ class HapticForceManager(Node):
 
         # Buffer Data for Plotting
         t = time.time() - self.start_time
-        components = {'Total': f_total, 'Sync': f_sync, 'CBF': f_cbf, 'Guide': f_guide + f_fix, 'Limit': f_vib}
-        
+        guide_comb = f_guide + f_fix   # guidance share = viscous guide + position fixture
+        components = {'Sync': f_sync, 'CBF': f_cbf, 'Guide': guide_comb, 'Limit': f_vib}
+
+        # Per-source contribution share (% of summed component magnitudes).
+        nF = {'Sync': np.linalg.norm(f_sync[0:3]),
+              'CBF':  np.linalg.norm(f_cbf[0:3]),
+              'Guide': np.linalg.norm(guide_comb[0:3])}
+        nT = {'Sync': np.linalg.norm(f_sync[3:6]),
+              'CBF':  np.linalg.norm(f_cbf[3:6]),
+              'Guide': np.linalg.norm(guide_comb[3:6])}
+        sF = sum(nF.values())
+        sT = sum(nT.values())
+
         # Lock the buffer modification to prevent matplotlib from reading a partially updated structure
         with self.plot_lock:
             self.t_data.append(t)
-            self.e_data.append(self.energy_observer)
-            # Calculate and store the magnitudes of the PC damping wrench
-            self.f_pc_data.append(np.linalg.norm(f_pc[0:3])) # Linear Force (N)
-            self.t_pc_data.append(np.linalg.norm(f_pc[3:6])) # Angular Torque (Nm)
-            # 2. Append Force Dictionaries (5 force categories per frame)
+            # Per-component wrench (Superposition window)
             for cat, force_vec in components.items():
                 for i in range(3):
-                    self.f_data[cat]['F'][i].append(force_vec[i])     
-                    self.f_data[cat]['T'][i].append(force_vec[i+3])
-
-            # 3. Append 6D Velocity Components (1 loop per frame)
-            # CAUTION: Ensure this is NOT indented inside the force loop above!
+                    self.f_data[cat]['F'][i].append(force_vec[i])
+                    self.f_data[cat]['T'][i].append(force_vec[i + 3])
+            # Final published total wrench (F_total window)
             for i in range(3):
-                self.v_lin_data[i].append(self.vel_haption[i])     # Indices 0, 1, 2
-                self.v_ang_data[i].append(self.vel_haption[i+3])   # Indices 3, 4, 5
+                self.ftot_data['F'][i].append(f_total[i])
+                self.ftot_data['T'][i].append(f_total[i + 3])
+            # Contribution shares (%)
+            for k in ['Sync', 'CBF', 'Guide']:
+                self.pct_force[k].append(100.0 * nF[k] / sF if sF > 1e-9 else 0.0)
+                self.pct_torque[k].append(100.0 * nT[k] / sT if sT > 1e-9 else 0.0)
+            # 6D Velocity components (Twist window)
+            for i in range(3):
+                self.v_lin_data[i].append(self.vel_haption[i])
+                self.v_ang_data[i].append(self.vel_haption[i + 3])
 
 def main(args=None):
     """Initializes ROS, spins the node on a daemon thread, and drives Matplotlib updates safely on the main thread."""
