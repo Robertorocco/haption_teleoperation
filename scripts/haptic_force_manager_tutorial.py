@@ -139,6 +139,16 @@ class HapticForceManager(Node):
         self.SYNC_FULL_POS_ERR  = 0.30     # m   "full" reference-real position error
         self.SYNC_FULL_ANG_ERR  = np.pi / 2  # rad "full" reference-real orientation error (90 deg)
         self.SYNC_SHARE_CAP     = 0.85     # max sync share beyond the full error
+
+        # --- Grasp-execution coupling ---
+        # During autonomous grasp execution (shared_autonomy drives the arm,
+        # /shared_autonomy/grasp_active = True) the user input is ignored, but we
+        # want the operator to FEEL what the arm is doing. We then output a strong,
+        # pure F_sync (everything else disabled) so the handle is firmly pulled to
+        # track the EE motion. GRASP_SYNC_BOOST scales the sync stiffness up; the
+        # final MAX_FORCE/MAX_TORQUE clip still bounds it.
+        self.grasp_active = False
+        self.GRASP_SYNC_BOOST = 3.0
         self.K_cbf_force = 2.0   
         self.K_cbf_torque = 0.1  
         self.MAX_FORCE = 10.0 
@@ -196,6 +206,8 @@ class HapticForceManager(Node):
         self.create_subscription(Float64MultiArray, '/shared_autonomy/user_policy', self.user_policy_cb, 10)
         # Active goal pose + confidence for the position virtual fixture
         self.create_subscription(Float64MultiArray, '/shared_autonomy/active_goal_pose', self.goal_pose_cb, 10)
+        # Grasp-execution flag: when True, output strong pure F_sync (track the EE)
+        self.create_subscription(Bool, '/shared_autonomy/grasp_active', self.grasp_active_cb, 10)
         
         self.force_pub = self.create_publisher(Wrench, 'virtuose/force_cmd', 10)
 
@@ -446,6 +458,10 @@ class HapticForceManager(Node):
             self.fix_goal_pos = np.array(msg.data[0:3])
             self.fix_goal_rot = R.from_euler('xyz', np.array(msg.data[3:6]), degrees=False)
             self.fix_confidence = float(msg.data[6])
+
+    def grasp_active_cb(self, msg):
+        """Tracks whether the shared-autonomy node is autonomously driving a grasp."""
+        self.grasp_active = bool(msg.data)
 
     def target_cb(self, msg):
         """Updates the target Cartesian position and orientation of the TRIAGo arm."""
@@ -788,40 +804,49 @@ class HapticForceManager(Node):
         # error and beyond (cap SYNC_SHARE_CAP), pulling the handle back to where
         # the robot actually is and establishing an equilibrium. Sync is never
         # attenuated; small error -> ~no attenuation -> free-space feel unchanged.
-        pos_err = (np.linalg.norm(self.pos_real - self.pos_target)
-                   if (self.pos_real is not None and self.pos_target is not None) else 0.0)
-        ang_err = 0.0
-        if self.rot_real is not None and self.rot_target is not None:
-            ang_err = float(np.linalg.norm(R.from_matrix(
-                self.rot_real.as_matrix() @ self.rot_target.as_matrix().T).as_rotvec()))
-        divergence = max(pos_err / self.SYNC_FULL_POS_ERR, ang_err / self.SYNC_FULL_ANG_ERR)
-        sync_share = min(self.SYNC_SHARE_AT_FULL * divergence, self.SYNC_SHARE_CAP)
+        if self.grasp_active:
+            # Grasp execution: user input is ignored, but the operator should FEEL
+            # the autonomous motion -> strong, pure F_sync, all other layers off.
+            # Skip the share logic and the authority cap (final clip still bounds it).
+            f_total_normal = self.GRASP_SYNC_BOOST * f_sync
+            f_cbf_s = np.zeros(6)
+            f_guide_s = np.zeros(6)
+            f_fix_s = np.zeros(6)
+        else:
+            pos_err = (np.linalg.norm(self.pos_real - self.pos_target)
+                       if (self.pos_real is not None and self.pos_target is not None) else 0.0)
+            ang_err = 0.0
+            if self.rot_real is not None and self.rot_target is not None:
+                ang_err = float(np.linalg.norm(R.from_matrix(
+                    self.rot_real.as_matrix() @ self.rot_target.as_matrix().T).as_rotvec()))
+            divergence = max(pos_err / self.SYNC_FULL_POS_ERR, ang_err / self.SYNC_FULL_ANG_ERR)
+            sync_share = min(self.SYNC_SHARE_AT_FULL * divergence, self.SYNC_SHARE_CAP)
 
-        push_force_mag  = np.linalg.norm(f_cbf[0:3] + f_guide[0:3] + f_fix[0:3])
-        push_torque_mag = np.linalg.norm(f_cbf[3:6] + f_guide[3:6] + f_fix[3:6])
-        k_f = self._sync_share_factor(np.linalg.norm(f_sync[0:3]), push_force_mag, sync_share)
-        k_t = self._sync_share_factor(np.linalg.norm(f_sync[3:6]), push_torque_mag, sync_share)
-        kvec = np.array([k_f, k_f, k_f, k_t, k_t, k_t])
-        # Scaled copies (do NOT mutate compute_* return values — f_cbf aliases the
-        # LPF state, mutating it would corrupt the filter).
-        f_cbf_s = f_cbf * kvec
-        f_guide_s = f_guide * kvec
-        f_fix_s = f_fix * kvec
+            push_force_mag  = np.linalg.norm(f_cbf[0:3] + f_guide[0:3] + f_fix[0:3])
+            push_torque_mag = np.linalg.norm(f_cbf[3:6] + f_guide[3:6] + f_fix[3:6])
+            k_f = self._sync_share_factor(np.linalg.norm(f_sync[0:3]), push_force_mag, sync_share)
+            k_t = self._sync_share_factor(np.linalg.norm(f_sync[3:6]), push_torque_mag, sync_share)
+            kvec = np.array([k_f, k_f, k_f, k_t, k_t, k_t])
+            # Scaled copies (do NOT mutate compute_* return values — f_cbf aliases the
+            # LPF state, mutating it would corrupt the filter).
+            f_cbf_s = f_cbf * kvec
+            f_guide_s = f_guide * kvec
+            f_fix_s = f_fix * kvec
 
-        # Calculate the normal running force
-        f_total_normal = f_sync + f_cbf_s + f_guide_s + f_fix_s + f_vib
+            # Calculate the normal running force
+            f_total_normal = f_sync + f_cbf_s + f_guide_s + f_fix_s + f_vib
 
-        # --- AUTHORITY CAP -------------------------------------------------- #
-        # Bound the MAGNITUDE of the assistive wrench so the autonomy can never
-        # overpower the operator. Scaling the whole vector preserves the relative
-        # proportions of sync/cbf/guide/fix (the "feel" we tuned) while limiting
-        # the total push to MAX_TOTAL_FORCE / MAX_TOTAL_TORQUE.
-        f_norm = np.linalg.norm(f_total_normal[0:3])
-        if f_norm > self.MAX_TOTAL_FORCE:
-            f_total_normal[0:3] *= self.MAX_TOTAL_FORCE / f_norm
-        t_norm = np.linalg.norm(f_total_normal[3:6])
-        if t_norm > self.MAX_TOTAL_TORQUE:
-            f_total_normal[3:6] *= self.MAX_TOTAL_TORQUE / t_norm
+            # --- AUTHORITY CAP --------------------------------------------- #
+            # Bound the MAGNITUDE of the assistive wrench so the autonomy can never
+            # overpower the operator. Scaling the whole vector preserves the relative
+            # proportions of sync/cbf/guide/fix (the "feel" we tuned) while limiting
+            # the total push to MAX_TOTAL_FORCE / MAX_TOTAL_TORQUE.
+            f_norm = np.linalg.norm(f_total_normal[0:3])
+            if f_norm > self.MAX_TOTAL_FORCE:
+                f_total_normal[0:3] *= self.MAX_TOTAL_FORCE / f_norm
+            t_norm = np.linalg.norm(f_total_normal[3:6])
+            if t_norm > self.MAX_TOTAL_TORQUE:
+                f_total_normal[3:6] *= self.MAX_TOTAL_TORQUE / t_norm
 
         # ========================================================
         # CLUTCHING ARCHITECTURE & ALIGNMENT GUIDANCE
