@@ -71,6 +71,25 @@ class HapticForceManager(Node):
         self.alpha_guide     = 0.15   # LPF coefficient (lower = smoother, more lag)
         self.f_guide_filtered = np.zeros(6)
 
+        # --- Position Virtual Fixture (strong "funnel" near a confident goal) ---
+        # The viscous F_guide vanishes near the goal (policy velocity -> 0), so it
+        # cannot hold the user precisely AT the grasp pose against the CBF that
+        # pushes the gripper off the cylinder. This POSITION spring pulls the user
+        # toward the exact active-goal pose and does NOT vanish near it, giving a
+        # strong, stable "lock-in" once a goal is confidently identified. Gated by
+        # confidence so it stays silent in free space / when intent is ambiguous.
+        self.fix_goal_pos = None
+        self.fix_goal_rot = None
+        self.fix_confidence = 0.0
+        self.K_fix_force  = 60.0      # N/m   position spring toward the grasp pose
+        self.K_fix_torque = 0.4       # Nm/rad orientation spring toward grasp orientation
+        self.MAX_FIX_FORCE  = 8.0     # N     saturation
+        self.MAX_FIX_TORQUE = 0.6     # Nm    saturation
+        self.FIX_CONF_LO = 0.55       # below this belief -> fixture OFF
+        self.FIX_CONF_HI = 0.85       # at/above this belief -> full fixture
+        self.alpha_fix = 0.15         # LPF on the fixture wrench (C0 continuity)
+        self.f_fix_filtered = np.zeros(6)
+
         # --- NEW: Clutching Architecture Variables ---
         self.is_clutching = False
         self.was_clutching_last_frame = False
@@ -143,6 +162,8 @@ class HapticForceManager(Node):
         self.create_subscription(String, '/shared_autonomy/goal_names', self.goal_names_cb, 10)
         self.create_subscription(Float64MultiArray, '/shared_autonomy/goal_probabilities', self.goal_probs_cb, 10)
         self.create_subscription(Float64MultiArray, '/shared_autonomy/user_policy', self.user_policy_cb, 10)
+        # Active goal pose + confidence for the position virtual fixture
+        self.create_subscription(Float64MultiArray, '/shared_autonomy/active_goal_pose', self.goal_pose_cb, 10)
         
         self.force_pub = self.create_publisher(Wrench, 'virtuose/force_cmd', 10)
 
@@ -384,6 +405,17 @@ class HapticForceManager(Node):
         """Updates the flattened array of optimal spatial twists evaluated from the user's reference frame."""
         self.user_policies = list(msg.data)
 
+    def goal_pose_cb(self, msg):
+        """Updates the active goal pose + confidence for the position virtual fixture.
+
+        Layout: [x, y, z, roll, pitch, yaw, confidence] in base_footprint.
+        confidence is the belief of the active goal (0 during grasp execution).
+        """
+        if len(msg.data) >= 7:
+            self.fix_goal_pos = np.array(msg.data[0:3])
+            self.fix_goal_rot = R.from_euler('xyz', np.array(msg.data[3:6]), degrees=False)
+            self.fix_confidence = float(msg.data[6])
+
     def target_cb(self, msg):
         """Updates the target Cartesian position and orientation of the TRIAGo arm."""
         if len(msg.data) >= 6:
@@ -588,6 +620,49 @@ class HapticForceManager(Node):
                                  + (1.0 - self.alpha_guide) * self.f_guide_filtered)
         return self.f_guide_filtered.copy()
 
+    def compute_F_fixture(self):
+        """Position+orientation virtual fixture pulling the user toward the active goal.
+
+        Unlike F_guide (viscous, velocity-based, vanishes at the goal), this is a
+        POSITION spring: F = K·(goal_pose − real_pose), saturated and gated by the
+        goal confidence. It does not weaken near the goal, so it lets the operator
+        settle precisely at the grasp standoff against the CBF that pushes the
+        gripper off the cylinder. Confidence gating (smoothstep over belief) keeps
+        it silent in free space and when intent is ambiguous.
+        """
+        if (self.fix_goal_pos is None or self.pos_real is None
+                or self.rot_real is None):
+            self.f_fix_filtered = (1.0 - self.alpha_fix) * self.f_fix_filtered
+            return self.f_fix_filtered.copy()
+
+        gate = self._smoothstep(self.fix_confidence,
+                                lo=self.FIX_CONF_LO, hi=self.FIX_CONF_HI)
+        if gate <= 0.0:
+            self.f_fix_filtered = (1.0 - self.alpha_fix) * self.f_fix_filtered
+            return self.f_fix_filtered.copy()
+
+        # Position spring in robot frame: points from the real EE toward the goal,
+        # i.e. the direction the user must move the handle to drive the arm in.
+        err_pos = self.fix_goal_pos - self.pos_real
+        F_fix_robot = self.K_fix_force * err_pos
+        F_fix_robot = self.MAX_FIX_FORCE * np.tanh(F_fix_robot / self.MAX_FIX_FORCE)
+
+        # Orientation spring: R_err = R_goal · R_real^T (robot frame)
+        err_rot_vec = R.from_matrix(
+            self.fix_goal_rot.as_matrix() @ self.rot_real.as_matrix().T).as_rotvec()
+        Tau_fix_robot = self.K_fix_torque * err_rot_vec
+        Tau_fix_robot = self.MAX_FIX_TORQUE * np.tanh(Tau_fix_robot / self.MAX_FIX_TORQUE)
+
+        # Map robot -> Haption frame (180° Z-flip), scaled by the confidence gate.
+        F_fix_raw = np.array([
+            -F_fix_robot[0],   -F_fix_robot[1],    F_fix_robot[2],
+            -Tau_fix_robot[0], -Tau_fix_robot[1],  Tau_fix_robot[2],
+        ]) * gate
+
+        self.f_fix_filtered = (self.alpha_fix * F_fix_raw
+                               + (1.0 - self.alpha_fix) * self.f_fix_filtered)
+        return self.f_fix_filtered.copy()
+
     def compute_F_limit_warning(self):
         """Calculates a 75Hz square wave rumble with variable intensity inside a specific boundary zone."""
         F_vib = np.zeros(6)
@@ -620,10 +695,11 @@ class HapticForceManager(Node):
         f_sync = self.compute_F_sync()
         f_cbf = self.compute_F_cbf()
         f_guide = self.compute_F_guide()
+        f_fix = self.compute_F_fixture()
         f_vib = self.compute_F_limit_warning()
 
         # Calculate the normal running force
-        f_total_normal = f_sync + f_cbf + f_guide + f_vib
+        f_total_normal = f_sync + f_cbf + f_guide + f_fix + f_vib
 
         # ========================================================
         # CLUTCHING ARCHITECTURE & ALIGNMENT GUIDANCE
@@ -730,7 +806,7 @@ class HapticForceManager(Node):
 
         # Buffer Data for Plotting
         t = time.time() - self.start_time
-        components = {'Total': f_total, 'Sync': f_sync, 'CBF': f_cbf, 'Guide': f_guide, 'Limit': f_vib}
+        components = {'Total': f_total, 'Sync': f_sync, 'CBF': f_cbf, 'Guide': f_guide + f_fix, 'Limit': f_vib}
         
         # Lock the buffer modification to prevent matplotlib from reading a partially updated structure
         with self.plot_lock:

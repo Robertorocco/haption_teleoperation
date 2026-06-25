@@ -22,6 +22,13 @@ class TeleopClutch(Node):
 
         self.clutch_engaged = False
 
+        # --- Grasp-execution handover ---
+        # When shared_autonomy drives the arm autonomously (grasp approach/close/
+        # lift), it publishes /shared_autonomy/grasp_active=True. We freeze (stop
+        # publishing) and, on the falling edge, force a re-anchor so teleop resumes
+        # from the actual post-grasp robot pose with no jump.
+        self.grasp_active = False
+
         # --- Parameters ---
         self.freq = 150.0  # Hz
         self.dt = 1.0 / self.freq
@@ -39,6 +46,9 @@ class TeleopClutch(Node):
 
         # 2. Listen to TRIAGo Real Pose (Used ONCE to anchor the integration)
         self.create_subscription(Float64MultiArray, '/qp_debug/ee_real', self.ee_callback, 10)
+
+        # 2b. Listen to the grasp-execution handover flag from shared_autonomy
+        self.create_subscription(Bool, '/shared_autonomy/grasp_active', self.grasp_active_callback, 10)
         
         # 3. Publish Command to Controller
         self.cmd_pub = self.create_publisher(Float64MultiArray, '/arm_right/cartesian_reference', 10)
@@ -87,8 +97,23 @@ class TeleopClutch(Node):
             else:
                 self.get_logger().info(" CLUTCH RELEASED: Teleoperation tracking resumed.")
 
+    def grasp_active_callback(self, msg):
+        """Handover flag: suspend teleop while shared_autonomy drives the grasp."""
+        if msg.data and not self.grasp_active:
+            self.grasp_active = True
+            self.get_logger().info(" GRASP EXEC: teleop suspended (arm driven autonomously).")
+        elif not msg.data and self.grasp_active:
+            self.grasp_active = False
+            # Force a re-anchor at the actual post-grasp pose so the resumed
+            # integration starts from where the robot really is (no jump back).
+            self.initialized = False
+            self.get_logger().info(" GRASP DONE: re-anchoring, teleop resuming.")
+
     def integration_loop(self):
         """Integrates the twist and publishes the 13-element array."""
+        # While shared_autonomy drives the grasp, publish nothing (yield authority).
+        if self.grasp_active:
+            return
         if not self.initialized:
             return # Do nothing until we know where the robot is
 

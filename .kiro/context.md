@@ -77,6 +77,25 @@ This package implements the **human-side** of the shared-autonomy architecture:
 
 3. **Exception — grasp execution**: during GRASP_APPROACH/GRASP_CLOSE/LIFT, the `triago_control` grasp state machine takes over motion control directly (precision + synchronization that the user cannot provide).
 
+### 4.1 Authority Handover (teleop ↔ autonomous grasp)
+
+In teleop mode (`POLICY_BELIEF_TEST=False`), `main_shared_autonomy.py` publishes
+`/shared_autonomy/grasp_active` (Bool):
+- **True** during GRASP_APPROACH/GRASP_CLOSE/LIFT → the node publishes the grasp reference
+  directly to `/arm_right/cartesian_reference`, and `teleop_triago_clutch.py` **freezes** (stops
+  publishing).
+- **Falling edge** (grasp done → HOLDING) → the clutch **re-anchors** at the actual post-grasp
+  robot pose (resets `initialized=False`) so teleop resumes with no jump.
+
+### 4.2 Position Virtual Fixture (haptic_force_manager_tutorial.py)
+
+`main_shared_autonomy.py` publishes `/shared_autonomy/active_goal_pose`
+(`[x,y,z,roll,pitch,yaw,confidence]`). The tutorial force manager applies `F_fixture`: a
+position+orientation spring pulling the handle toward the exact grasp pose, gated by confidence
+(`FIX_CONF_LO=0.55`→`HI=0.85`). Unlike the viscous `F_guide` (which vanishes at the goal), this
+does NOT weaken near the goal, so it lets the operator settle precisely at the grasp standoff
+against the CBF push-off. Confidence is forced to 0 during grasp execution (fixture releases).
+
 ---
 
 ## 5. C++ Node: virtuose_server_node
@@ -214,7 +233,10 @@ Vibration warning triggers at `LIMIT_OUTER = 0.25 rad` from any limit; maximum a
 | Robot state | `/qp_debug/ee_real` | `main_qp_controller.py` | both teleop scripts |
 | CBF gradient | `/collision_constraints` | `main_qp_controller.py` | `haptic_force_manager.py` |
 | CBF slack | `/qp_debug/lambda_cbf` | `main_qp_controller.py` | `haptic_force_manager.py` |
-| Clutch | `virtuose/button` | `virtuose_server_node` | teleop + force manager |
+| Clutch | `virtuose/button_right` | `virtuose_server_node` | teleop + force manager |
+| Grasp trigger | `virtuose/button_left` | `virtuose_server_node` | `main_shared_autonomy.py` |
+| Authority handover | `/shared_autonomy/grasp_active` | `main_shared_autonomy.py` | `teleop_triago_clutch.py` |
+| Virtual fixture | `/shared_autonomy/active_goal_pose` | `main_shared_autonomy.py` | `haptic_force_manager_tutorial.py` |
 | Device vel | `virtuose/velocity` | `virtuose_server_node` | teleop + force manager |
 
 ---
