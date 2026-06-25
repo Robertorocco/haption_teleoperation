@@ -66,6 +66,17 @@ class HapticForceManager(Node):
         self.alpha_guide     = 0.15   # LPF coefficient (lower = smoother, more lag)
         self.f_guide_filtered = np.zeros(6)
 
+        # --- User-led guidance gating ("listen more, lock less") ---
+        # The guidance fades out (a) when the user is essentially still — so the
+        # autonomy never drags a passive hand and the user always initiates — and
+        # (b) when the user moves AGAINST the suggested direction — so a change of
+        # mind is easy and never fought. Full guidance only when the user is
+        # actively moving roughly along the suggestion (the behaviour we like).
+        self.LEAD_V_STILL = 0.005   # m/s  below -> "still" (guidance ~0)
+        self.LEAD_V_MOVE  = 0.030   # m/s  above -> fully engaged
+        self.LEAD_COS_LO  = -0.10   # cos(user_vel, guide) below -> disagreeing (gain 0)
+        self.LEAD_COS_HI  =  0.50   # above -> agreeing (gain 1)
+
         # --- Position Virtual Fixture (strong "funnel" near a confident goal) ---
         # The viscous F_guide vanishes near the goal (policy velocity -> 0), so it
         # cannot hold the user precisely AT the grasp pose against the CBF that
@@ -608,10 +619,30 @@ class HapticForceManager(Node):
         error_v_ang = pi_blend[3:6] - vel_robot[3:6]
 
         # ------------------------------------------------------------------ #
-        # 5.  Viscous guidance wrench (robot frame), scaled by confidence     #
+        # 4b. User-led gate: engagement × agreement                           #
         # ------------------------------------------------------------------ #
-        F_guide_robot   = self.B_guide_lin * error_v_lin * alpha
-        Tau_guide_robot = self.B_guide_ang * error_v_ang * alpha
+        # engagement -> 0 when the user is still (let them initiate, never drag a
+        # passive hand); agreement -> 0 when the user moves against the suggested
+        # direction (let them override a wrong guess without a fight). The product
+        # multiplies the whole guidance wrench, so the system "listens" to the
+        # user's twist instead of locking a goal and pulling.
+        speed = float(np.linalg.norm(vel_robot[0:3]))
+        pi_n = float(np.linalg.norm(pi_blend[0:3]))
+        if speed > 1e-6 and pi_n > 1e-6:
+            cos_align = float(np.dot(vel_robot[0:3], pi_blend[0:3]) / (speed * pi_n))
+        else:
+            cos_align = 0.0
+        engage = self._smoothstep(speed, lo=self.LEAD_V_STILL, hi=self.LEAD_V_MOVE)
+        agree = self._smoothstep(cos_align, lo=self.LEAD_COS_LO, hi=self.LEAD_COS_HI)
+        lead_gain = engage * agree
+
+        # ------------------------------------------------------------------ #
+        # 5.  Viscous guidance wrench (robot frame), scaled by confidence     #
+        #     AND the user-led gate.                                          #
+        # ------------------------------------------------------------------ #
+        gain = alpha * lead_gain
+        F_guide_robot   = self.B_guide_lin * error_v_lin * gain
+        Tau_guide_robot = self.B_guide_ang * error_v_ang * gain
 
         # Map robot → Haption frame (180° Z-flip)
         F_guide_raw = np.array([
