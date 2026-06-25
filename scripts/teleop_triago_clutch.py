@@ -35,7 +35,7 @@ class TeleopClutch(Node):
         # --- ROS 2 Interfaces ---
         # 1. Listen to Haption Twist and Button (Clutch)
         self.create_subscription(Twist, 'virtuose/velocity', self.twist_callback, 10)
-        self.create_subscription(Bool, 'virtuose/button', self.button_callback, 10)
+        self.create_subscription(Bool, 'virtuose/button_right', self.button_callback, 10)
 
         # 2. Listen to TRIAGo Real Pose (Used ONCE to anchor the integration)
         self.create_subscription(Float64MultiArray, '/qp_debug/ee_real', self.ee_callback, 10)

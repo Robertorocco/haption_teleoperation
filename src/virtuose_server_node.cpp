@@ -43,7 +43,8 @@ public:
         
         pose_pub_ = this->create_publisher<geometry_msgs::msg::Pose>("virtuose/pose", 10);
         velocity_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("virtuose/velocity", 10);
-        button_pub_ = this->create_publisher<std_msgs::msg::Bool>("virtuose/button", 10); 
+        button_right_pub_ = this->create_publisher<std_msgs::msg::Bool>("virtuose/button_right", 10);
+        button_left_pub_ = this->create_publisher<std_msgs::msg::Bool>("virtuose/button_left", 10); 
         // Subscribe to a wrench topic (Force: x,y,z | Torque: x,y,z)
         force_sub_ = this->create_subscription<geometry_msgs::msg::Wrench>(
             "virtuose/force_cmd", 10, std::bind(&VirtuoseServerNode::ForceCallback, this, std::placeholders::_1)
@@ -87,7 +88,8 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr velocity_pub_;
     rclcpp::Subscription<geometry_msgs::msg::Wrench>::SharedPtr force_sub_;
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr articular_pub_;
-    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr button_pub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr button_right_pub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr button_left_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
 
     // ===============================> Setup Device
@@ -128,13 +130,14 @@ private:
     }
 
     // ===============================> State Interface
-    int VirtuoseStateInterface(float *pose, float *velocity, int *button_state){
+    int VirtuoseStateInterface(float *pose, float *velocity, int *button_right, int *button_left){
         // Get Virtuose Pose
         virtGetPosition(VC, pose);
         // Get Virtuose Velocity
         virtGetPhysicalSpeed(VC, velocity);
-        // Get Button State: 1 is right button, 2 is left button
-        virtGetButton(VC, 1, button_state);
+        // Get Button States: 1 is right button (clutch), 2 is left button (grasp)
+        virtGetButton(VC, 1, button_right);
+        virtGetButton(VC, 2, button_left);
         
         return 0;
     }
@@ -181,9 +184,10 @@ private:
         // ===============> State Interface Variables
         float pose[7];
         float velocity[6];
-        int button_state = 0;
+        int button_right = 0;
+        int button_left = 0;
         // State Interface
-        VirtuoseStateInterface(pose, velocity, &button_state);
+        VirtuoseStateInterface(pose, velocity, &button_right, &button_left);
 
         // Debug prints for read data, throttled to 1 print per second
         // if (debug_mode_) {
@@ -225,10 +229,14 @@ private:
         vel_msg.angular.z = velocity[5];
         velocity_pub_->publish(vel_msg);
         
-        // =================> Publish Button State
-        std_msgs::msg::Bool btn_msg;
-        btn_msg.data = (button_state != 0); // Convert int (0 or 1) to boolean
-        button_pub_->publish(btn_msg);
+        // =================> Publish Button States
+        std_msgs::msg::Bool btn_right_msg;
+        btn_right_msg.data = (button_right != 0);
+        button_right_pub_->publish(btn_right_msg);
+
+        std_msgs::msg::Bool btn_left_msg;
+        btn_left_msg.data = (button_left != 0);
+        button_left_pub_->publish(btn_left_msg);
 
         // =================> NEW: Publish Articular (Joint) Positions <=================
         float art_pos[6];

@@ -137,7 +137,7 @@ class HapticForceManager(Node):
         self.create_subscription(Float64, '/qp_debug/lambda_cbf', self.lambda_cb, 10)
         self.create_subscription(Float64MultiArray, 'virtuose/articular_position', self.joint_cb, 10)
         #self.create_subscription(Float64MultiArray, '/shared_autonomy/assistive_reference', self.assist_cb, 10)
-        self.create_subscription(Bool, 'virtuose/button', self.button_cb, 10)
+        self.create_subscription(Bool, 'virtuose/button_right', self.button_cb, 10)
         self.create_subscription(PoseStamped, 'virtuose/pose', self.haption_pose_cb, 10)
         #Unified Inference State Subscribers
         self.create_subscription(String, '/shared_autonomy/goal_names', self.goal_names_cb, 10)
