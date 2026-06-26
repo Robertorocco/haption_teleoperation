@@ -31,6 +31,8 @@ class HapticForceManager(Node):
         # --- CBF State Variables ---
         self.grad_cbf_right = np.zeros(6)
         self.lambda_cbf = 0.0
+        self.lambda_cbf_f = 0.0       # LPF'd lambda for smooth damping scaling
+        self.CBF_LAMBDA_ALPHA = 0.05  # LPF coefficient on lambda (low = very smooth)
         self.CBF_GAIN_BOOST = 1.2     # CBF feedback 1.2x stronger
 
         # --- CBF Smoothing Parameters ---
@@ -150,7 +152,7 @@ class HapticForceManager(Node):
         # final MAX_FORCE/MAX_TORQUE clip still bounds it.
         self.grasp_active = False
         self._grasp_start_pos = None   # EE position at the start of the grasp (for velocity-following)
-        self.GRASP_SYNC_BOOST = 3.0
+        self.GRASP_SYNC_BOOST = 6.0    # 2x stronger than before so user clearly feels the motion
         self.K_cbf_force = 2.0   
         self.K_cbf_torque = 0.1  
         self.MAX_FORCE = 10.0 
@@ -171,8 +173,6 @@ class HapticForceManager(Node):
         self.buffer_size = int(150 * self.plot_window_sec)
         self.t_data = deque(maxlen=self.buffer_size)
         self.start_time = time.time()
-        self.v_lin_data = [deque(maxlen=self.buffer_size) for _ in range(3)]
-        self.v_ang_data = [deque(maxlen=self.buffer_size) for _ in range(3)]
 
         # Per-component wrench history (Superposition window: no Total here).
         self.f_data = {
@@ -191,8 +191,6 @@ class HapticForceManager(Node):
         self.pct_torque = {'Sync': deque(maxlen=self.buffer_size),
                            'CBF':  deque(maxlen=self.buffer_size),
                            'Guide': deque(maxlen=self.buffer_size)}
-
-        # --- ROS 2 Interfaces ---
         self.create_subscription(Float64MultiArray, '/arm_right/cartesian_reference', self.target_cb, 10)
         self.create_subscription(Float64MultiArray, '/qp_debug/ee_real', self.real_cb, 10)
         self.create_subscription(Twist, 'virtuose/velocity', self.vel_cb, 10)
@@ -314,40 +312,6 @@ class HapticForceManager(Node):
         ax.legend(loc='upper left', fontsize=8, ncol=3)
 
         self.fig_tot.tight_layout()
-
-        # ========================================================
-        # --- Twist Analyzer Window (2 Stacked Subplots) ---
-        # ========================================================
-        self.fig_v, (self.ax_v_lin, self.ax_v_ang) = plt.subplots(2, 1, figsize=(8, 6))
-        self.fig_v.canvas.manager.set_window_title('Haption 6D Twist Analyzer')
-        
-        colors = ['r', 'g', 'b']
-        labels = ['X', 'Y', 'Z']
-        
-        # --- TOP SUBPLOT: Linear Velocity ---
-        self.ax_v_lin.set_title("Linear Velocity Components", fontsize=11, fontweight='bold')
-        self.ax_v_lin.set_ylabel("Velocity (m/s)")
-        self.ax_v_lin.grid(True, linestyle='--', alpha=0.6)
-        
-        self.lines_v_lin = []
-        for i in range(3):
-            line, = self.ax_v_lin.plot([], [], color=colors[i], linewidth=1.5, label=f"v_{labels[i]}")
-            self.lines_v_lin.append(line)
-        self.ax_v_lin.legend(loc='upper right')
-        
-        # --- BOTTOM SUBPLOT: Angular Velocity ---
-        self.ax_v_ang.set_title("Angular Velocity Components", fontsize=11, fontweight='bold')
-        self.ax_v_ang.set_ylabel("Velocity (rad/s)")
-        self.ax_v_ang.set_xlabel("Time (s)")
-        self.ax_v_ang.grid(True, linestyle='--', alpha=0.6)
-        
-        self.lines_v_ang = []
-        for i in range(3):
-            line, = self.ax_v_ang.plot([], [], color=colors[i], linewidth=1.5, label=f"w_{labels[i]}")
-            self.lines_v_ang.append(line)
-        self.ax_v_ang.legend(loc='upper right')
-        
-        self.fig_v.tight_layout()
         plt.show(block=False)
 
 
@@ -368,8 +332,6 @@ class HapticForceManager(Node):
             ftot_T = [list(self.ftot_data['T'][i]) for i in range(3)]
             pctF = {k: list(self.pct_force[k]) for k in ['Sync', 'CBF', 'Guide']}
             pctT = {k: list(self.pct_torque[k]) for k in ['Sync', 'CBF', 'Guide']}
-            v_lin_lists = [list(self.v_lin_data[i]) for i in range(3)]
-            v_ang_lists = [list(self.v_ang_data[i]) for i in range(3)]
 
         # 2. Update Matplotlib outside the lock to prevent stalling the ROS 2 loop
         current_t = t_list[-1]
@@ -406,21 +368,6 @@ class HapticForceManager(Node):
         self.axs_tot[3].set_xlim(*win)
 
         self.fig_tot.canvas.draw_idle()
-
-        # --- Twist window ---
-        for i in range(3):
-            self.lines_v_lin[i].set_data(t_list, v_lin_lists[i])
-        self.ax_v_lin.set_xlim(*win)
-        self.ax_v_lin.relim()
-        self.ax_v_lin.autoscale_view(scalex=False, scaley=True)
-
-        for i in range(3):
-            self.lines_v_ang[i].set_data(t_list, v_ang_lists[i])
-        self.ax_v_ang.set_xlim(*win)
-        self.ax_v_ang.relim()
-        self.ax_v_ang.autoscale_view(scalex=False, scaley=True)
-
-        self.fig_v.canvas.draw_idle()
 
         # Flush events once at the very end to update all windows simultaneously
         self.fig.canvas.flush_events()
@@ -498,6 +445,8 @@ class HapticForceManager(Node):
     def lambda_cb(self, msg):
         """Updates the active CBF slack variable representing obstacle proximity."""
         self.lambda_cbf = msg.data
+        self.lambda_cbf_f = ((1.0 - self.CBF_LAMBDA_ALPHA) * self.lambda_cbf_f
+                             + self.CBF_LAMBDA_ALPHA * max(0.0, float(msg.data)))
 
     def joint_cb(self, msg):
         """Updates the current 6-DoF joint positions directly from the Haption encoders."""
@@ -911,9 +860,16 @@ class HapticForceManager(Node):
             f_total = f_total_normal
             self.was_clutching_last_frame = False
 
-        # GLOBAL DAMPING. IF PLUG HIGH VALUES, YOU GET INSTABILITY DUE TO ZOH. NEEDED TO AVOID LOW FREQ OSCILLATION.
-        Kd_global_lin = 0.7  
-        Kd_global_ang = 0.1
+        # GLOBAL DAMPING + DYNAMIC CBF-AWARE DAMPING ON GUIDANCE.
+        # Base global damping (needed to avoid low-freq oscillation from ZOH).
+        # As lambda_cbf grows (hard trajectory), the damping on the GUIDANCE
+        # component smoothly doubles — making it harder to push through an obstacle
+        # without injecting closed-loop coupling on the force composition.
+        Kd_base_lin = 0.7
+        Kd_base_ang = 0.1
+        damp_scale = 1.0 + float(np.clip(self.lambda_cbf_f / 10.0, 0.0, 1.0))  # 1.0 -> 2.0
+        Kd_global_lin = Kd_base_lin * damp_scale
+        Kd_global_ang = Kd_base_ang * damp_scale
         
         f_total[0:3] -= Kd_global_lin * self.vel_haption[0:3]
         f_total[3:6] -= Kd_global_ang * self.vel_haption[3:6]
@@ -961,10 +917,6 @@ class HapticForceManager(Node):
             for k in ['Sync', 'CBF', 'Guide']:
                 self.pct_force[k].append(100.0 * nF[k] / sF if sF > 1e-9 else 0.0)
                 self.pct_torque[k].append(100.0 * nT[k] / sT if sT > 1e-9 else 0.0)
-            # 6D Velocity components (Twist window)
-            for i in range(3):
-                self.v_lin_data[i].append(self.vel_haption[i])
-                self.v_ang_data[i].append(self.vel_haption[i + 3])
 
 def main(args=None):
     """Initializes ROS, spins the node on a daemon thread, and drives Matplotlib updates safely on the main thread."""
