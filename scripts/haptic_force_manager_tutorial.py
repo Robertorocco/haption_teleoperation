@@ -92,7 +92,7 @@ class HapticForceManager(Node):
         # REFERENCE (pos_target) to the active goal (fix_goal_pos). Assistance then
         # only engages once the user has steered the reference close enough that
         # the goal is committed and stable.
-        self.GUIDE_PROX_FAR  = 0.50   # m — beyond this: device free (gate = 0)
+        self.GUIDE_PROX_FAR  = 1.00   # m — beyond this: device free (gate = 0)
         self.GUIDE_PROX_NEAR = 0.10   # m — at/below this: full guidance (gate = 1)
 
         # DEBUG: set True to output ONLY F_guide (isolate guidance for testing)
