@@ -75,10 +75,25 @@ class HapticForceManager(Node):
         #     way, but through the user's hand;
         #   * vanishes at the goal (pi_blend -> 0), so it settles instead of
         #     pushing the handle past it.
-        self.D_guide_lin = 28.0   # Ns/m  velocity-field tracking gain (translation)
-        self.D_guide_ang = 0.45   # Nms/rad velocity-field tracking gain (rotation)
-        self.MAX_GUIDE_FORCE  = 3.5   # N   saturation on the guidance force
-        self.MAX_GUIDE_TORQUE = 0.25  # Nm  saturation on the guidance torque
+        self.D_guide_lin = 33.6   # Ns/m  velocity-field tracking gain (translation) [1.2x]
+        self.D_guide_ang = 0.54   # Nms/rad velocity-field tracking gain (rotation) [1.2x]
+        self.MAX_GUIDE_FORCE  = 4.2   # N   saturation on the guidance force  [1.2x]
+        self.MAX_GUIDE_TORQUE = 0.30  # Nm  saturation on the guidance torque [1.2x]
+        # ^ scaled 1.2x vs the first pass: near the goal the policy twist (and thus
+        #   v_field) is small, so the raw guidance struggled to move the handle.
+
+        # --- Proximity gate on F_guide -------------------------------------- #
+        # The velocity-field policy is LARGE far from the goal (tanh-saturated
+        # v_geo) and small near it, so far away the guidance would drag the handle
+        # toward a goal pose that is still ill-determined and swinging (orientation
+        # candidate flips, azimuth changes) → erratic "exploding" guidance. Fade
+        # the guidance to ZERO beyond GUIDE_PROX_FAR (device totally free) and ramp
+        # to full only by GUIDE_PROX_NEAR, measured as the distance from the
+        # REFERENCE (pos_target) to the active goal (fix_goal_pos). Assistance then
+        # only engages once the user has steered the reference close enough that
+        # the goal is committed and stable.
+        self.GUIDE_PROX_FAR  = 0.50   # m — beyond this: device free (gate = 0)
+        self.GUIDE_PROX_NEAR = 0.10   # m — at/below this: full guidance (gate = 1)
 
         # DEBUG: set True to output ONLY F_guide (isolate guidance for testing)
         self.DEBUG_ONLY_GUIDE = True
@@ -649,6 +664,21 @@ class HapticForceManager(Node):
             confidence = 1.0 - H / np.log(n_active)
         alpha = self._smoothstep(confidence, lo=self.GUIDE_CONF_LO, hi=self.GUIDE_CONF_HI)
 
+        # Proximity gate: distance from the REFERENCE (pos_target) to the active
+        # goal (fix_goal_pos). Fades guidance to zero far away (where the policy
+        # twist is large but the goal pose is still swinging) and ramps to full
+        # near the goal. See GUIDE_PROX_* in __init__ for the rationale.
+        if self.fix_goal_pos is not None and self.pos_target is not None:
+            d_goal = float(np.linalg.norm(self.fix_goal_pos - self.pos_target))
+            prox = np.clip(
+                (self.GUIDE_PROX_FAR - d_goal)
+                / max(self.GUIDE_PROX_FAR - self.GUIDE_PROX_NEAR, 1e-6), 0.0, 1.0)
+            prox_gate = 3.0 * prox ** 2 - 2.0 * prox ** 3   # smoothstep
+        else:
+            prox_gate = 0.0   # no goal/reference info → no guidance (safe)
+
+        gain = alpha * prox_gate   # belief-confidence × proximity
+
         # Map the policy twist (robot frame) into the Haption frame: this is the
         # device velocity the handle must have for the teleop integrator to
         # reproduce pi_blend on the robot (180° Z-flip, matching teleop_triago_clutch).
@@ -661,8 +691,8 @@ class HapticForceManager(Node):
         # Intrinsically damped via the −v_handle term, so it cannot run away.
         dv = v_field - self.vel_haption
         F_guide_raw = np.zeros(6)
-        F_guide_raw[0:3] = self.D_guide_lin * dv[0:3] * alpha
-        F_guide_raw[3:6] = self.D_guide_ang * dv[3:6] * alpha
+        F_guide_raw[0:3] = self.D_guide_lin * dv[0:3] * gain
+        F_guide_raw[3:6] = self.D_guide_ang * dv[3:6] * gain
 
         # Saturate (tanh soft-clip) for operator comfort and hard bounding.
         F_guide_raw[0:3] = self.MAX_GUIDE_FORCE * np.tanh(F_guide_raw[0:3] / self.MAX_GUIDE_FORCE)
