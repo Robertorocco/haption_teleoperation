@@ -55,8 +55,8 @@ class HapticForceManager(Node):
         # This produces a force even when the user is still (unlike viscous).
         self.B_guide_lin = 90.0   # N/m   (position spring stiffness)
         self.B_guide_ang = 0.5    # Nm/rad (orientation spring stiffness)
-        self.GUIDE_LOOKAHEAD_S = 0.5  # seconds to integrate the policy twist ahead
-        self.GUIDE_MAX_OFFSET = 0.03  # m — cap on the lookahead position offset
+        self.GUIDE_LOOKAHEAD_S = 0.8  # seconds to integrate the policy twist ahead
+        self.GUIDE_MAX_OFFSET = 0.05  # m — cap on the lookahead position offset (5cm -> max 4.5N)
 
         # DEBUG: set True to output ONLY F_guide (isolate guidance for testing)
         self.DEBUG_ONLY_GUIDE = True
@@ -70,8 +70,8 @@ class HapticForceManager(Node):
         # confidence gain : continuous fade-in of the whole guidance wrench based
         #                   on how "peaked" the blended belief is (1 - normalised
         #                   entropy), shaped by a smoothstep with a soft floor/cap.
-        self.GUIDE_CONF_LO   = 0.15   # below this confidence -> transparent (no force)
-        self.GUIDE_CONF_HI   = 0.85   # at/above this confidence -> full guidance gain
+        self.GUIDE_CONF_LO   = 0.05   # below this confidence -> transparent (almost never)
+        self.GUIDE_CONF_HI   = 0.50   # at/above this confidence -> full guidance gain
         # Temporal smoothing of the final guidance wrench. Guarantees C0 continuity
         # even if a probability sample arrives noisy; removes any residual stepping.
         self.alpha_guide     = 0.15   # LPF coefficient (lower = smoother, more lag)
@@ -193,6 +193,11 @@ class HapticForceManager(Node):
         self._sa_freq_data = deque(maxlen=self.buffer_size)
         self._sa_last_time = None
         self._sa_freq_lpf = 0.0
+
+        # Own node frequency tracker (from control_loop call rate)
+        self._own_freq_data = deque(maxlen=self.buffer_size)
+        self._own_last_time = None
+        self._own_freq_lpf = 0.0
         self.create_subscription(Float64MultiArray, '/arm_right/cartesian_reference', self.target_cb, 10)
         self.create_subscription(Float64MultiArray, '/qp_debug/ee_real', self.real_cb, 10)
         self.create_subscription(Twist, 'virtuose/velocity', self.vel_cb, 10)
@@ -313,15 +318,15 @@ class HapticForceManager(Node):
                            for k in ['Sync', 'CBF', 'Guide']}
         ax.legend(loc='upper left', fontsize=8, ncol=3)
 
-        # Subplot 4: Shared autonomy inference frequency
+        # Subplot 4: Haptic Force Manager own frequency
         ax = self.axs_tot[4]
-        ax.set_title("Shared Autonomy Inference Frequency (Hz)", fontsize=10, fontweight='bold')
+        ax.set_title("Haptic Force Manager Frequency (Hz)", fontsize=10, fontweight='bold')
         ax.set_ylabel("Hz")
         ax.set_xlabel("Time (s)")
-        ax.set_ylim(0, 120)
+        ax.set_ylim(0, 180)
         ax.grid(True, linestyle='--', alpha=0.6)
-        ax.axhline(100, color='g', linestyle='--', linewidth=1.0, alpha=0.7, label='target 100Hz')
-        self.line_sa_freq, = ax.plot([], [], color='#9467bd', linewidth=1.5, label='SA freq')
+        ax.axhline(150, color='g', linestyle='--', linewidth=1.0, alpha=0.7, label='target 150Hz')
+        self.line_sa_freq, = ax.plot([], [], color='#9467bd', linewidth=1.5, label='HFM freq')
         ax.legend(loc='upper left', fontsize=8)
 
         self.fig_tot.tight_layout()
@@ -380,11 +385,11 @@ class HapticForceManager(Node):
         self.axs_tot[2].set_xlim(*win)
         self.axs_tot[3].set_xlim(*win)
 
-        # Freq subplot
+        # Freq subplot (own node frequency)
         with self.plot_lock:
-            sa_freq_list = list(self._sa_freq_data)
-        if sa_freq_list:
-            self.line_sa_freq.set_data(t_list[:len(sa_freq_list)], sa_freq_list)
+            own_freq_list = list(self._own_freq_data)
+        if own_freq_list:
+            self.line_sa_freq.set_data(t_list[:len(own_freq_list)], own_freq_list)
         self.axs_tot[4].set_xlim(*win)
 
         self.fig_tot.canvas.draw_idle()
@@ -410,15 +415,8 @@ class HapticForceManager(Node):
         self.goal_names = msg.data.split(',')
 
     def goal_probs_cb(self, msg):
-        """Updates the array of goal probabilities + tracks SA inference frequency."""
+        """Updates the array of goal probabilities."""
         self.goal_probs = list(msg.data)
-        now = time.time()
-        if self._sa_last_time is not None:
-            dt = now - self._sa_last_time
-            if dt > 1e-6:
-                freq = 1.0 / dt
-                self._sa_freq_lpf = 0.9 * self._sa_freq_lpf + 0.1 * freq
-        self._sa_last_time = now
 
     def user_policy_cb(self, msg):
         """Updates the flattened array of optimal spatial twists evaluated from the user's reference frame."""
@@ -890,8 +888,16 @@ class HapticForceManager(Node):
             for k in ['Sync', 'CBF', 'Guide']:
                 self.pct_force[k].append(100.0 * nF[k] / sF if sF > 1e-9 else 0.0)
                 self.pct_torque[k].append(100.0 * nT[k] / sT if sT > 1e-9 else 0.0)
-            # SA inference frequency
+            # SA inference frequency (unchanged — still tracked from goal_probs)
             self._sa_freq_data.append(self._sa_freq_lpf)
+            # Own node frequency
+            now = time.time()
+            if self._own_last_time is not None:
+                dt_own = now - self._own_last_time
+                if dt_own > 1e-6:
+                    self._own_freq_lpf = 0.9 * self._own_freq_lpf + 0.1 * (1.0 / dt_own)
+            self._own_last_time = now
+            self._own_freq_data.append(self._own_freq_lpf)
 
 def main(args=None):
     """Initializes ROS, spins the node on a daemon thread, and drives Matplotlib updates safely on the main thread."""
