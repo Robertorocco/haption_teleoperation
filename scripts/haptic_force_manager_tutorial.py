@@ -426,7 +426,11 @@ class HapticForceManager(Node):
         with self.plot_lock:
             own_freq_list = list(self._own_freq_data)
         if own_freq_list:
-            self.line_sa_freq.set_data(t_list[:len(own_freq_list)], own_freq_list)
+            # Trim to the minimum length of both arrays to avoid numpy broadcast
+            # mismatch (t_data and _own_freq_data are pushed in the same loop tick
+            # but under a lock that update_plot may snapshot between the two appends).
+            n = min(len(t_list), len(own_freq_list))
+            self.line_sa_freq.set_data(t_list[:n], own_freq_list[:n])
         self.axs_tot[4].set_xlim(*win)
 
         self.fig_tot.canvas.draw_idle()
