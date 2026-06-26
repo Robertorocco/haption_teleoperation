@@ -49,14 +49,36 @@ class HapticForceManager(Node):
         self.user_policies = []
 
         # --- Tunable Force Parameters ---
-        # F_guide: position-spring approach. We integrate the blended policy twist
-        # over a small dt (GUIDE_LOOKAHEAD_S) to compute a "where the robot should
-        # be shortly" target pose, then spring-pull the Haption handle toward it.
-        # This produces a force even when the user is still (unlike viscous).
-        self.B_guide_lin = 90.0   # N/m   (position spring stiffness)
-        self.B_guide_ang = 0.5    # Nm/rad (orientation spring stiffness)
-        self.GUIDE_LOOKAHEAD_S = 0.8  # seconds to integrate the policy twist ahead
-        self.GUIDE_MAX_OFFSET = 0.05  # m — cap on the lookahead position offset (5cm -> max 4.5N)
+        # F_guide: VELOCITY-FIELD guidance (not a position spring).
+        #
+        # Rationale (bug fix): the previous approach turned the tanh-saturated
+        # policy velocity into a position offset (pi_blend * lookahead, capped),
+        # which made F_guide a NEAR-CONSTANT ~4.5 N push whenever the EE was more
+        # than ~10-15 cm from the goal. On an impedance device with no damping
+        # (DEBUG_ONLY_GUIDE bypasses the global damper) a constant force does not
+        # "drive the handle to a target" — it just keeps accelerating a lightly
+        # held handle (felt as "too strong / moves on its own / never settles"),
+        # because the force depends only on the ROBOT state and never on the HAND.
+        #
+        # New model: render the blended policy as a velocity FIELD the handle
+        # should follow:
+        #       F = D_guide * ( v_field_haption - v_handle )
+        # where v_field_haption is the policy twist pi_blend mapped into the
+        # Haption frame. Properties that fix the bug:
+        #   * produces a force when the handle is still (D * v_field), so it
+        #     initiates motion toward the goal;
+        #   * INTRINSICALLY DAMPED — as the handle accelerates up to v_field the
+        #     force fades to zero, so it can never run away / fling the handle;
+        #   * a passive operator lets the handle cruise at exactly v_field, so the
+        #     teleop reference integrates the same path the POLICY_BELIEF_TEST=True
+        #     mode commands directly -> the gripper is driven to the goal the same
+        #     way, but through the user's hand;
+        #   * vanishes at the goal (pi_blend -> 0), so it settles instead of
+        #     pushing the handle past it.
+        self.D_guide_lin = 28.0   # Ns/m  velocity-field tracking gain (translation)
+        self.D_guide_ang = 0.45   # Nms/rad velocity-field tracking gain (rotation)
+        self.MAX_GUIDE_FORCE  = 3.5   # N   saturation on the guidance force
+        self.MAX_GUIDE_TORQUE = 0.25  # Nm  saturation on the guidance torque
 
         # DEBUG: set True to output ONLY F_guide (isolate guidance for testing)
         self.DEBUG_ONLY_GUIDE = True
@@ -581,18 +603,27 @@ class HapticForceManager(Node):
 
     def compute_F_guide(self):
         """
-        Position-spring guidance: integrate the blended policy over a short
-        lookahead, then spring-pull the Haption toward that offset.
+        Velocity-field guidance: render the belief-weighted policy twist as a
+        velocity FIELD the handle should follow, and apply a damping-style force
+        that drives the handle velocity toward that field.
 
-        Architecture (simple and clear):
-          1. pi_blend = Σ P(k) · pi_k  (belief-weighted policy twist, robot frame)
-          2. offset = pi_blend * GUIDE_LOOKAHEAD_S  (where the EE should go shortly)
-             — capped to GUIDE_MAX_OFFSET
-          3. F = K_spring * offset * confidence  (spring from current toward target)
-          4. Map to Haption frame (180° Z-flip)
+        Architecture:
+          1. pi_blend = Σ P(k) · pi_k          (belief-weighted policy twist, robot frame)
+          2. v_field_haption = map(pi_blend)   (180° Z-flip into the Haption frame)
+          3. F = D_guide · (v_field_haption − v_handle) · confidence   (saturated)
 
-        This produces a force even when the user is still (unlike the old viscous
-        approach which required velocity) and is bounded by the offset cap.
+        Why this and not a position/offset spring (see __init__ for the full
+        rationale): the policy velocity is tanh-saturated to a near-constant
+        magnitude far from the goal, so an offset-spring becomes a constant push
+        that — with no damping in DEBUG mode — just accelerates the handle and
+        never settles. The velocity field instead:
+          * pushes when the handle is still (D · v_field) → starts the motion,
+          * fades to zero as the handle reaches v_field → no runaway / fling,
+          * lets a passive hand cruise at exactly pi_blend, so the teleop
+            reference traces the SAME path the POLICY_BELIEF_TEST=True mode
+            commands directly (the gripper is driven to the goal through the
+            user's hand),
+          * vanishes at the goal (pi_blend → 0) → settles cleanly.
         """
         n_goals = len(self.goal_names) if self.goal_names else 0
         n_policies = len(self.user_policies)
@@ -607,7 +638,8 @@ class HapticForceManager(Node):
         policies = np.array(self.user_policies).reshape(n_goals, 6)
         pi_blend = probs @ policies
 
-        # Confidence (entropy-based)
+        # Confidence (entropy-based): fade the whole guidance in as the belief
+        # peaks, so it stays transparent while the user's intent is ambiguous.
         active_mask = probs > 1e-12
         n_active = int(np.sum(active_mask))
         if n_active <= 1:
@@ -617,22 +649,24 @@ class HapticForceManager(Node):
             confidence = 1.0 - H / np.log(n_active)
         alpha = self._smoothstep(confidence, lo=self.GUIDE_CONF_LO, hi=self.GUIDE_CONF_HI)
 
-        # Integrate policy over lookahead → position offset (capped)
-        offset_lin = pi_blend[0:3] * self.GUIDE_LOOKAHEAD_S
-        offset_ang = pi_blend[3:6] * self.GUIDE_LOOKAHEAD_S
-        lin_mag = np.linalg.norm(offset_lin)
-        if lin_mag > self.GUIDE_MAX_OFFSET:
-            offset_lin *= self.GUIDE_MAX_OFFSET / lin_mag
-
-        # Position spring (robot frame), scaled by confidence
-        F_robot = self.B_guide_lin * offset_lin * alpha
-        Tau_robot = self.B_guide_ang * offset_ang * alpha
-
-        # Map robot → Haption frame (180° Z-flip)
-        F_guide_raw = np.array([
-            -F_robot[0],   -F_robot[1],    F_robot[2],
-            -Tau_robot[0], -Tau_robot[1],  Tau_robot[2],
+        # Map the policy twist (robot frame) into the Haption frame: this is the
+        # device velocity the handle must have for the teleop integrator to
+        # reproduce pi_blend on the robot (180° Z-flip, matching teleop_triago_clutch).
+        v_field = np.array([
+            -pi_blend[0], -pi_blend[1],  pi_blend[2],
+            -pi_blend[3], -pi_blend[4],  pi_blend[5],
         ])
+
+        # Velocity-field tracking force: drive the handle velocity toward v_field.
+        # Intrinsically damped via the −v_handle term, so it cannot run away.
+        dv = v_field - self.vel_haption
+        F_guide_raw = np.zeros(6)
+        F_guide_raw[0:3] = self.D_guide_lin * dv[0:3] * alpha
+        F_guide_raw[3:6] = self.D_guide_ang * dv[3:6] * alpha
+
+        # Saturate (tanh soft-clip) for operator comfort and hard bounding.
+        F_guide_raw[0:3] = self.MAX_GUIDE_FORCE * np.tanh(F_guide_raw[0:3] / self.MAX_GUIDE_FORCE)
+        F_guide_raw[3:6] = self.MAX_GUIDE_TORQUE * np.tanh(F_guide_raw[3:6] / self.MAX_GUIDE_TORQUE)
 
         # Temporal smoothing (LPF)
         self.f_guide_filtered = (self.alpha_guide * F_guide_raw
