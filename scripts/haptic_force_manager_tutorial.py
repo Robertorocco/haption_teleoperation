@@ -52,6 +52,11 @@ class HapticForceManager(Node):
         # Represents the viscous drag pulling the user toward the optimal policy
         self.B_guide_lin = 90.0   # N/(m/s) (Translational damping)
         self.B_guide_ang = 0.5    # Nm/(rad/s) (Rotational damping)
+        self.PI_BLEND_SAT_LIN = 0.04  # m/s — cap on pi_blend linear magnitude
+        self.PI_BLEND_SAT_ANG = 0.15  # rad/s — cap on pi_blend angular magnitude
+
+        # DEBUG: set True to output ONLY F_guide (isolate guidance for testing)
+        self.DEBUG_ONLY_GUIDE = True
 
         # --- Continuous Policy-Merging (Belief-Weighted Blend) Parameters ---
         # Instead of a winner-take-all gate that snaps pi_ref from one goal's
@@ -594,6 +599,16 @@ class HapticForceManager(Node):
         # since excluded goals have P=0, but avoids numerical noise.
         pi_blend = probs @ policies  # (n_goals,) @ (n_goals, 6) -> (6,)
 
+        # Saturate pi_blend so F_guide never demands more velocity than
+        # PI_BLEND_SAT — prevents the reference from being pushed far away when
+        # the raw policy is large (user far from goal) and the handle is still.
+        lin_mag = np.linalg.norm(pi_blend[0:3])
+        if lin_mag > self.PI_BLEND_SAT_LIN:
+            pi_blend[0:3] *= self.PI_BLEND_SAT_LIN / lin_mag
+        ang_mag = np.linalg.norm(pi_blend[3:6])
+        if ang_mag > self.PI_BLEND_SAT_ANG:
+            pi_blend[3:6] *= self.PI_BLEND_SAT_ANG / ang_mag
+
         # ------------------------------------------------------------------ #
         # 3.  Continuous confidence gain = 1 − normalised entropy             #
         # ------------------------------------------------------------------ #
@@ -747,15 +762,13 @@ class HapticForceManager(Node):
         f_fix = self.compute_F_fixture()
         f_vib = self.compute_F_limit_warning()
 
-        # --- ADAPTIVE SYNC AUTHORITY (anti reference-runaway) --------------- #
-        # When the reference (target) has drifted far from the real EE — i.e. the
-        # robot couldn't follow the push from guidance/CBF and the reference flew
-        # away — attenuate the PUSHING forces (cbf + guide + fix) so the sync
-        # spring's share of the wrench rises to SYNC_SHARE_AT_FULL at the full
-        # error and beyond (cap SYNC_SHARE_CAP), pulling the handle back to where
-        # the robot actually is and establishing an equilibrium. Sync is never
-        # attenuated; small error -> ~no attenuation -> free-space feel unchanged.
-        if self.grasp_active:
+        # DEBUG: isolate F_guide only (all other layers disabled)
+        if self.DEBUG_ONLY_GUIDE:
+            f_total_normal = f_guide.copy()
+            f_cbf_s = np.zeros(6)
+            f_guide_s = f_guide.copy()
+            f_fix_s = np.zeros(6)
+        elif self.grasp_active:
             # Grasp execution: user input is ignored, but the operator should FEEL
             # the autonomous motion. F_sync (real vs target) doesn't work here
             # because the teleop reference is frozen/stale. Instead we apply a force
@@ -814,7 +827,10 @@ class HapticForceManager(Node):
         # ========================================================
         # CLUTCHING ARCHITECTURE & ALIGNMENT GUIDANCE
         # ========================================================
-        if self.is_clutching:
+        if self.DEBUG_ONLY_GUIDE:
+            # In debug mode: skip clutching, skip global damping — raw F_guide only.
+            f_total = f_total_normal.copy()
+        elif self.is_clutching:
             # 1. Edge Detection: The exact millisecond the clutch is pressed
             if not self.was_clutching_last_frame:
                 # Save the total force and immediately halve it for cognitive grounding
@@ -861,18 +877,15 @@ class HapticForceManager(Node):
             self.was_clutching_last_frame = False
 
         # GLOBAL DAMPING + DYNAMIC CBF-AWARE DAMPING ON GUIDANCE.
-        # Base global damping (needed to avoid low-freq oscillation from ZOH).
-        # As lambda_cbf grows (hard trajectory), the damping on the GUIDANCE
-        # component smoothly doubles — making it harder to push through an obstacle
-        # without injecting closed-loop coupling on the force composition.
-        Kd_base_lin = 0.7
-        Kd_base_ang = 0.1
-        damp_scale = 1.0 + float(np.clip(self.lambda_cbf_f / 10.0, 0.0, 1.0))  # 1.0 -> 2.0
-        Kd_global_lin = Kd_base_lin * damp_scale
-        Kd_global_ang = Kd_base_ang * damp_scale
-        
-        f_total[0:3] -= Kd_global_lin * self.vel_haption[0:3]
-        f_total[3:6] -= Kd_global_ang * self.vel_haption[3:6]
+        if not self.DEBUG_ONLY_GUIDE:
+            Kd_base_lin = 0.7
+            Kd_base_ang = 0.1
+            damp_scale = 1.0 + float(np.clip(self.lambda_cbf_f / 10.0, 0.0, 1.0))  # 1.0 -> 2.0
+            Kd_global_lin = Kd_base_lin * damp_scale
+            Kd_global_ang = Kd_base_ang * damp_scale
+            
+            f_total[0:3] -= Kd_global_lin * self.vel_haption[0:3]
+            f_total[3:6] -= Kd_global_ang * self.vel_haption[3:6]
 
         # ========================================================
         # CLIPPING & PUBLISHING
