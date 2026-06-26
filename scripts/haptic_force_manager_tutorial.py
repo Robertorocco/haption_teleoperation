@@ -31,6 +31,10 @@ class HapticForceManager(Node):
         # --- CBF State Variables ---
         self.grad_cbf_right = np.zeros(6)
         self.lambda_cbf = 0.0
+        self.lambda_cbf_f = 0.0       # LPF'd lambda for the smooth CBF force-share
+        self.CBF_LAMBDA_ALPHA = 0.08  # LPF coefficient on lambda (lower = smoother)
+        self.CBF_GAIN_BOOST = 1.5     # CBF feedback 1.5x stronger (per request)
+        self.LAMBDA_REF = 10.0        # lambda at which the CBF force-share saturates (~50%)
 
         # --- CBF Smoothing Parameters ---
         self.f_cbf_filtered = np.zeros(6)
@@ -496,6 +500,10 @@ class HapticForceManager(Node):
     def lambda_cb(self, msg):
         """Updates the active CBF slack variable representing obstacle proximity."""
         self.lambda_cbf = msg.data
+        # Smooth it: the raw shadow price is noisy and would inject oscillation
+        # into the force-share. The LPF guarantees a smooth CBF contribution.
+        self.lambda_cbf_f = ((1.0 - self.CBF_LAMBDA_ALPHA) * self.lambda_cbf_f
+                             + self.CBF_LAMBDA_ALPHA * max(0.0, float(msg.data)))
 
     def joint_cb(self, msg):
         """Updates the current 6-DoF joint positions directly from the Haption encoders."""
@@ -822,25 +830,26 @@ class HapticForceManager(Node):
             divergence = max(pos_err / self.SYNC_FULL_POS_ERR, ang_err / self.SYNC_FULL_ANG_ERR)
             sync_share = min(self.SYNC_SHARE_AT_FULL * divergence, self.SYNC_SHARE_CAP)
 
-            push_force_mag  = np.linalg.norm(f_cbf[0:3] + f_guide[0:3] + f_fix[0:3])
-            push_torque_mag = np.linalg.norm(f_cbf[3:6] + f_guide[3:6] + f_fix[3:6])
-            k_f = self._sync_share_factor(np.linalg.norm(f_sync[0:3]), push_force_mag, sync_share)
-            k_t = self._sync_share_factor(np.linalg.norm(f_sync[3:6]), push_torque_mag, sync_share)
-            kvec = np.array([k_f, k_f, k_f, k_t, k_t, k_t])
-            # Scaled copies (do NOT mutate compute_* return values — f_cbf aliases the
-            # LPF state, mutating it would corrupt the filter).
-            f_cbf_s = f_cbf * kvec
-            f_guide_s = f_guide * kvec
-            f_fix_s = f_fix * kvec
+            # CBF demand from the SMOOTHED lambda: rises to ~0.5 at LAMBDA_REF.
+            cbf_share = float(np.clip(0.5 * self.lambda_cbf_f / self.LAMBDA_REF, 0.0, 0.5))
+
+            # The GUIDANCE (guide + fix) yields smoothly as the sync + cbf demand
+            # grows. It is ONLY ever attenuated, never inflated — so f_tot keeps an
+            # organic magnitude (we never force a fixed total). In a hard situation
+            # (reference far AND lambda high) guide_gain -> 0 and the wrench becomes
+            # purely F_sync + (1.5x) F_cbf, with no F_guide. Both demand terms are
+            # smooth (divergence is smooth, lambda is LPF'd) so no oscillation.
+            guide_gain = float(np.clip(1.0 - sync_share - cbf_share, 0.0, 1.0))
+            f_cbf_s = self.CBF_GAIN_BOOST * f_cbf      # CBF feedback 1.5x stronger
+            f_guide_s = guide_gain * f_guide
+            f_fix_s = guide_gain * f_fix
 
             # Calculate the normal running force
             f_total_normal = f_sync + f_cbf_s + f_guide_s + f_fix_s + f_vib
 
             # --- AUTHORITY CAP --------------------------------------------- #
-            # Bound the MAGNITUDE of the assistive wrench so the autonomy can never
-            # overpower the operator. Scaling the whole vector preserves the relative
-            # proportions of sync/cbf/guide/fix (the "feel" we tuned) while limiting
-            # the total push to MAX_TOTAL_FORCE / MAX_TOTAL_TORQUE.
+            # Bound the MAGNITUDE only when it is exceeded (does NOT force a fixed
+            # total): the autonomy can never overpower the operator.
             f_norm = np.linalg.norm(f_total_normal[0:3])
             if f_norm > self.MAX_TOTAL_FORCE:
                 f_total_normal[0:3] *= self.MAX_TOTAL_FORCE / f_norm
