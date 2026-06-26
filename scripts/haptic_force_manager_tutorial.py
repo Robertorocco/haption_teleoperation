@@ -149,6 +149,7 @@ class HapticForceManager(Node):
         # track the EE motion. GRASP_SYNC_BOOST scales the sync stiffness up; the
         # final MAX_FORCE/MAX_TORQUE clip still bounds it.
         self.grasp_active = False
+        self._grasp_start_pos = None   # EE position at the start of the grasp (for velocity-following)
         self.GRASP_SYNC_BOOST = 3.0
         self.K_cbf_force = 2.0   
         self.K_cbf_torque = 0.1  
@@ -807,13 +808,30 @@ class HapticForceManager(Node):
         # attenuated; small error -> ~no attenuation -> free-space feel unchanged.
         if self.grasp_active:
             # Grasp execution: user input is ignored, but the operator should FEEL
-            # the autonomous motion -> strong, pure F_sync, all other layers off.
-            # Skip the share logic and the authority cap (final clip still bounds it).
-            f_total_normal = self.GRASP_SYNC_BOOST * f_sync
+            # the autonomous motion. F_sync (real vs target) doesn't work here
+            # because the teleop reference is frozen/stale. Instead we apply a force
+            # proportional to the REAL EE displacement from the position it had when
+            # the grasp started (pulling the handle to follow the arm's motion) plus
+            # a velocity-following component so the user feels the direction of
+            # travel. The 180° Z-flip maps robot→Haption.
+            if self.pos_real is not None:
+                if self._grasp_start_pos is None:
+                    self._grasp_start_pos = self.pos_real.copy()
+                # Position tether: pull handle toward where the arm IS now
+                err = self.pos_real - self._grasp_start_pos
+                F_follow = self.GRASP_SYNC_BOOST * self.Kp_sync * err
+                F_haption = np.zeros(6)
+                F_haption[0] = -F_follow[0]
+                F_haption[1] = -F_follow[1]
+                F_haption[2] =  F_follow[2]
+                f_total_normal = F_haption
+            else:
+                f_total_normal = np.zeros(6)
             f_cbf_s = np.zeros(6)
             f_guide_s = np.zeros(6)
             f_fix_s = np.zeros(6)
         else:
+            self._grasp_start_pos = None  # reset for next grasp
             pos_err = (np.linalg.norm(self.pos_real - self.pos_target)
                        if (self.pos_real is not None and self.pos_target is not None) else 0.0)
             ang_err = 0.0
