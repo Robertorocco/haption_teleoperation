@@ -49,11 +49,14 @@ class HapticForceManager(Node):
         self.user_policies = []
 
         # --- Tunable Force Parameters ---
-        # Represents the viscous drag pulling the user toward the optimal policy
-        self.B_guide_lin = 90.0   # N/(m/s) (Translational damping)
-        self.B_guide_ang = 0.5    # Nm/(rad/s) (Rotational damping)
-        self.PI_BLEND_SAT_LIN = 0.04  # m/s — cap on pi_blend linear magnitude
-        self.PI_BLEND_SAT_ANG = 0.15  # rad/s — cap on pi_blend angular magnitude
+        # F_guide: position-spring approach. We integrate the blended policy twist
+        # over a small dt (GUIDE_LOOKAHEAD_S) to compute a "where the robot should
+        # be shortly" target pose, then spring-pull the Haption handle toward it.
+        # This produces a force even when the user is still (unlike viscous).
+        self.B_guide_lin = 90.0   # N/m   (position spring stiffness)
+        self.B_guide_ang = 0.5    # Nm/rad (orientation spring stiffness)
+        self.GUIDE_LOOKAHEAD_S = 0.5  # seconds to integrate the policy twist ahead
+        self.GUIDE_MAX_OFFSET = 0.03  # m — cap on the lookahead position offset
 
         # DEBUG: set True to output ONLY F_guide (isolate guidance for testing)
         self.DEBUG_ONLY_GUIDE = True
@@ -73,17 +76,6 @@ class HapticForceManager(Node):
         # even if a probability sample arrives noisy; removes any residual stepping.
         self.alpha_guide     = 0.15   # LPF coefficient (lower = smoother, more lag)
         self.f_guide_filtered = np.zeros(6)
-
-        # --- User-led guidance gating ("listen more, lock less") ---
-        # The guidance fades out (a) when the user is essentially still — so the
-        # autonomy never drags a passive hand and the user always initiates — and
-        # (b) when the user moves AGAINST the suggested direction — so a change of
-        # mind is easy and never fought. Full guidance only when the user is
-        # actively moving roughly along the suggestion (the behaviour we like).
-        self.LEAD_V_STILL = 0.005   # m/s  below -> "still" (guidance ~0)
-        self.LEAD_V_MOVE  = 0.030   # m/s  above -> fully engaged
-        self.LEAD_COS_LO  = -0.10   # cos(user_vel, guide) below -> disagreeing (gain 0)
-        self.LEAD_COS_HI  =  0.50   # above -> agreeing (gain 1)
 
         # --- Position Virtual Fixture (strong "funnel" near a confident goal) ---
         # The viscous F_guide vanishes near the goal (policy velocity -> 0), so it
@@ -196,6 +188,11 @@ class HapticForceManager(Node):
         self.pct_torque = {'Sync': deque(maxlen=self.buffer_size),
                            'CBF':  deque(maxlen=self.buffer_size),
                            'Guide': deque(maxlen=self.buffer_size)}
+
+        # Shared-autonomy inference frequency tracker (from goal_probs arrival rate)
+        self._sa_freq_data = deque(maxlen=self.buffer_size)
+        self._sa_last_time = None
+        self._sa_freq_lpf = 0.0
         self.create_subscription(Float64MultiArray, '/arm_right/cartesian_reference', self.target_cb, 10)
         self.create_subscription(Float64MultiArray, '/qp_debug/ee_real', self.real_cb, 10)
         self.create_subscription(Twist, 'virtuose/velocity', self.vel_cb, 10)
@@ -269,7 +266,7 @@ class HapticForceManager(Node):
         # ========================================================
         # --- F_total Window (final published wrench + % breakdown) ---
         # ========================================================
-        self.fig_tot, self.axs_tot = plt.subplots(4, 1, figsize=(9, 10))
+        self.fig_tot, self.axs_tot = plt.subplots(5, 1, figsize=(9, 12))
         self.fig_tot.canvas.manager.set_window_title('Total Wrench (published to device)')
         colors = ['r', 'g', 'b']
         labels = ['X', 'Y', 'Z']
@@ -315,6 +312,17 @@ class HapticForceManager(Node):
         self.lines_pctT = {k: ax.plot([], [], color=src_colors[k], label=k)[0]
                            for k in ['Sync', 'CBF', 'Guide']}
         ax.legend(loc='upper left', fontsize=8, ncol=3)
+
+        # Subplot 4: Shared autonomy inference frequency
+        ax = self.axs_tot[4]
+        ax.set_title("Shared Autonomy Inference Frequency (Hz)", fontsize=10, fontweight='bold')
+        ax.set_ylabel("Hz")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylim(0, 120)
+        ax.grid(True, linestyle='--', alpha=0.6)
+        ax.axhline(100, color='g', linestyle='--', linewidth=1.0, alpha=0.7, label='target 100Hz')
+        self.line_sa_freq, = ax.plot([], [], color='#9467bd', linewidth=1.5, label='SA freq')
+        ax.legend(loc='upper left', fontsize=8)
 
         self.fig_tot.tight_layout()
         plt.show(block=False)
@@ -372,6 +380,13 @@ class HapticForceManager(Node):
         self.axs_tot[2].set_xlim(*win)
         self.axs_tot[3].set_xlim(*win)
 
+        # Freq subplot
+        with self.plot_lock:
+            sa_freq_list = list(self._sa_freq_data)
+        if sa_freq_list:
+            self.line_sa_freq.set_data(t_list[:len(sa_freq_list)], sa_freq_list)
+        self.axs_tot[4].set_xlim(*win)
+
         self.fig_tot.canvas.draw_idle()
 
         # Flush events once at the very end to update all windows simultaneously
@@ -395,8 +410,15 @@ class HapticForceManager(Node):
         self.goal_names = msg.data.split(',')
 
     def goal_probs_cb(self, msg):
-        """Updates the array of goal probabilities perfectly synchronized with the goal names."""
+        """Updates the array of goal probabilities + tracks SA inference frequency."""
         self.goal_probs = list(msg.data)
+        now = time.time()
+        if self._sa_last_time is not None:
+            dt = now - self._sa_last_time
+            if dt > 1e-6:
+                freq = 1.0 / dt
+                self._sa_freq_lpf = 0.9 * self._sa_freq_lpf + 0.1 * freq
+        self._sa_last_time = now
 
     def user_policy_cb(self, msg):
         """Updates the flattened array of optimal spatial twists evaluated from the user's reference frame."""
@@ -561,122 +583,60 @@ class HapticForceManager(Node):
 
     def compute_F_guide(self):
         """
-        Continuous policy-merging guidance wrench (flat 5-goal simplex).
+        Position-spring guidance: integrate the blended policy over a short
+        lookahead, then spring-pull the Haption toward that offset.
 
-        The shared_autonomy node in triago_control publishes a FLAT belief
-        distribution over 5 goals: Red_Top, Red_Side, Blue_Top, Blue_Side,
-        Platform_Place. No hierarchy — just a proper simplex where excluded
-        goals sit at probability 0.
+        Architecture (simple and clear):
+          1. pi_blend = Σ P(k) · pi_k  (belief-weighted policy twist, robot frame)
+          2. offset = pi_blend * GUIDE_LOOKAHEAD_S  (where the EE should go shortly)
+             — capped to GUIDE_MAX_OFFSET
+          3. F = K_spring * offset * confidence  (spring from current toward target)
+          4. Map to Haption frame (180° Z-flip)
 
-        The blended reference twist is:
-            pi_blend = Σ_k  P(k) · pi_k
-
-        A continuous confidence gain (1 − normalised entropy, smoothstepped)
-        fades the guidance in/out, and a final first-order LPF guarantees C0
-        continuity even on noisy probability samples.
+        This produces a force even when the user is still (unlike the old viscous
+        approach which required velocity) and is bounded by the offset cap.
         """
         n_goals = len(self.goal_names) if self.goal_names else 0
         n_policies = len(self.user_policies)
 
-        # Guard: need all inference data to have arrived with consistent sizes.
         if (n_goals == 0
                 or len(self.goal_probs) != n_goals
                 or n_policies != n_goals * 6):
             self.f_guide_filtered = (1.0 - self.alpha_guide) * self.f_guide_filtered
             return self.f_guide_filtered.copy()
 
-        # ------------------------------------------------------------------ #
-        # 1.  Parse flat arrays into per-goal probabilities and policies      #
-        # ------------------------------------------------------------------ #
         probs = np.array(self.goal_probs)
         policies = np.array(self.user_policies).reshape(n_goals, 6)
+        pi_blend = probs @ policies
 
-        # ------------------------------------------------------------------ #
-        # 2.  Belief-weighted blended policy (convex combination)             #
-        # ------------------------------------------------------------------ #
-        # Only blend over goals with non-zero probability (excluded goals
-        # contribute nothing). This is mathematically equivalent to summing all
-        # since excluded goals have P=0, but avoids numerical noise.
-        pi_blend = probs @ policies  # (n_goals,) @ (n_goals, 6) -> (6,)
-
-        # Saturate pi_blend so F_guide never demands more velocity than
-        # PI_BLEND_SAT — prevents the reference from being pushed far away when
-        # the raw policy is large (user far from goal) and the handle is still.
-        lin_mag = np.linalg.norm(pi_blend[0:3])
-        if lin_mag > self.PI_BLEND_SAT_LIN:
-            pi_blend[0:3] *= self.PI_BLEND_SAT_LIN / lin_mag
-        ang_mag = np.linalg.norm(pi_blend[3:6])
-        if ang_mag > self.PI_BLEND_SAT_ANG:
-            pi_blend[3:6] *= self.PI_BLEND_SAT_ANG / ang_mag
-
-        # ------------------------------------------------------------------ #
-        # 3.  Continuous confidence gain = 1 − normalised entropy             #
-        # ------------------------------------------------------------------ #
-        # Count only the ACTIVE goals (prob > 0) for entropy normalisation,
-        # so that excluded goals (which are always 0) don't artificially inflate
-        # entropy and suppress guidance when only 2-3 goals remain.
+        # Confidence (entropy-based)
         active_mask = probs > 1e-12
         n_active = int(np.sum(active_mask))
         if n_active <= 1:
-            # Single goal dominates (or nothing active): full confidence.
             confidence = 1.0
         else:
             H = -np.sum(probs[active_mask] * np.log(probs[active_mask]))
-            H_norm = H / np.log(n_active)   # ∈ [0, 1]
-            confidence = 1.0 - H_norm       # ∈ [0, 1], peaked → 1
+            confidence = 1.0 - H / np.log(n_active)
+        alpha = self._smoothstep(confidence, lo=self.GUIDE_CONF_LO, hi=self.GUIDE_CONF_HI)
 
-        alpha = self._smoothstep(confidence,
-                                 lo=self.GUIDE_CONF_LO,
-                                 hi=self.GUIDE_CONF_HI)
+        # Integrate policy over lookahead → position offset (capped)
+        offset_lin = pi_blend[0:3] * self.GUIDE_LOOKAHEAD_S
+        offset_ang = pi_blend[3:6] * self.GUIDE_LOOKAHEAD_S
+        lin_mag = np.linalg.norm(offset_lin)
+        if lin_mag > self.GUIDE_MAX_OFFSET:
+            offset_lin *= self.GUIDE_MAX_OFFSET / lin_mag
 
-        # ------------------------------------------------------------------ #
-        # 4.  Velocity error in a consistent frame                            #
-        # ------------------------------------------------------------------ #
-        # pi_blend is in the robot/world frame (policies evaluated from
-        # current_T_user in shared_autonomy). vel_haption arrives in the
-        # Haption device frame → apply the 180° Z-flip to get robot frame.
-        vel_h = self.vel_haption.copy()
-        vel_robot = np.array([-vel_h[0], -vel_h[1],  vel_h[2],
-                              -vel_h[3], -vel_h[4],  vel_h[5]])
-
-        error_v_lin = pi_blend[0:3] - vel_robot[0:3]
-        error_v_ang = pi_blend[3:6] - vel_robot[3:6]
-
-        # ------------------------------------------------------------------ #
-        # 4b. User-led gate: engagement × agreement                           #
-        # ------------------------------------------------------------------ #
-        # engagement -> 0 when the user is still (let them initiate, never drag a
-        # passive hand); agreement -> 0 when the user moves against the suggested
-        # direction (let them override a wrong guess without a fight). The product
-        # multiplies the whole guidance wrench, so the system "listens" to the
-        # user's twist instead of locking a goal and pulling.
-        speed = float(np.linalg.norm(vel_robot[0:3]))
-        pi_n = float(np.linalg.norm(pi_blend[0:3]))
-        if speed > 1e-6 and pi_n > 1e-6:
-            cos_align = float(np.dot(vel_robot[0:3], pi_blend[0:3]) / (speed * pi_n))
-        else:
-            cos_align = 0.0
-        engage = self._smoothstep(speed, lo=self.LEAD_V_STILL, hi=self.LEAD_V_MOVE)
-        agree = self._smoothstep(cos_align, lo=self.LEAD_COS_LO, hi=self.LEAD_COS_HI)
-        lead_gain = engage * agree
-
-        # ------------------------------------------------------------------ #
-        # 5.  Viscous guidance wrench (robot frame), scaled by confidence     #
-        #     AND the user-led gate.                                          #
-        # ------------------------------------------------------------------ #
-        gain = alpha * lead_gain
-        F_guide_robot   = self.B_guide_lin * error_v_lin * gain
-        Tau_guide_robot = self.B_guide_ang * error_v_ang * gain
+        # Position spring (robot frame), scaled by confidence
+        F_robot = self.B_guide_lin * offset_lin * alpha
+        Tau_robot = self.B_guide_ang * offset_ang * alpha
 
         # Map robot → Haption frame (180° Z-flip)
         F_guide_raw = np.array([
-            -F_guide_robot[0],   -F_guide_robot[1],    F_guide_robot[2],
-            -Tau_guide_robot[0], -Tau_guide_robot[1],  Tau_guide_robot[2],
+            -F_robot[0],   -F_robot[1],    F_robot[2],
+            -Tau_robot[0], -Tau_robot[1],  Tau_robot[2],
         ])
 
-        # ------------------------------------------------------------------ #
-        # 6.  Temporal smoothing (LPF) — final guarantee of C0 continuity     #
-        # ------------------------------------------------------------------ #
+        # Temporal smoothing (LPF)
         self.f_guide_filtered = (self.alpha_guide * F_guide_raw
                                  + (1.0 - self.alpha_guide) * self.f_guide_filtered)
         return self.f_guide_filtered.copy()
@@ -930,6 +890,8 @@ class HapticForceManager(Node):
             for k in ['Sync', 'CBF', 'Guide']:
                 self.pct_force[k].append(100.0 * nF[k] / sF if sF > 1e-9 else 0.0)
                 self.pct_torque[k].append(100.0 * nT[k] / sT if sT > 1e-9 else 0.0)
+            # SA inference frequency
+            self._sa_freq_data.append(self._sa_freq_lpf)
 
 def main(args=None):
     """Initializes ROS, spins the node on a daemon thread, and drives Matplotlib updates safely on the main thread."""
