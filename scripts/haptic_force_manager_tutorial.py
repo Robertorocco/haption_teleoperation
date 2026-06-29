@@ -788,12 +788,16 @@ class HapticForceManager(Node):
         f_fix = self.compute_F_fixture()
         f_vib = self.compute_F_limit_warning()
 
-        # DEBUG: isolate F_guide only (all other layers disabled)
+        # DEBUG: isolate guidance layers only (sync, CBF, limit disabled).
+        # F_guide (velocity-field) + F_fixture (position spring) together cover
+        # the full range: F_guide drives the handle toward the goal from far away,
+        # F_fixture holds it precisely AT the goal once close (where F_guide
+        # vanishes because the policy twist → 0).
         if self.DEBUG_ONLY_GUIDE:
-            f_total_normal = f_guide.copy()
+            f_total_normal = f_guide + f_fix
             f_cbf_s = np.zeros(6)
             f_guide_s = f_guide.copy()
-            f_fix_s = np.zeros(6)
+            f_fix_s = f_fix.copy()
         elif self.grasp_active:
             # Grasp execution: user input is ignored, but the operator should FEEL
             # the autonomous motion. F_sync (real vs target) doesn't work here
