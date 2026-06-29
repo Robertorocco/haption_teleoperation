@@ -26,6 +26,7 @@ class HapticForceManager(Node):
         self.rot_target = None
         self.pos_real = None
         self.rot_real = None
+        self.vel_real = np.zeros(3)   # right EE linear velocity (from ee_real[3:6])
         self.vel_haption = np.zeros(6)  
 
         # --- CBF State Variables ---
@@ -187,6 +188,13 @@ class HapticForceManager(Node):
         self.grasp_active = False
         self._grasp_start_pos = None   # EE position at the start of the grasp (for velocity-following)
         self.GRASP_SYNC_BOOST = 6.0    # 2x stronger than before so user clearly feels the motion
+        # Grasp-follow tether: a gentler POSITION spring (so the approach no longer
+        # "advances too much") plus a VELOCITY-following term that renders the EE's
+        # instantaneous motion — this is what makes the LIFT (pure +Z) clearly felt
+        # even when the cumulative position error in Z is small (e.g. after a
+        # top-grasp approach that first moved down then lifts back up).
+        self.GRASP_FOLLOW_KP = 30.0    # N/m   position tether toward where the arm is now
+        self.GRASP_FOLLOW_KD = 80.0    # Ns/m  velocity-following (feels direction/speed of travel)
         self.K_cbf_force = 2.0   
         self.K_cbf_torque = 0.1  
         self.MAX_FORCE = 10.0 
@@ -489,6 +497,12 @@ class HapticForceManager(Node):
         """Updates the real Cartesian position and orientation of the TRIAGo arm."""
         if len(msg.data) >= 15:
             self.pos_real = np.array(msg.data[0:3])
+            # Right-arm EE LINEAR velocity (indices 3:6 of the 18-float ee_real:
+            # [pos_R(3), vel_R(3), pos_L(3), vel_L(3), rpy_R(3), rpy_L(3)]). This
+            # is the model velocity (pin.getFrameVelocity), clean — not a noisy
+            # finite difference — so it is safe to render as a guidance force.
+            if len(msg.data) >= 18:
+                self.vel_real = np.array(msg.data[3:6])
             rpy = np.array(msg.data[12:15])
             self.rot_real = R.from_euler('xyz', rpy, degrees=False)
 
@@ -798,11 +812,13 @@ class HapticForceManager(Node):
             if self.pos_real is not None:
                 if self._grasp_start_pos is None:
                     self._grasp_start_pos = self.pos_real.copy()
-                # Position tether: pull the handle toward where the arm IS now,
-                # proportional to how far it has moved since the grasp started.
-                # The 180° Z-flip maps robot → Haption.
+                # Gentle position tether toward where the arm is now, PLUS a
+                # velocity-following term so the operator feels the instantaneous
+                # direction & speed of the autonomous motion. The velocity term is
+                # what makes the LIFT clearly felt (the +Z EE velocity pulls the
+                # handle up) even when the cumulative Z displacement is small.
                 err = self.pos_real - self._grasp_start_pos
-                F_follow = self.GRASP_SYNC_BOOST * self.Kp_sync * err
+                F_follow = self.GRASP_FOLLOW_KP * err + self.GRASP_FOLLOW_KD * self.vel_real
                 F_haption = np.zeros(6)
                 F_haption[0] = -F_follow[0]
                 F_haption[1] = -F_follow[1]
