@@ -96,26 +96,6 @@ position+orientation spring pulling the handle toward the exact grasp pose, gate
 does NOT weaken near the goal, so it lets the operator settle precisely at the grasp standoff
 against the CBF push-off. Confidence is forced to 0 during grasp execution (fixture releases).
 
-### 4.3 Force Smoothing (math-sound, anti-vibration) — 2026-06-29
-
-Applying the policy velocity field directly produced buzz/vibration on the handle. Two
-complementary, mathematically-principled smoothing stages were added:
-
-1. **Guidance-velocity LPF**: the `F_guide` damping term `D·(v_field − v_handle)` uses a
-   low-pass-filtered handle velocity (`vel_haption_f`, α=0.25) instead of the raw device
-   velocity. The raw velocity is noisy and `D_guide≈42` amplifies that noise straight into the
-   wrench. The raw velocity is still used for the sync / global-damping layers (their stiffer
-   terms are lag-sensitive, per the original design note).
-2. **Final output filter — 2nd-order critically-damped LPF (ζ=1, fc=12 Hz)** on the wrench
-   actually injected into the device (`virtuose/force_cmd`). Critically damped ⇒ no resonant
-   peak (cannot ring/amplify) and **C¹** (continuous force AND force-rate), so the handle feels
-   smooth and jerk-free — a first-order LPF only gives C⁰. Discrete semi-implicit integration of
-   `ÿ = ωn²(u − y) − 2ωn·ẏ`. The hard `MAX_FORCE/MAX_TORQUE` clip is applied AFTER the filter so
-   the injected vector is always bounded.
-
-Guidance gains were also bumped ~1.25× (operator wanted slightly stronger assistance):
-`D_guide_lin 42`, `D_guide_ang 0.68`, `MAX_GUIDE_FORCE 5.0 N`, `MAX_GUIDE_TORQUE 0.38 Nm`.
-
 ---
 
 ## 5. C++ Node: virtuose_server_node
