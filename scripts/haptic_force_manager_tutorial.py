@@ -194,7 +194,7 @@ class HapticForceManager(Node):
         # even when the cumulative position error in Z is small (e.g. after a
         # top-grasp approach that first moved down then lifts back up).
         self.GRASP_FOLLOW_KP = 30.0    # N/m   position tether toward where the arm is now
-        self.GRASP_FOLLOW_KD = 80.0    # Ns/m  velocity-following (feels direction/speed of travel)
+        self.GRASP_FOLLOW_KD = 120.0   # Ns/m  velocity-following (feels direction/speed of travel)
         self.K_cbf_force = 2.0   
         self.K_cbf_torque = 0.1  
         self.MAX_FORCE = 10.0 
