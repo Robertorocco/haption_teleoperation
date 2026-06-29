@@ -788,28 +788,19 @@ class HapticForceManager(Node):
         f_fix = self.compute_F_fixture()
         f_vib = self.compute_F_limit_warning()
 
-        # DEBUG: isolate guidance layers only (sync, CBF, limit disabled).
-        # F_guide (velocity-field) + F_fixture (position spring) together cover
-        # the full range: F_guide drives the handle toward the goal from far away,
-        # F_fixture holds it precisely AT the goal once close (where F_guide
-        # vanishes because the policy twist → 0).
-        if self.DEBUG_ONLY_GUIDE:
-            f_total_normal = f_guide + f_fix
-            f_cbf_s = np.zeros(6)
-            f_guide_s = f_guide.copy()
-            f_fix_s = f_fix.copy()
-        elif self.grasp_active:
-            # Grasp execution: user input is ignored, but the operator should FEEL
-            # the autonomous motion. F_sync (real vs target) doesn't work here
-            # because the teleop reference is frozen/stale. Instead we apply a force
-            # proportional to the REAL EE displacement from the position it had when
-            # the grasp started (pulling the handle to follow the arm's motion) plus
-            # a velocity-following component so the user feels the direction of
-            # travel. The 180° Z-flip maps robot→Haption.
+        # Grasp execution takes PRECEDENCE over every other mode (including DEBUG):
+        # while the autonomy drives the arm the user input is ignored, so we drag
+        # the handle to FOLLOW the EE motion — the operator physically feels what
+        # the autonomous grasp / lift / abort-retreat is doing. (Previously this
+        # was an `elif` after DEBUG_ONLY_GUIDE, so in the active DEBUG mode the
+        # handle felt NOTHING during a grasp; now it always follows.)
+        if self.grasp_active:
             if self.pos_real is not None:
                 if self._grasp_start_pos is None:
                     self._grasp_start_pos = self.pos_real.copy()
-                # Position tether: pull handle toward where the arm IS now
+                # Position tether: pull the handle toward where the arm IS now,
+                # proportional to how far it has moved since the grasp started.
+                # The 180° Z-flip maps robot → Haption.
                 err = self.pos_real - self._grasp_start_pos
                 F_follow = self.GRASP_SYNC_BOOST * self.Kp_sync * err
                 F_haption = np.zeros(6)
@@ -822,6 +813,14 @@ class HapticForceManager(Node):
             f_cbf_s = np.zeros(6)
             f_guide_s = np.zeros(6)
             f_fix_s = np.zeros(6)
+        elif self.DEBUG_ONLY_GUIDE:
+            # Guidance-only mode: F_guide (velocity field, drives from far) +
+            # F_fixture (position spring, holds precisely at the goal).
+            self._grasp_start_pos = None  # reset so the next grasp re-anchors
+            f_total_normal = f_guide + f_fix
+            f_cbf_s = np.zeros(6)
+            f_guide_s = f_guide.copy()
+            f_fix_s = f_fix.copy()
         else:
             self._grasp_start_pos = None  # reset for next grasp
             pos_err = (np.linalg.norm(self.pos_real - self.pos_target)

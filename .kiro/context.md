@@ -87,6 +87,12 @@ In teleop mode (`POLICY_BELIEF_TEST=False`), `main_shared_autonomy.py` publishes
 - **Falling edge** (grasp done → HOLDING) → the clutch **re-anchors** at the actual post-grasp
   robot pose (resets `initialized=False`) so teleop resumes with no jump.
 
+> **Handle drag during autonomous phases (2026-06-29):** while `grasp_active=True`
+> (grasp/align/approach/close/lift/abort-lift) the force manager applies `F_follow` — a position
+> tether pulling the handle to follow the EE's displacement since grasp start — so the operator
+> physically feels the autonomous motion. This now takes **precedence over `DEBUG_ONLY_GUIDE`**
+> (previously the DEBUG branch short-circuited it, so the handle felt nothing during a grasp).
+
 ### 4.2 Position Virtual Fixture (haptic_force_manager_tutorial.py)
 
 `main_shared_autonomy.py` publishes `/shared_autonomy/active_goal_pose`
