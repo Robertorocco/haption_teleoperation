@@ -27,6 +27,14 @@ class HapticForceManager(Node):
         self.pos_real = None
         self.rot_real = None
         self.vel_haption = np.zeros(6)  
+        # Dedicated LPF of the device velocity, used ONLY in the F_guide damping
+        # term. The raw device velocity is noisy; the guidance law multiplies it
+        # by D_guide (~42), so feeding RAW velocity into −D·v_handle injects that
+        # sensor noise straight into the wrench (felt as buzz/vibration). We keep
+        # the raw self.vel_haption for the other layers (sync/global damping, per
+        # the existing design note) and use this filtered copy for guidance only.
+        self.vel_haption_f = np.zeros(6)
+        self.VEL_LPF_ALPHA = 0.25   # first-order LPF coeff on the guidance velocity
 
         # --- CBF State Variables ---
         self.grad_cbf_right = np.zeros(6)
@@ -75,12 +83,14 @@ class HapticForceManager(Node):
         #     way, but through the user's hand;
         #   * vanishes at the goal (pi_blend -> 0), so it settles instead of
         #     pushing the handle past it.
-        self.D_guide_lin = 33.6   # Ns/m  velocity-field tracking gain (translation) [1.2x]
-        self.D_guide_ang = 0.54   # Nms/rad velocity-field tracking gain (rotation) [1.2x]
-        self.MAX_GUIDE_FORCE  = 4.2   # N   saturation on the guidance force  [1.2x]
-        self.MAX_GUIDE_TORQUE = 0.30  # Nm  saturation on the guidance torque [1.2x]
-        # ^ scaled 1.2x vs the first pass: near the goal the policy twist (and thus
-        #   v_field) is small, so the raw guidance struggled to move the handle.
+        self.D_guide_lin = 42.0   # Ns/m  velocity-field tracking gain (translation) [stronger]
+        self.D_guide_ang = 0.68   # Nms/rad velocity-field tracking gain (rotation) [stronger]
+        self.MAX_GUIDE_FORCE  = 5.0   # N   saturation on the guidance force  [stronger]
+        self.MAX_GUIDE_TORQUE = 0.38  # Nm  saturation on the guidance torque [stronger]
+        # ^ scaled up ~1.25x vs the previous pass: the operator asked for slightly
+        #   stronger assistance. Near the goal the policy twist (and thus v_field)
+        #   is small, so the raw guidance still needs enough authority to move the
+        #   handle; the final 2nd-order filter + MAX_TOTAL cap keep it smooth/bounded.
 
         # --- Proximity gate on F_guide -------------------------------------- #
         # The velocity-field policy is LARGE far from the goal (tanh-saturated
@@ -200,6 +210,24 @@ class HapticForceManager(Node):
         # these to set "how much the assistance is allowed to push".
         self.MAX_TOTAL_FORCE  = 5.0   # N
         self.MAX_TOTAL_TORQUE = 0.4   # Nm
+
+        # --- Final output smoothing: 2nd-order critically-damped low-pass ------ #
+        # The wrench actually injected into the device is passed through a
+        # second-order critically-damped (ζ = 1) low-pass filter before publishing.
+        # Why second-order critically damped (and not just the per-layer first-order
+        # LPFs)?
+        #   * ζ = 1 is the FASTEST non-oscillatory response: the transfer function
+        #     ωn²/(s² + 2ωn s + ωn²) has NO resonant peak, so it cannot amplify or
+        #     ring at any frequency — it strictly attenuates the velocity-noise
+        #     ripple and the policy/belief stair-steps.
+        #   * It is C¹: both the force AND its time-derivative are continuous, so
+        #     the operator feels a smooth, jerk-free wrench (a first-order LPF only
+        #     guarantees C⁰ — the force is continuous but its slope can still step).
+        # fc sets the bandwidth: high enough (~12 Hz) to stay responsive for
+        # guidance, low enough to sit below device/hand tremor resonance.
+        self.FORCE_FILTER_FC = 12.0   # Hz  cutoff of the output wrench filter
+        self._ft_y  = np.zeros(6)     # filter state: filtered wrench
+        self._ft_yd = np.zeros(6)     # filter state: filtered wrench derivative
 
         # --- Data Buffers & Synchronization ---
         self.plot_lock = threading.Lock()
@@ -493,15 +521,21 @@ class HapticForceManager(Node):
             self.rot_real = R.from_euler('xyz', rpy, degrees=False)
 
     def vel_cb(self, msg):
-        """Updates the current 6D spatial velocity (raw, unfiltered)."""
-        # NOTE: velocity-measurement LPF removed on purpose. The previous
-        # first-order filter added phase lag to every velocity-dependent force
-        # (guidance damping, sync, etc.), which is itself a destabiliser in a
-        # sampled-data haptic loop. We now use the raw device velocity directly.
+        """Updates the current 6D spatial velocity (raw, unfiltered).
+
+        We keep the RAW device velocity for the sync / global-damping layers (per
+        the existing design note: a velocity LPF there adds phase lag that can
+        destabilise those stiffer terms). Separately we maintain a low-pass-filtered
+        copy (self.vel_haption_f) used ONLY by the guidance damping term, where the
+        large D_guide gain would otherwise amplify the raw velocity sensor noise
+        into audible/felt buzz.
+        """
         self.vel_haption = np.array([
             msg.linear.x, msg.linear.y, msg.linear.z,
             msg.angular.x, msg.angular.y, msg.angular.z
         ])
+        a = self.VEL_LPF_ALPHA
+        self.vel_haption_f = (1.0 - a) * self.vel_haption_f + a * self.vel_haption
 
     def cbf_gradient_cb(self, msg):
         """Updates the control barrier function gradients mapped from the QP controller."""
@@ -693,7 +727,9 @@ class HapticForceManager(Node):
 
         # Velocity-field tracking force: drive the handle velocity toward v_field.
         # Intrinsically damped via the −v_handle term, so it cannot run away.
-        dv = v_field - self.vel_haption
+        # Use the FILTERED handle velocity here: the raw signal is noisy and the
+        # large D_guide gain would otherwise inject that noise as buzz/vibration.
+        dv = v_field - self.vel_haption_f
         F_guide_raw = np.zeros(6)
         F_guide_raw[0:3] = self.D_guide_lin * dv[0:3] * gain
         F_guide_raw[3:6] = self.D_guide_ang * dv[3:6] * gain
@@ -916,9 +952,20 @@ class HapticForceManager(Node):
         # ========================================================
         # CLIPPING & PUBLISHING
         # ========================================================
+        # --- FINAL OUTPUT SMOOTHING: 2nd-order critically-damped low-pass ----- #
+        # Smooth the wrench actually injected into the device. ζ = 1 (critically
+        # damped) ⇒ no overshoot/ringing and C¹ continuity (smooth force AND
+        # smooth force-rate), so the handle never feels stepped or buzzy.
+        # Discrete semi-implicit integration of  ÿ = ωn²(u − y) − 2ωn ẏ :
+        wn = 2.0 * np.pi * self.FORCE_FILTER_FC
+        self._ft_yd += self.dt * (wn * wn * (f_total - self._ft_y) - 2.0 * wn * self._ft_yd)
+        self._ft_y  += self.dt * self._ft_yd
+        f_total = self._ft_y.copy()
+
+        # Hard safety clip is the LAST stage, so the injected vector is always
+        # bounded regardless of the filter transient.
         f_total[0:3] = np.clip(f_total[0:3], -self.MAX_FORCE, self.MAX_FORCE)
         f_total[3:6] = np.clip(f_total[3:6], -self.MAX_TORQUE, self.MAX_TORQUE)
-
         msg = Wrench()
         msg.force.x, msg.force.y, msg.force.z = float(f_total[0]), float(f_total[1]), float(f_total[2])
         msg.torque.x, msg.torque.y, msg.torque.z = float(f_total[3]), float(f_total[4]), float(f_total[5])
