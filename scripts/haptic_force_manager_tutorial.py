@@ -79,7 +79,7 @@ class HapticForceManager(Node):
         self.D_guide_lin = 33.6   # Ns/m  velocity-field tracking gain (translation) [1.2x]
         self.D_guide_ang = 0.54   # Nms/rad velocity-field tracking gain (rotation) [1.2x]
         self.MAX_GUIDE_FORCE  = 4.2   # N   saturation on the guidance force  [1.2x]
-        self.MAX_GUIDE_TORQUE = 0.15  # Nm  saturation on the guidance torque [lowered: less aggressive rotation]
+        self.MAX_GUIDE_TORQUE = 0.10  # Nm  saturation on the guidance torque [reduced further]
         # ^ scaled 1.2x vs the first pass: near the goal the policy twist (and thus
         #   v_field) is small, so the raw guidance struggled to move the handle.
 
@@ -125,9 +125,9 @@ class HapticForceManager(Node):
         self.fix_goal_pos = None
         self.fix_goal_rot = None
         self.fix_confidence = 0.0
-        self.K_fix_force  = 30.0      # N/m   position spring toward the grasp pose [raised for stronger near-goal pull]
+        self.K_fix_force  = 20.0      # N/m   position spring toward the grasp pose
         self.K_fix_torque = 0.15      # Nm/rad orientation spring toward grasp orientation
-        self.MAX_FIX_FORCE  = 4.0     # N     saturation [raised for clear last-cm guidance]
+        self.MAX_FIX_FORCE  = 3.0     # N     saturation
         self.MAX_FIX_TORQUE = 0.25    # Nm    saturation
         self.FIX_CONF_LO = 0.55       # below this belief -> fixture OFF
         self.FIX_CONF_HI = 0.85       # at/above this belief -> full fixture
