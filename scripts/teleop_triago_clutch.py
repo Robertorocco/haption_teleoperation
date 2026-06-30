@@ -3,7 +3,7 @@
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Float64MultiArray, Bool
+from std_msgs.msg import Float64MultiArray, Bool, String
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -50,23 +50,40 @@ class TeleopClutch(Node):
         # 2b. Listen to the grasp-execution handover flag from shared_autonomy
         self.create_subscription(Bool, '/shared_autonomy/grasp_active', self.grasp_active_callback, 10)
         
-        # 3. Publish Command to Controller
-        self.cmd_pub = self.create_publisher(Float64MultiArray, '/arm_right/cartesian_reference', 10)
+        # 3. Publish Command to Controller (switchable between arms)
+        self.active_arm = 'right'
+        self.cmd_pub_right = self.create_publisher(Float64MultiArray, '/arm_right/cartesian_reference', 10)
+        self.cmd_pub_left = self.create_publisher(Float64MultiArray, '/arm_left/cartesian_reference', 10)
+        self.cmd_pub = self.cmd_pub_right  # current active publisher
+
+        # 4. Subscribe to arm-switch notifications from shared_autonomy
+        self.create_subscription(String, '/shared_autonomy/active_arm', self.active_arm_cb, 10)
 
         # Control loop timer
         self.timer = self.create_timer(self.dt, self.integration_loop)
         
         self.get_logger().info("Teleop Clutch started. Waiting for initial TRIAGo pose...")
 
+    def active_arm_cb(self, msg):
+        """Switches which arm the teleop publishes to."""
+        if msg.data in ('right', 'left') and msg.data != self.active_arm:
+            self.active_arm = msg.data
+            self.cmd_pub = self.cmd_pub_right if msg.data == 'right' else self.cmd_pub_left
+            # Force a re-anchor so integration starts from the new arm's pose.
+            self.initialized = False
+            self.get_logger().info(f"[TELEOP] Arm switched to {msg.data.upper()}. Re-anchoring.")
+
     def ee_callback(self, msg):
         """Grabs the robot's current pose to initialize the integration anchor."""
         if not self.initialized:
             try:
-                # Extract initial Position
-                self.ref_pos = np.array(msg.data[0:3])
-                
-                # Extract initial Orientation (RPY)
-                rpy_real = np.array(msg.data[12:15])
+                # EE real layout: [pos_R(3), vel_R(3), pos_L(3), vel_L(3), rpy_R(3), rpy_L(3)]
+                if self.active_arm == 'right':
+                    self.ref_pos = np.array(msg.data[0:3])
+                    rpy_real = np.array(msg.data[12:15])
+                else:
+                    self.ref_pos = np.array(msg.data[6:9])
+                    rpy_real = np.array(msg.data[15:18])
                 self.ref_rot = R.from_euler('xyz', rpy_real, degrees=False)
                 
                 self.initialized = True

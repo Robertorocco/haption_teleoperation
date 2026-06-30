@@ -194,7 +194,7 @@ class HapticForceManager(Node):
         # even when the cumulative position error in Z is small (e.g. after a
         # top-grasp approach that first moved down then lifts back up).
         self.GRASP_FOLLOW_KP = 30.0    # N/m   position tether toward where the arm is now
-        self.GRASP_FOLLOW_KD = 120.0   # Ns/m  velocity-following (feels direction/speed of travel)
+        self.GRASP_FOLLOW_KD = 160.0   # Ns/m  velocity-following (feels direction/speed of travel)
         self.K_cbf_force = 2.0   
         self.K_cbf_torque = 0.1  
         self.MAX_FORCE = 10.0 
@@ -260,6 +260,10 @@ class HapticForceManager(Node):
         self.create_subscription(Float64MultiArray, '/shared_autonomy/active_goal_pose', self.goal_pose_cb, 10)
         # Grasp-execution flag: when True, output strong pure F_sync (track the EE)
         self.create_subscription(Bool, '/shared_autonomy/grasp_active', self.grasp_active_cb, 10)
+        # Arm switch: follow the active arm for EE state slicing and reference topic
+        self.active_arm = 'right'
+        self.create_subscription(String, '/shared_autonomy/active_arm', self.active_arm_cb, 10)
+        self.create_subscription(Float64MultiArray, '/arm_left/cartesian_reference', self.target_cb_left, 10)
         
         self.force_pub = self.create_publisher(Wrench, 'virtuose/force_cmd', 10)
 
@@ -486,24 +490,41 @@ class HapticForceManager(Node):
         """Tracks whether the shared-autonomy node is autonomously driving a grasp."""
         self.grasp_active = bool(msg.data)
 
+    def active_arm_cb(self, msg):
+        """Switches which arm's EE data is used for force computation."""
+        if msg.data in ('right', 'left') and msg.data != self.active_arm:
+            self.active_arm = msg.data
+            self.get_logger().info(f"[FORCE MGR] Active arm switched to {msg.data.upper()}")
+
     def target_cb(self, msg):
-        """Updates the target Cartesian position and orientation of the TRIAGo arm."""
+        """Updates the target Cartesian position and orientation (right arm reference)."""
+        if self.active_arm != 'right':
+            return
+        if len(msg.data) >= 6:
+            self.pos_target = np.array(msg.data[0:3])
+            rpy = np.array(msg.data[3:6])
+            self.rot_target = R.from_euler('xyz', rpy, degrees=False)
+
+    def target_cb_left(self, msg):
+        """Updates the target Cartesian position and orientation (left arm reference)."""
+        if self.active_arm != 'left':
+            return
         if len(msg.data) >= 6:
             self.pos_target = np.array(msg.data[0:3])
             rpy = np.array(msg.data[3:6])
             self.rot_target = R.from_euler('xyz', rpy, degrees=False)
 
     def real_cb(self, msg):
-        """Updates the real Cartesian position and orientation of the TRIAGo arm."""
-        if len(msg.data) >= 15:
-            self.pos_real = np.array(msg.data[0:3])
-            # Right-arm EE LINEAR velocity (indices 3:6 of the 18-float ee_real:
-            # [pos_R(3), vel_R(3), pos_L(3), vel_L(3), rpy_R(3), rpy_L(3)]). This
-            # is the model velocity (pin.getFrameVelocity), clean — not a noisy
-            # finite difference — so it is safe to render as a guidance force.
-            if len(msg.data) >= 18:
+        """Updates the real Cartesian position and orientation of the active arm."""
+        if len(msg.data) >= 18:
+            if self.active_arm == 'right':
+                self.pos_real = np.array(msg.data[0:3])
                 self.vel_real = np.array(msg.data[3:6])
-            rpy = np.array(msg.data[12:15])
+                rpy = np.array(msg.data[12:15])
+            else:
+                self.pos_real = np.array(msg.data[6:9])
+                self.vel_real = np.array(msg.data[9:12])
+                rpy = np.array(msg.data[15:18])
             self.rot_real = R.from_euler('xyz', rpy, degrees=False)
 
     def vel_cb(self, msg):
