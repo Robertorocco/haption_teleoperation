@@ -1,7 +1,7 @@
 # AI Agent Context — haption_teleoperation
 
 > **This file is maintained by the AI agent. Do not edit manually.**
-> Last updated: 2026-06-23 (initial context from package upload)
+> Last updated: 2026-06-29 (per-arm bimanual, cost-decoupling, dual FSM/belief, arm-switch, grasp-fail retreat, force tuning)
 
 ---
 
@@ -279,10 +279,20 @@ ros2 run haption_teleoperation workspace_debug_visualizer.py
 | Area | Status | Notes |
 |------|--------|-------|
 | virtuose_server_node (C++) | ✅ Working | 150 Hz impedance loop, stable |
-| teleop_triago_clutch.py | ✅ Working | Clutch-indexing, 180° frame flip |
-| haptic_force_manager.py | 🔧 Active dev | Force layers all functional; F_guide goal hierarchy hardcoded for a previous experiment (Battery/Hole layout) — needs updating for the Red/Blue/Platform goal set in triago_control |
+| teleop_triago_clutch.py | ✅ Working | Clutch-indexing, 180° frame flip; follows `/shared_autonomy/active_arm` to switch between left/right `/arm_*/cartesian_reference` |
+| haptic_force_manager_tutorial.py | ✅ Working | `DEBUG_ONLY_GUIDE=True`: F_guide (velocity-field) + F_fixture (position spring near goal). `grasp_active` takes precedence → drag handle to follow EE motion during autonomous phases (KP=30 + KD=160 velocity-following). MAX_GUIDE_TORQUE=0.10 Nm. Follows active arm via `/shared_autonomy/active_arm` (reads correct arm's reference + EE slice). |
 | Passivity controller | ⚠️ Disabled | `ENABLE_PASSIVITY_CONTROL = False`; tuning pending |
 | calibration_main.cpp | ✅ Working | Joint limits discovered and documented |
+| Bimanual arm switch | ✅ Working | Both nodes (teleop + force mgr) subscribe to `/shared_autonomy/active_arm`; switch publishers/EE slices dynamically. Teleop re-anchors from the new arm's EE pose on switch. |
+
+---
+
+## 15. Known Issues / Next Steps for the Next Agent
+
+| Issue | Description | Proposed Fix |
+|-------|-------------|-------------|
+| **Residual inactive-arm motion** | The inactive arm moves when the active arm moves fast. Root cause: the single shared scalar SoftMin CBF row `J_soft·q̇ ≥ b` mixes BOTH arms' Jacobian columns, so the global QP optimizer recruits the inactive arm's joints to cheaply satisfy the barrier. | **Per-arm SoftMin split**: instead of one scalar CBF row, emit two: right-involving pairs → one row touching only right joints; left-involving pairs → one row touching only left joints; inter-arm pairs contribute a shared row over both (keeps inter-arm safety). This makes the inactive arm's cost penalty (2× DAMP, MAX slack, GAMMA_MAX) actually effective since no barrier demand touches its joints unless the inter-arm pair itself is active. Contained change in `collision_manager.compute_softmin_jacobian` (return per-arm `J_soft`/`h_soft`) + `qp_formulator` (two CBF rows instead of one). |
+| **Gazebo LinkAttacher dual-attach** | The IFRA_LinkAttacher plugin has a global `IsAttached` boolean that allows only ONE attachment in the whole world. A patched `gazebo_link_attacher.cpp` was provided to the user (per-pair gating, vector-based erase in Detach) but not yet confirmed working in simulation. | User must replace the plugin source, rebuild `ros2_linkattacher`, and verify two simultaneous attach/detach calls. |
 
 ---
 
