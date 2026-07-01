@@ -125,9 +125,9 @@ class HapticForceManager(Node):
         self.fix_goal_pos = None
         self.fix_goal_rot = None
         self.fix_confidence = 0.0
-        self.K_fix_force  = 20.0      # N/m   position spring toward the grasp pose
+        self.K_fix_force  = 24.0      # N/m   position spring toward the grasp pose [+20%, for testing]
         self.K_fix_torque = 0.15      # Nm/rad orientation spring toward grasp orientation
-        self.MAX_FIX_FORCE  = 3.0     # N     saturation
+        self.MAX_FIX_FORCE  = 3.6     # N     saturation [+20%, for testing]
         self.MAX_FIX_TORQUE = 0.25    # Nm    saturation
         self.FIX_CONF_LO = 0.55       # below this belief -> fixture OFF
         self.FIX_CONF_HI = 0.85       # at/above this belief -> full fixture
