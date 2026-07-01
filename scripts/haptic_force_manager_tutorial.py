@@ -261,7 +261,7 @@ class HapticForceManager(Node):
         self.create_subscription(Float64MultiArray, '/qp_debug/ee_real', self.real_cb, 10)
         self.create_subscription(Twist, 'virtuose/velocity', self.vel_cb, 10)
         self.create_subscription(Float64MultiArray, '/collision_constraints', self.cbf_gradient_cb, 10)
-        self.create_subscription(Float64, '/qp_debug/lambda_cbf', self.lambda_cb, 10)
+        self.create_subscription(Float64MultiArray, '/qp_debug/lambda_cbf', self.lambda_cb, 10)
         self.create_subscription(Float64MultiArray, 'virtuose/articular_position', self.joint_cb, 10)
         #self.create_subscription(Float64MultiArray, '/shared_autonomy/assistive_reference', self.assist_cb, 10)
         self.create_subscription(Bool, 'virtuose/button_right', self.button_cb, 10)
@@ -553,15 +553,29 @@ class HapticForceManager(Node):
         ])
 
     def cbf_gradient_cb(self, msg):
-        """Updates the control barrier function gradients mapped from the QP controller."""
-        if len(msg.data) >= 13:
-            self.grad_cbf_right = np.array(msg.data[1:7])
+        """Updates the control barrier function gradients mapped from the QP controller.
+
+        Layout (14 floats, per-arm CBF split): [b_col_r, b_col_l, J_c_cart_R(6),
+        J_c_cart_L(6)] -- was 13 floats [b_col, J_c_cart_R(6), J_c_cart_L(6)]
+        before the per-arm SoftMin split. This device always drives the RIGHT
+        gripper's cartesian gradient (indices 2:8, was 1:7).
+        """
+        if len(msg.data) >= 14:
+            self.grad_cbf_right = np.array(msg.data[2:8])
 
     def lambda_cb(self, msg):
-        """Updates the active CBF slack variable representing obstacle proximity."""
-        self.lambda_cbf = msg.data
+        """Updates the active CBF shadow price representing obstacle proximity.
+
+        msg.data = [lambda_cbf_R, lambda_cbf_L] (two independent per-arm shadow
+        prices, replacing the old single combined scalar). This device always
+        drives the right gripper, so we take lambda_cbf_R.
+        """
+        if len(msg.data) < 1:
+            return
+        lambda_r = float(msg.data[0])
+        self.lambda_cbf = lambda_r
         self.lambda_cbf_f = ((1.0 - self.CBF_LAMBDA_ALPHA) * self.lambda_cbf_f
-                             + self.CBF_LAMBDA_ALPHA * max(0.0, float(msg.data)))
+                             + self.CBF_LAMBDA_ALPHA * max(0.0, lambda_r))
 
     def joint_cb(self, msg):
         """Updates the current 6-DoF joint positions directly from the Haption encoders."""
