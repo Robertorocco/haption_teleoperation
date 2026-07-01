@@ -96,8 +96,12 @@ class HapticForceManager(Node):
         self.GUIDE_PROX_FAR  = 1.00   # m — beyond this: device free (gate = 0)
         self.GUIDE_PROX_NEAR = 0.10   # m — at/below this: full guidance (gate = 1)
 
-        # DEBUG: set True to output ONLY F_guide (isolate guidance for testing)
-        self.DEBUG_ONLY_GUIDE = True
+        # DEBUG: set True to output ONLY F_guide (isolate guidance for testing).
+        # Set to False to re-enable the full superposition path (F_sync active;
+        # F_cbf still EVALUATED every tick for telemetry/plots but its
+        # contribution to f_total_normal is commented out below — see
+        # "F_CBF DISABLED" in control_loop).
+        self.DEBUG_ONLY_GUIDE = False
 
         # --- Continuous Policy-Merging (Belief-Weighted Blend) Parameters ---
         # Instead of a winner-take-all gate that snaps pi_ref from one goal's
@@ -896,14 +900,17 @@ class HapticForceManager(Node):
             sync_share = min(self.SYNC_SHARE_AT_FULL * divergence, self.SYNC_SHARE_CAP)
 
             # Guidance (guide + fix) yields as the sync demand grows (reference
-            # drifting far). CBF is simply boosted 1.2x (no lambda-driven share —
-            # that injected oscillation via closed-loop coupling).
+            # drifting far).
             guide_gain = float(np.clip(1.0 - sync_share, 0.0, 1.0))
-            f_cbf_s = self.CBF_GAIN_BOOST * f_cbf
+            # F_CBF DISABLED (per operator request): compute_F_cbf() above is still
+            # called every tick — f_cbf keeps updating (LPF state, telemetry, plot
+            # trace) — but its contribution to the total wrench is zeroed out here.
+            # f_cbf_s = self.CBF_GAIN_BOOST * f_cbf
+            f_cbf_s = np.zeros(6)
             f_guide_s = guide_gain * f_guide
             f_fix_s = guide_gain * f_fix
 
-            # Calculate the normal running force
+            # Calculate the normal running force (F_sync + guidance; F_cbf excluded)
             f_total_normal = f_sync + f_cbf_s + f_guide_s + f_fix_s + f_vib
 
             # --- AUTHORITY CAP --------------------------------------------- #
