@@ -133,6 +133,16 @@ class HapticForceManager(Node):
         self.FIX_CONF_HI = 0.85       # at/above this belief -> full fixture
         self.alpha_fix = 0.15         # LPF on the fixture wrench (C0 continuity)
         self.f_fix_filtered = np.zeros(6)
+        # --- Near-goal ORIENTATION assist (help the user rotate the gripper) ---
+        # Rotating the handle to align the gripper is hard from the operator's POV,
+        # so VERY CLOSE to the goal we strengthen the fixture torque (~20%) and add
+        # angular damping so it is "strong but damped" — it drives small residual
+        # orientation errors (~10 deg) to alignment without oscillating. Ramped by
+        # the EE→goal distance (full within *_NEAR, off beyond *_FAR).
+        self.FIX_TORQUE_NEAR = 0.05        # m — full orientation assist within 5 cm of the goal
+        self.FIX_TORQUE_FAR  = 0.12        # m — no assist beyond 12 cm
+        self.FIX_TORQUE_NEAR_BOOST = 0.20  # +20% torque gain/saturation at the goal
+        self.K_FIX_TORQUE_DAMP = 0.06      # Nms/rad angular damping (kills oscillation)
 
         # --- NEW: Clutching Architecture Variables ---
         self.is_clutching = False
@@ -772,14 +782,30 @@ class HapticForceManager(Node):
         # Orientation spring: R_err = R_goal · R_real^T (robot frame)
         err_rot_vec = R.from_matrix(
             self.fix_goal_rot.as_matrix() @ self.rot_real.as_matrix().T).as_rotvec()
-        Tau_fix_robot = self.K_fix_torque * err_rot_vec
-        Tau_fix_robot = self.MAX_FIX_TORQUE * np.tanh(Tau_fix_robot / self.MAX_FIX_TORQUE)
+
+        # Near-goal orientation ASSIST: strengthen the torque (up to +20%) as the
+        # EE approaches the goal, so small residual rotation errors get actively
+        # driven to alignment (the operator struggles to do this by hand). Ramped
+        # by the EE→goal distance (full within FIX_TORQUE_NEAR, off past *_FAR).
+        d_goal = float(np.linalg.norm(self.fix_goal_pos - self.pos_real))
+        prox = np.clip(
+            (self.FIX_TORQUE_FAR - d_goal)
+            / max(self.FIX_TORQUE_FAR - self.FIX_TORQUE_NEAR, 1e-6), 0.0, 1.0)
+        prox = 3.0 * prox ** 2 - 2.0 * prox ** 3     # smoothstep
+        tau_scale = 1.0 + self.FIX_TORQUE_NEAR_BOOST * prox
+        K_tau = self.K_fix_torque * tau_scale
+        max_tau = self.MAX_FIX_TORQUE * tau_scale
+        Tau_fix_robot = max_tau * np.tanh(K_tau * err_rot_vec / max_tau)
 
         # Map robot -> Haption frame (180° Z-flip), scaled by the confidence gate.
         F_fix_raw = np.array([
             -F_fix_robot[0],   -F_fix_robot[1],    F_fix_robot[2],
             -Tau_fix_robot[0], -Tau_fix_robot[1],  Tau_fix_robot[2],
-        ]) * gate
+        ])
+        # "Damped but strong": near the goal, oppose the handle's angular velocity
+        # so the strengthened torque settles the orientation instead of ringing.
+        F_fix_raw[3:6] -= self.K_FIX_TORQUE_DAMP * prox * self.vel_haption[3:6]
+        F_fix_raw *= gate
 
         self.f_fix_filtered = (self.alpha_fix * F_fix_raw
                                + (1.0 - self.alpha_fix) * self.f_fix_filtered)
