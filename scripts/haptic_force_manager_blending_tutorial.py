@@ -13,14 +13,17 @@ Blending:
   ref_blended = (1 - alpha) * ref_user + alpha * ref_assistive
 
   where:
-    ref_assistive = belief-weighted sum of per-goal assistive twists (integrated),
+    ref_assistive = user_ref + (belief-weighted policy twist) * ASSIST_LOOKAHEAD_S,
+                    i.e. a lookahead point along the goal-directed flow (capped),
                     ensuring continuity in the reference as beliefs shift.
-    alpha = ALPHA_MAX * max_belief   (continuous function of the peak belief,
-            capped so the user ALWAYS retains at least 20% authority).
-    ALPHA_MAX = 0.80  ->  at 100% belief the autonomy contributes 80%.
+    alpha = ALPHA_MAX * x**ALPHA_GAMMA, x = normalised peak belief in [0,1]
+            (continuous, capped so the user ALWAYS retains >= 20% authority).
+    ALPHA_MAX = 0.80  ->  at 100% belief the autonomy contributes up to 80%.
+    ALPHA_GAMMA < 1   ->  alpha ramps toward ALPHA_MAX quickly once belief is
+                          "sufficiently high", rather than only near-certainty.
 
 Force output:
-  f_total = F_sync + F_limit_warning + global_damping
+  f_total = F_sync (boosted Kp/Kp_ang) + F_limit_warning + global_damping
 
 Plot:
   Window 1: F_sync wrench (3 force + 3 torque)
@@ -62,6 +65,29 @@ class HapticForceManagerBlending(Node):
         self.alpha = 0.0             # Current blending factor (updated every tick)
         self.alpha_lpf = 0.0         # Low-pass filtered alpha for smooth transitions
         self.ALPHA_LPF_COEFF = 0.08  # LPF coefficient (lower = smoother)
+        # Shapes HOW FAST alpha climbs toward ALPHA_MAX as belief rises above
+        # uniform. x = normalised belief in [0,1]; alpha = ALPHA_MAX * x**ALPHA_GAMMA.
+        # GAMMA < 1 bows the curve UPWARD: alpha reaches most of ALPHA_MAX well
+        # before belief is fully certain, so "sufficiently confident" beliefs
+        # already hand strong authority to the policy instead of only the last
+        # few % of certainty mattering (which is what GAMMA=1, i.e. the old
+        # linear mapping, did).
+        self.ALPHA_GAMMA = 0.5       # <1 = faster ramp-up; 1.0 = linear (old behavior)
+
+        # --- Assistive-trajectory lookahead (how strongly the policy pulls) ---
+        # The per-goal twists in /shared_autonomy/user_policy are velocity
+        # COMMANDS (m/s, rad/s), not offsets. Multiplying by a single control
+        # tick (dt ~ 6.7 ms) produces a sub-millimeter nudge that blending can
+        # never make visible, no matter how high alpha climbs. Instead we place
+        # the assistive reference point ASSIST_LOOKAHEAD_S seconds AHEAD along
+        # the belief-weighted policy flow -- exactly like a pure-pursuit lookahead
+        # point -- so a confident belief produces a clearly displaced assistive
+        # target, capped for safety (MAX_ASSIST_OFFSET / MAX_ASSIST_ANGLE) so a
+        # transient large policy twist can never fling the blended reference far
+        # from the user's own commanded pose.
+        self.ASSIST_LOOKAHEAD_S = 1.5     # s   how far ahead along the policy flow
+        self.MAX_ASSIST_OFFSET = 0.25     # m   cap on the position lookahead offset
+        self.MAX_ASSIST_ANGLE = 0.6       # rad cap on the rotation lookahead offset
 
 
         # --- Inference State Variables ---
@@ -82,9 +108,18 @@ class HapticForceManagerBlending(Node):
         self.joint_max = np.array([0.781944, -0.0654231, 2.49752, 2.82038, 1.04722, 2.09453])
 
         # --- Sync Force Parameters ---
-        self.Kp_sync = 10.0
-        self.Kd_sync = 0.0
-        self.Kp_sync_ang = 0.3       # Nm/rad orientation sync spring
+        # F_sync is now the ONLY force the operator ever feels (no more F_guide /
+        # F_fixture / F_cbf at the haptic level), so it must be strong enough on
+        # its own to convey EVERY divergence between the user's raw reference and
+        # the robot's real EE -- including the divergence CAUSED by the blended
+        # reference pulling the robot toward the assistive trajectory. The old
+        # Kp_sync=10.0 N/m was tuned when F_sync was just one of several force
+        # channels; boosted 3.5x here so a few-cm reference/real gap is clearly
+        # felt (e.g. 5cm error: 0.5N -> 1.75N) while staying well under the
+        # MAX_FORCE=10N safety clip for realistic tracking errors.
+        self.Kp_sync = 35.0          # N/m   [was 10.0]
+        self.Kd_sync = 0.0           # kept at 0: global damping (below) already covers this
+        self.Kp_sync_ang = 1.0       # Nm/rad orientation sync spring [was 0.3]
 
         # --- Global Force Limits ---
         self.MAX_FORCE = 10.0
@@ -429,13 +464,16 @@ class HapticForceManagerBlending(Node):
 
         max_belief = max(self.goal_probs)
         # Scale so alpha=0 at uniform and alpha=ALPHA_MAX at certainty.
-        # With N goals, uniform max_belief = 1/N. Map [1/N, 1] -> [0, ALPHA_MAX].
+        # With N goals, uniform max_belief = 1/N. Map [1/N, 1] -> [0, 1] first...
         n_goals = len(self.goal_probs)
         uniform_max = 1.0 / n_goals if n_goals > 0 else 1.0
         if max_belief <= uniform_max:
             return 0.0
-        # Linear mapping from [uniform, 1] -> [0, ALPHA_MAX]
-        raw_alpha = self.ALPHA_MAX * (max_belief - uniform_max) / (1.0 - uniform_max)
+        x = (max_belief - uniform_max) / (1.0 - uniform_max)   # normalised belief in [0, 1]
+        # ...then apply the GAMMA reshaping (see ALPHA_GAMMA docstring in __init__):
+        # GAMMA < 1 makes alpha climb toward ALPHA_MAX much faster once belief is
+        # "sufficiently high", instead of needing near-total certainty.
+        raw_alpha = self.ALPHA_MAX * (x ** self.ALPHA_GAMMA)
         return float(np.clip(raw_alpha, 0.0, self.ALPHA_MAX))
 
     def compute_blended_reference(self):
@@ -473,15 +511,28 @@ class HapticForceManagerBlending(Node):
         # pi_assistive = sum_k P(k) * pi_k  (convex combination -> continuous)
         pi_assistive = probs @ policies  # shape (6,)
 
-        # Integrate the assistive twist into a position/orientation offset
-        # relative to the user's current reference (one tick of dt)
-        dp_assist = pi_assistive[0:3] * self.dt   # small position delta
-        dw_assist = pi_assistive[3:6] * self.dt   # small orientation delta
+        # --- Lookahead point along the policy flow (NOT a one-tick delta) ---
+        # pi_assistive is a velocity (m/s, rad/s). Projecting it ASSIST_LOOKAHEAD_S
+        # seconds ahead gives a genuinely displaced assistive target -- this is
+        # what makes alpha's effect visible: a confident belief now pulls the
+        # blended reference toward a point noticeably further along the goal
+        # direction, not a sub-millimeter nudge. Capped (MAX_ASSIST_OFFSET /
+        # MAX_ASSIST_ANGLE) so a momentary large policy twist can't fling the
+        # assistive target far from the user's own commanded pose.
+        dp_raw = pi_assistive[0:3] * self.ASSIST_LOOKAHEAD_S
+        dw_raw = pi_assistive[3:6] * self.ASSIST_LOOKAHEAD_S
 
-        # Assistive reference = user_ref + assistive_delta (robot frame)
-        pos_assist = self.pos_target + dp_assist
-        # Orientation: compose a small rotation dR onto the user's orientation
-        dR = R.from_rotvec(dw_assist)
+        dp_norm = float(np.linalg.norm(dp_raw))
+        if dp_norm > self.MAX_ASSIST_OFFSET:
+            dp_raw = dp_raw * (self.MAX_ASSIST_OFFSET / dp_norm)
+        dw_norm = float(np.linalg.norm(dw_raw))
+        if dw_norm > self.MAX_ASSIST_ANGLE:
+            dw_raw = dw_raw * (self.MAX_ASSIST_ANGLE / dw_norm)
+
+        # Assistive reference = user_ref + lookahead_offset (robot frame)
+        pos_assist = self.pos_target + dp_raw
+        # Orientation: compose the lookahead rotation onto the user's orientation
+        dR = R.from_rotvec(dw_raw)
         rot_assist = dR * self.rot_target
 
         # Blend: ref_blended = (1 - alpha) * user + alpha * assistive
