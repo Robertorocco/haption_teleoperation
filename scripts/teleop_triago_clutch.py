@@ -8,6 +8,13 @@ from std_msgs.msg import Float64MultiArray, Bool, String
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+# Single source of truth for the shared-autonomy blending architecture (also
+# read by triago_control/scripts/qp_arm_teleop/main_shared_autonomy.py). See
+# cfg.BLENDING's docstring in triago_control/qp_controller/config.py for the
+# full topic-routing rationale.
+import triago_control.qp_controller.config as cfg
+
+
 class TeleopClutch(Node):
     def __init__(self):
         super().__init__('teleop_clutch')
@@ -51,10 +58,28 @@ class TeleopClutch(Node):
         self.create_subscription(Bool, '/shared_autonomy/grasp_active', self.grasp_active_callback, 10)
         
         # 3. Publish Command to Controller (switchable between arms)
+        #
+        # Topic routing depends on cfg.BLENDING (shared with main_shared_autonomy.py):
+        #   BLENDING=False (legacy): publish the pure user pose directly on
+        #     /arm_*/cartesian_reference -- this node drives the QP controller
+        #     directly, same as always.
+        #   BLENDING=True: publish on /arm_*/user_cartesian_reference instead.
+        #     main_shared_autonomy.py listens there for pure user intent, blends
+        #     it with the belief-weighted assistive policy, and becomes the SOLE
+        #     publisher of the real /arm_*/cartesian_reference. This avoids two
+        #     nodes ever racing to publish the same topic.
         self.active_arm = 'right'
-        self.cmd_pub_right = self.create_publisher(Float64MultiArray, '/arm_right/cartesian_reference', 10)
-        self.cmd_pub_left = self.create_publisher(Float64MultiArray, '/arm_left/cartesian_reference', 10)
+        _topic_right = ('/arm_right/user_cartesian_reference' if cfg.BLENDING
+                        else '/arm_right/cartesian_reference')
+        _topic_left = ('/arm_left/user_cartesian_reference' if cfg.BLENDING
+                       else '/arm_left/cartesian_reference')
+        self.cmd_pub_right = self.create_publisher(Float64MultiArray, _topic_right, 10)
+        self.cmd_pub_left = self.create_publisher(Float64MultiArray, _topic_left, 10)
         self.cmd_pub = self.cmd_pub_right  # current active publisher
+
+        self.get_logger().info(
+            f"[TELEOP] cfg.BLENDING={cfg.BLENDING} -> publishing user reference on "
+            f"'{_topic_right}' (right) / '{_topic_left}' (left).")
 
         # 4. Subscribe to arm-switch notifications from shared_autonomy
         self.create_subscription(String, '/shared_autonomy/active_arm', self.active_arm_cb, 10)

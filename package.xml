@@ -13,6 +13,10 @@
   <depend>geometry_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>rclpy</depend>
+  <!-- teleop_triago_clutch.py and haptic_force_manager_blending_tutorial.py
+       import triago_control.qp_controller.config (cfg.BLENDING, cfg.ALPHA_*)
+       as the single source of truth for the shared-autonomy blending flag. -->
+  <depend>triago_control</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

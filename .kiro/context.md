@@ -1,7 +1,15 @@
 # AI Agent Context — haption_teleoperation
 
 > **This file is maintained by the AI agent. Do not edit manually.**
-> Last updated: 2026-06-29 (per-arm bimanual, cost-decoupling, dual FSM/belief, arm-switch, grasp-fail retreat, force tuning)
+> Last updated: 2026-07-03 (§4.3 NEW: shared-autonomy TWIST BLENDING mode.
+> `teleop_triago_clutch.py` and the new `haptic_force_manager_blending_
+> tutorial.py` now both `import triago_control.qp_controller.config as cfg`
+> and read `cfg.BLENDING` as the SAME single source of truth used by
+> `triago_control/scripts/qp_arm_teleop/main_shared_autonomy.py`. This is the
+> first time this package imports from `triago_control` — `package.xml` gained
+> `<depend>triago_control</depend>`. See §4.3 for the full design; see
+> `triago_control`'s own context.md §11.5 for the companion (robot-side) half.)
+> Earlier: 2026-06-29 (per-arm bimanual, cost-decoupling, dual FSM/belief, arm-switch, grasp-fail retreat, force tuning)
 
 ---
 
@@ -46,8 +54,11 @@ haption_teleoperation/
 │   ├── virtuose_server_node.cpp     ★ primary: 150Hz impedance-mode device server
 │   └── calibration_main.cpp         utility: manual joint-limit discovery tool
 └── scripts/                     ← PYTHON NODES (teleoperation + force feedback)
-    ├── teleop_triago_clutch.py      ★ active: clutch-indexing teleop (mouse-mode)
-    ├── haptic_force_manager.py      ★ active: multi-layer force-feedback superposition
+    ├── teleop_triago_clutch.py                 ★ active: clutch-indexing teleop (mouse-mode).
+    │                                              Topic-routes via cfg.BLENDING (§4.3).
+    ├── haptic_force_manager_tutorial.py        ★ active (cfg.BLENDING=False): Virtual Fixture mode
+    ├── haptic_force_manager_blending_tutorial.py ★ active (cfg.BLENDING=True): TWIST BLENDING mode (§4.3)
+    ├── haptic_force_manager_battery.py         alternate/experimental variant
     ├── teleop_triago.py             forward teleop (no clutch, continuous integration)
     ├── teleop_demo_integrator.py    RViz-only demo (no robot, visualizes in "map" frame)
     ├── haption_plotter.py           live matplotlib: pose/vel/force from virtuose topics
@@ -101,6 +112,66 @@ position+orientation spring pulling the handle toward the exact grasp pose, gate
 (`FIX_CONF_LO=0.55`→`HI=0.85`). Unlike the viscous `F_guide` (which vanishes at the goal), this
 does NOT weaken near the goal, so it lets the operator settle precisely at the grasp standoff
 against the CBF push-off. Confidence is forced to 0 during grasp execution (fixture releases).
+
+### 4.3 Alternate mode: shared-autonomy TWIST BLENDING (2026-07-03)
+
+A SECOND teleoperation strategy, selected via `cfg.BLENDING` in
+`triago_control/qp_controller/config.py` (the single source of truth, also
+read directly by `main_shared_autonomy.py` — see that repo's context.md
+§11.5 for the full companion design). Unlike Virtual Fixture mode (§4, §4.2),
+where the user's raw reference reaches the QP unmodified and ALL assistance
+is rendered as haptic force, this mode blends the ACTUAL Cartesian reference
+sent to the QP:
+
+```
+v_blend = (1 - alpha) * v_user + alpha * pi_policy      (twist-level blend)
+alpha   = ALPHA_MAX * x**ALPHA_GAMMA                     (x = normalised belief)
+```
+persistently integrated by `main_shared_autonomy.py` every tick — this
+package's two scripts only carry the pure USER reference and render the
+resulting force feedback:
+
+```
+Haption → teleop_triago_clutch.py → /arm_right/user_cartesian_reference   [cfg.BLENDING=True]
+                                              |
+                                              v
+                          triago_control/main_shared_autonomy.py
+                            (belief inference, alpha=compute_alpha(b_max),
+                             v_blend integration, SOLE publisher of the
+                             real /arm_right/cartesian_reference,
+                             publishes /shared_autonomy/blend_debug)
+                                              |
+                                              v
+                            /arm_right/cartesian_reference
+                                              |
+                                              v
+                          triago_control/main_qp_controller.py (QP CLF-CBF)
+```
+
+**Both `teleop_triago_clutch.py` and `haptic_force_manager_blending_
+tutorial.py` `import triago_control.qp_controller.config as cfg`** and check
+`cfg.BLENDING` at their own startup (no live-toggle — restart both nodes
+after changing the flag) to decide which topic carries the pure user pose:
+`/arm_*/cartesian_reference` (BLENDING=False) or `/arm_*/user_cartesian_
+reference` (BLENDING=True). This is what lets `main_shared_autonomy.py`
+become the sole, always-on publisher of the real `/arm_*/cartesian_
+reference` without ever racing `teleop_triago_clutch.py` for the same topic.
+
+**`haptic_force_manager_blending_tutorial.py`** (this mode's active force
+node) renders ONLY `F_sync` — no `F_guide`/`F_fixture`/`F_cbf` at the haptic
+level, since all assistance now happens at the reference level instead. It
+tethers the handle toward the REAL robot EE using the PURE USER pose (read
+from `/arm_*/user_cartesian_reference`, never the blended one — reading the
+blended pose would hide the exact divergence the operator wants to feel).
+Its 3rd plot window, "Authority Share", reads `/shared_autonomy/blend_debug`
+(19 floats: `[alpha, v_user(6), v_policy(6), v_blend(6)]`) VERBATIM — the
+exact numbers `main_shared_autonomy.py` used to command the robot — rather
+than recomputing the blend independently, so the plot can never drift from
+what actually happened.
+
+**Cross-package dependency**: `package.xml` gained `<depend>triago_
+control</depend>` (this is the first cross-package Python import in this
+repo).
 
 ---
 
@@ -229,21 +300,35 @@ Vibration warning triggers at `LIMIT_OUTER = 0.25 rad` from any limit; maximum a
 
 ## 10. Inter-Package Topic Interface
 
+**Virtual Fixture mode (`cfg.BLENDING=False`, default):**
+
 | Direction | Topic | Publisher | Subscriber |
 |-----------|-------|-----------|------------|
 | Haption → Robot | `/arm_right/cartesian_reference` | `teleop_triago_clutch.py` | `main_qp_controller.py` (triago_control) |
-| Robot → Haption | `virtuose/force_cmd` | `haptic_force_manager.py` | `virtuose_server_node` |
-| Inference → Force | `/shared_autonomy/goal_names` | `main_shared_autonomy.py` | `haptic_force_manager.py` |
-| Inference → Force | `/shared_autonomy/goal_probabilities` | `main_shared_autonomy.py` | `haptic_force_manager.py` |
-| Inference → Force | `/shared_autonomy/user_policy` | `main_shared_autonomy.py` | `haptic_force_manager.py` |
+| Robot → Haption | `virtuose/force_cmd` | `haptic_force_manager_tutorial.py` | `virtuose_server_node` |
+| Inference → Force | `/shared_autonomy/goal_names` | `main_shared_autonomy.py` | `haptic_force_manager_tutorial.py` |
+| Inference → Force | `/shared_autonomy/goal_probabilities` | `main_shared_autonomy.py` | `haptic_force_manager_tutorial.py` |
+| Inference → Force | `/shared_autonomy/user_policy` | `main_shared_autonomy.py` | `haptic_force_manager_tutorial.py` |
 | Robot state | `/qp_debug/ee_real` | `main_qp_controller.py` | both teleop scripts |
-| CBF gradient | `/collision_constraints` | `main_qp_controller.py` | `haptic_force_manager.py` |
-| CBF slack | `/qp_debug/lambda_cbf` | `main_qp_controller.py` | `haptic_force_manager.py` |
+| CBF gradient | `/collision_constraints` | `main_qp_controller.py` | `haptic_force_manager_tutorial.py` |
+| CBF slack | `/qp_debug/lambda_cbf` | `main_qp_controller.py` | `haptic_force_manager_tutorial.py` |
 | Clutch | `virtuose/button_right` | `virtuose_server_node` | teleop + force manager |
 | Grasp trigger | `virtuose/button_left` | `virtuose_server_node` | `main_shared_autonomy.py` |
 | Authority handover | `/shared_autonomy/grasp_active` | `main_shared_autonomy.py` | `teleop_triago_clutch.py` |
 | Virtual fixture | `/shared_autonomy/active_goal_pose` | `main_shared_autonomy.py` | `haptic_force_manager_tutorial.py` |
 | Device vel | `virtuose/velocity` | `virtuose_server_node` | teleop + force manager |
+
+**TWIST BLENDING mode (`cfg.BLENDING=True`, §4.3) — topics that DIFFER:**
+
+| Direction | Topic | Publisher | Subscriber |
+|-----------|-------|-----------|------------|
+| Haption → Robot (pure user intent) | `/arm_right/user_cartesian_reference` | `teleop_triago_clutch.py` | `main_shared_autonomy.py` |
+| Robot (blended) → QP | `/arm_right/cartesian_reference` | `main_shared_autonomy.py` (SOLE publisher now) | `main_qp_controller.py` |
+| Robot → Haption | `virtuose/force_cmd` | `haptic_force_manager_blending_tutorial.py` | `virtuose_server_node` |
+| Authority-share telemetry | `/shared_autonomy/blend_debug` | `main_shared_autonomy.py` | `haptic_force_manager_blending_tutorial.py` |
+
+All other topics (grasp trigger, clutch, device vel, `/qp_debug/ee_real`, etc.) are
+unchanged between the two modes.
 
 ---
 
@@ -258,11 +343,12 @@ source install/setup.bash
 # Run device server (requires hardware or simulator on 127.0.0.1#53210)
 ros2 run haption_teleoperation virtuose_server_node
 
-# Run clutch teleop
+# Run clutch teleop (topic routing depends on cfg.BLENDING in triago_control's config.py)
 ros2 run haption_teleoperation teleop_triago_clutch.py
 
-# Run force feedback
-ros2 run haption_teleoperation haptic_force_manager.py
+# Run force feedback -- pick the script matching cfg.BLENDING:
+ros2 run haption_teleoperation haptic_force_manager_tutorial.py            # cfg.BLENDING=False (Virtual Fixture)
+ros2 run haption_teleoperation haptic_force_manager_blending_tutorial.py   # cfg.BLENDING=True  (Twist Blending, §4.3)
 
 # Calibration utility (discover joint limits by manually moving device)
 ros2 run haption_teleoperation virtuose_calibration
@@ -279,8 +365,9 @@ ros2 run haption_teleoperation workspace_debug_visualizer.py
 | Area | Status | Notes |
 |------|--------|-------|
 | virtuose_server_node (C++) | ✅ Working | 150 Hz impedance loop, stable |
-| teleop_triago_clutch.py | ✅ Working | Clutch-indexing, 180° frame flip; follows `/shared_autonomy/active_arm` to switch between left/right `/arm_*/cartesian_reference` |
-| haptic_force_manager_tutorial.py | ✅ Working | `DEBUG_ONLY_GUIDE=True`: F_guide (velocity-field) + F_fixture (position spring near goal). `grasp_active` takes precedence → drag handle to follow EE motion during autonomous phases (KP=30 + KD=160 velocity-following). MAX_GUIDE_TORQUE=0.10 Nm. Follows active arm via `/shared_autonomy/active_arm` (reads correct arm's reference + EE slice). |
+| teleop_triago_clutch.py | ✅ Working | Clutch-indexing, 180° frame flip; follows `/shared_autonomy/active_arm` to switch between left/right EE slices; topic-routes via `cfg.BLENDING` (§4.3, unpublished/published topic pair) |
+| haptic_force_manager_tutorial.py | ✅ Working (`cfg.BLENDING=False`) | `DEBUG_ONLY_GUIDE=True`: F_guide (velocity-field) + F_fixture (position spring near goal). `grasp_active` takes precedence → drag handle to follow EE motion during autonomous phases (KP=30 + KD=160 velocity-following). MAX_GUIDE_TORQUE=0.10 Nm. Follows active arm via `/shared_autonomy/active_arm` (reads correct arm's reference + EE slice). |
+| haptic_force_manager_blending_tutorial.py | 🔧 New (2026-07-03), untested on real hardware (`cfg.BLENDING=True`) | Renders ONLY F_sync (Kp_sync=35.0, Kp_sync_ang=1.0 — boosted vs. the shared F_sync in the tutorial variant since it is now the SOLE force channel); no local blending math — reads `/shared_autonomy/blend_debug` verbatim for its "Authority Share" plot. See §4.3. |
 | Passivity controller | ⚠️ Disabled | `ENABLE_PASSIVITY_CONTROL = False`; tuning pending |
 | calibration_main.cpp | ✅ Working | Joint limits discovered and documented |
 | Bimanual arm switch | ✅ Working | Both nodes (teleop + force mgr) subscribe to `/shared_autonomy/active_arm`; switch publishers/EE slices dynamically. Teleop re-anchors from the new arm's EE pose on switch. |
@@ -293,6 +380,7 @@ ros2 run haption_teleoperation workspace_debug_visualizer.py
 |-------|-------------|-------------|
 | **Residual inactive-arm motion** | The inactive arm moves when the active arm moves fast. Root cause: the single shared scalar SoftMin CBF row `J_soft·q̇ ≥ b` mixes BOTH arms' Jacobian columns, so the global QP optimizer recruits the inactive arm's joints to cheaply satisfy the barrier. | **Per-arm SoftMin split**: instead of one scalar CBF row, emit two: right-involving pairs → one row touching only right joints; left-involving pairs → one row touching only left joints; inter-arm pairs contribute a shared row over both (keeps inter-arm safety). This makes the inactive arm's cost penalty (2× DAMP, MAX slack, GAMMA_MAX) actually effective since no barrier demand touches its joints unless the inter-arm pair itself is active. Contained change in `collision_manager.compute_softmin_jacobian` (return per-arm `J_soft`/`h_soft`) + `qp_formulator` (two CBF rows instead of one). |
 | **Gazebo LinkAttacher dual-attach** | The IFRA_LinkAttacher plugin has a global `IsAttached` boolean that allows only ONE attachment in the whole world. A patched `gazebo_link_attacher.cpp` was provided to the user (per-pair gating, vector-based erase in Detach) but not yet confirmed working in simulation. | User must replace the plugin source, rebuild `ros2_linkattacher`, and verify two simultaneous attach/detach calls. |
+| **Pure-user integrator drift (Twist Blending mode, §4.3)** | `teleop_triago_clutch.py`'s own `ref_pos`/`ref_rot` state keeps integrating from the raw Haption twist regardless of which topic it publishes to. At sustained high `alpha` the real robot EE (pulled by the blend) can drift away from this pure-user pose over time; only `F_sync`'s spring on the HANDLE reflects that divergence — the user-side integrator itself is never corrected. | Consider periodically re-anchoring `ref_pos`/`ref_rot` toward the real EE (via `/qp_debug/ee_real`) once divergence exceeds a threshold, similar to the existing re-anchor-on-arm-switch / re-anchor-on-grasp-done logic. Not implemented — flagged for whoever tests this mode first. |
 
 ---
 
