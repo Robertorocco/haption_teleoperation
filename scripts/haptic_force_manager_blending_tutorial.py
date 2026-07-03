@@ -294,10 +294,18 @@ class HapticForceManagerBlending(Node):
         ax.set_ylabel("alpha")
         ax.set_ylim(-0.05, 1.0)
         ax.grid(True, linestyle='--', alpha=0.6)
-        ax.axhline(cfg.ALPHA_MAX, color='orange', linestyle='--', linewidth=1.5,
-                   alpha=0.8, label=f'ALPHA_MAX={cfg.ALPHA_MAX}')
+        # NOTE (2026-07-03): alpha's TRUE dynamic ceiling is
+        # cfg.ALPHA_PROXIMITY_CAP (the near-goal boost, §11.6), not cfg.ALPHA_MAX
+        # (only the away-from-goal ceiling) -- alpha visibly exceeded the old
+        # ALPHA_MAX line near a goal, which looked like a bug but wasn't. Both
+        # lines are now shown so the "belief-only" floor and the "boosted"
+        # ceiling are both visible.
+        ax.axhline(cfg.ALPHA_MAX, color='orange', linestyle='--', linewidth=1.3,
+                   alpha=0.7, label=f'ALPHA_MAX={cfg.ALPHA_MAX} (away from goal)')
+        ax.axhline(cfg.ALPHA_PROXIMITY_CAP, color='#c0392b', linestyle=':', linewidth=1.5,
+                   alpha=0.8, label=f'ALPHA_PROXIMITY_CAP={cfg.ALPHA_PROXIMITY_CAP} (near-goal ceiling)')
         self.line_alpha, = ax.plot([], [], color='#9b59b6', linewidth=2.0, label='alpha')
-        ax.legend(loc='upper left', fontsize=8)
+        ax.legend(loc='upper left', fontsize=7, ncol=1)
 
         ax = self.axs3[2]
         ax.set_title("Position Divergence ||pos_real - pos_user|| [m]",
