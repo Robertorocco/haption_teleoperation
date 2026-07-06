@@ -97,7 +97,8 @@ install(PROGRAMS
   scripts/haptic_force_manager_blending_tutorial.py
   scripts/teleop_demo_integrator.py
   scripts/teleop_triago.py
-  scripts/teleop_triago_clutch.py 
+  scripts/teleop_triago_clutch.py
+  scripts/teleop_triago_joystick.py
   scripts/workspace_debug_visualizer.py
   DESTINATION lib/${PROJECT_NAME}
 )

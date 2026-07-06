@@ -26,9 +26,10 @@ haption_teleoperation/
 │   ├── virtuose_server_node.cpp     150Hz impedance-mode device server
 │   └── calibration_main.cpp         manual joint-limit discovery tool
 └── scripts/                    Python nodes (teleop + force feedback)
-    ├── teleop_triago_clutch.py                   clutch-indexing teleop, topic-routes via cfg.BLENDING
-    ├── haptic_force_manager_tutorial.py          active when cfg.BLENDING=False (Virtual Fixture)
-    ├── haptic_force_manager_blending_tutorial.py active when cfg.BLENDING=True (Twist Blending)
+    ├── teleop_triago_clutch.py                    clutch-indexing teleop (Virtual Fixture, cfg.BLENDING=False)
+    ├── teleop_triago_joystick.py                  Joystick Mode teleop (cfg.BLENDING=True)
+    ├── haptic_force_manager_tutorial.py           active when cfg.BLENDING=False (Virtual Fixture)
+    ├── haptic_force_manager_blending_tutorial.py  active when cfg.BLENDING=True (Joystick Mode centering spring)
     ├── teleop_triago.py / teleop_demo_integrator.py   alternate/demo teleop variants
     └── haption_plotter.py / workspace_debug_visualizer.py   debug visualization
 ```
@@ -36,6 +37,8 @@ haption_teleoperation/
 ## 3. Architecture: Two Teleoperation Modes
 
 Mode is selected by `cfg.BLENDING` (`triago_control/qp_controller/config.py`). Both nodes below read the SAME flag at their own startup — no live toggle, restart both after changing it.
+
+The two modes use **different teleop nodes** (`teleop_triago_clutch.py` for Virtual Fixture, `teleop_triago_joystick.py` for Joystick Mode) and **different force nodes** (`haptic_force_manager_tutorial.py` vs `haptic_force_manager_blending_tutorial.py`).
 
 ### 3.1 Mode A — Virtual Fixture (`cfg.BLENDING = False`)
 
@@ -52,26 +55,33 @@ triago_control/main_shared_autonomy.py → /shared_autonomy/{goal_names, goal_pr
 
 **Authority handover during grasp execution**: `main_shared_autonomy.py` publishes `/shared_autonomy/grasp_active` (Bool). While `True`, the grasp state machine drives `/arm_*/cartesian_reference` directly and `teleop_triago_clutch.py` freezes; on the falling edge the clutch re-anchors at the post-grasp EE pose.
 
-### 3.2 Mode B — Twist Blending (`cfg.BLENDING = True`)
+### 3.2 Mode B — Joystick Mode (`cfg.BLENDING = True`)
 
-Assistance is applied at the **reference level** (the actual Cartesian command sent to the QP is a blend), not as force. See `triago_control`'s context.md §5 for the belief/alpha computation this depends on.
-
-```
-v_blend = (1 - alpha) * v_user + alpha * pi_policy        (twist-level blend, computed in main_shared_autonomy.py)
-```
+The **only** haptic force is a centering spring; the handle is a spring-centered joystick whose **displacement from home** is the pure user twist. This isolates the raw user twist and breaks the unstable feedback loop of the old design (which fed a robot-state-derived force back onto the handle whose motion was then re-read as user intent). Assistance is applied at the **reference level**: `main_shared_autonomy.py` blends the user twist with the belief-weighted policy (computed from the true EE pose) and is the sole writer of `/arm_*/cartesian_reference`. See `triago_control`'s context.md §5 for the alignment-based arbitration.
 
 ```
-Haption → teleop_triago_clutch.py → /arm_*/user_cartesian_reference   (pure user intent, BLENDING=True)
-                                              ↓
-                     main_shared_autonomy.py: alpha = compute_alpha(belief);
-                       v_blend integrated persistently every tick;
-                       SOLE publisher of /arm_*/cartesian_reference;
-                       publishes /shared_autonomy/blend_debug
-                                              ↓
-                          main_qp_controller.py (QP CLF-CBF)   [unchanged, topic-agnostic]
+v_blend = (1 - alpha) * v_user + alpha * pi_policy        (alpha from twist ALIGNMENT, see triago §5)
 ```
 
-`haptic_force_manager_blending_tutorial.py` renders **only `F_sync`** (no `F_guide`/`F_fixture`/`F_cbf`, since assistance now happens at the reference level). It tethers the handle to the real EE using the **pure user pose** (`/arm_*/user_cartesian_reference`, never the blended one — reading the blended pose would hide the divergence the operator is meant to feel). Its telemetry plot reads `/shared_autonomy/blend_debug` (19 floats: `[alpha, v_user(6), v_policy(6), v_blend(6)]`) verbatim rather than recomputing the blend.
+```
+Haption pose ─┐
+              │  teleop_triago_joystick.py:
+              │    v_user = K · (handle_pose − home_pose)   [deadbanded, 180°-Z mapped]
+              │    publishes /arm_*/user_cartesian_reference  (pure user twist)
+              │    publishes /joystick/home_pose             (live home, single source of truth)
+              ▼
+     main_shared_autonomy.py: alpha = compute_alpha(align(v_user, pi_policy));
+       v_blend integrated persistently every tick; SOLE publisher of /arm_*/cartesian_reference
+              ▼
+     main_qp_controller.py (QP CLF-CBF)   [unchanged, topic-agnostic]
+
+     haptic_force_manager_blending_tutorial.py: subscribes /joystick/home_pose;
+       renders ONLY the restorative spring toward home → virtuose/force_cmd
+```
+
+**Home pose** (Haption base frame): position fixed at `JOYSTICK_NEUTRAL_POSITION_M = [0.5, -0.03, -0.03]`; orientation starts from `JOYSTICK_NEUTRAL_ORIENTATION_XYZW = [0, 0.7071068, 0, 0.7071068]` and is **dynamically re-based** to track the gripper's orientation (so "handle at rest" always means "hold current gripper orientation"). The gripper's rotation away from its **startup reference** is scaled DOWN by `JOYSTICK_ROT_HOME_SCALE = 1.5` (gripper 90° → handle 60°) when building the home orientation, because the Haption's rotational workspace is more restrictive — this scaling applies ONLY to the home pose, never to the commanded twist. `teleop_triago_joystick.py` owns and publishes the live home pose so the spring and the twist zero-point stay identical.
+
+**Deadband**: handle displacement below `JOYSTICK_DEADBAND_LIN = 5 cm` / `JOYSTICK_DEADBAND_ANG = 5°` yields zero user twist (removed radially, continuous at the boundary). A zero user twist is treated by the arbitration as perfectly aligned, so the autonomy leads.
 
 ## 4. C++ Node: virtuose_server_node
 
@@ -89,16 +99,28 @@ Haption → teleop_triago_clutch.py → /arm_*/user_cartesian_reference   (pure 
 |---|---|---|
 | `virtuose/force_cmd` | Wrench | 6-DOF wrench applied to the handle |
 
-## 5. Key Script: teleop_triago_clutch.py
+## 5. Teleop Scripts
 
-Clutch-indexing (mouse-mode) teleoperation:
-- Initializes by anchoring at `/qp_debug/ee_real`.
-- Frame mapping: Haption→TRIAGo = 180° rotation about Z (§7).
-- Clutch pressed → pose frozen, zero velocity published; released → integration resumes from frozen pose.
-- Output: 13-float `Float64MultiArray` on `/arm_*/cartesian_reference` (or `/arm_*/user_cartesian_reference` when `cfg.BLENDING=True`): `[pos(3), rpy(3), vel_lin(3), vel_ang(3), task_dim(1)]`. `task_dim`: `6.0` = full 6D, `5.0` = free rotation about the approach axis.
-- Runs at 150 Hz, matching the device server.
+Both output the same 13-float `Float64MultiArray` protocol: `[pos(3), rpy(3), vel_lin(3), vel_ang(3), task_dim(1)]` (`task_dim`: `6.0` = full 6D, `5.0` = free rotation about the approach axis), run at 150 Hz, and apply the 180°-Z frame map (§7). Both suspend on `/shared_autonomy/grasp_active` and re-anchor on the falling edge, and follow `/shared_autonomy/active_arm`.
 
-## 6. Force Feedback (haptic_force_manager_*)
+**`teleop_triago_clutch.py`** (Virtual Fixture, `cfg.BLENDING=False`): clutch-indexing (mouse-mode). Anchors at `/qp_debug/ee_real`; integrates the Haption velocity into a pose; clutch pressed → pose frozen; publishes to `/arm_*/cartesian_reference`.
+
+**`teleop_triago_joystick.py`** (Joystick Mode, `cfg.BLENDING=True`): the handle is a spring-centered joystick. Reads the Haption **pose** (`virtuose/pose`) and maps its displacement from the home pose to a pure Cartesian twist (magnitude strictly proportional to distance, past the deadband). No pose integration, no clutch. The **pose slots** of the outgoing message carry the live EE pose (so downstream `current_T_user == current_T_EE`); the **velocity slots** carry the twist. Publishes the pure user twist on `/arm_*/user_cartesian_reference` and the live home pose on `/joystick/home_pose`. Owns the dynamic home orientation (§3.2).
+
+## 6. Force Feedback
+
+### 6.0 Joystick Mode spring (`haptic_force_manager_blending_tutorial.py`, `cfg.BLENDING=True`)
+
+The **only** force rendered in Joystick Mode: a spring-damper pulling the handle back to the (dynamic) home pose (§3.2), in the Haption base frame:
+
+```
+F_lin = KP_LIN·(home_pos − handle_pos) − KD_LIN·handle_vel_lin       (KP_LIN=40 N/m, KD_LIN=0.7)
+Tau   = KP_ANG·rotvec(home_rot · handle_rot⁻¹) − KD_ANG·handle_vel_ang (KP_ANG=1 Nm/rad, KD_ANG=0.1)
+```
+
+Clipped to `MAX_FORCE=10N` / `MAX_TORQUE=1Nm`. No `F_guide`/`F_fixture`/`F_sync`/`F_cbf`, no clutch-align, no joint-limit vibration — coupling any robot-state-derived force onto the handle is exactly what destabilized the previous design. The home pose target is subscribed from `/joystick/home_pose` (single source of truth = the joystick teleop), falling back to the config neutral until the first message.
+
+### 6.1 Virtual Fixture superposition (`haptic_force_manager_tutorial.py`, `cfg.BLENDING=False`)
 
 Multi-layer force superposition, summed and clipped to `MAX_FORCE=10N`/`MAX_TORQUE=1Nm`:
 
@@ -155,16 +177,17 @@ Vibration warning at `LIMIT_OUTER=0.25 rad` from a limit; maximum at `LIMIT_INNE
 | Authority handover | `/shared_autonomy/grasp_active` | `main_shared_autonomy.py` | `teleop_triago_clutch.py` |
 | Virtual fixture | `/shared_autonomy/active_goal_pose` | `main_shared_autonomy.py` | `haptic_force_manager_tutorial.py` |
 
-**Twist Blending mode (`cfg.BLENDING=True`) — topics that differ**
+**Joystick Mode (`cfg.BLENDING=True`) — topics that differ**
 
 | Direction | Topic | Publisher | Subscriber |
 |---|---|---|---|
-| Haption → Robot (pure user intent) | `/arm_right/user_cartesian_reference` | `teleop_triago_clutch.py` | `main_shared_autonomy.py` |
+| Haption → Robot (pure user twist) | `/arm_right/user_cartesian_reference` | `teleop_triago_joystick.py` | `main_shared_autonomy.py` |
+| Joystick home pose | `/joystick/home_pose` | `teleop_triago_joystick.py` | `haptic_force_manager_blending_tutorial.py` |
 | Robot (blended) → QP | `/arm_right/cartesian_reference` | `main_shared_autonomy.py` (sole publisher) | `main_qp_controller.py` |
-| Robot → Haption | `virtuose/force_cmd` | `haptic_force_manager_blending_tutorial.py` | `virtuose_server_node` |
-| Authority-share telemetry | `/shared_autonomy/blend_debug` | `main_shared_autonomy.py` | `haptic_force_manager_blending_tutorial.py` |
+| Robot → Haption (centering spring) | `virtuose/force_cmd` | `haptic_force_manager_blending_tutorial.py` | `virtuose_server_node` |
+| Authority-share telemetry | `/shared_autonomy/blend_debug` | `main_shared_autonomy.py` | (optional) |
 
-All other topics (grasp trigger, clutch, device velocity, `/qp_debug/ee_real`) are unchanged between modes.
+The joystick teleop + blending force manager read `virtuose/pose` (handle Cartesian pose); the force manager also reads `virtuose/velocity` (spring damping). All other topics (grasp trigger, device velocity, `/qp_debug/ee_real`) are unchanged between modes.
 
 ## 10. Build & Run
 
@@ -174,11 +197,14 @@ colcon build --packages-select haption_teleoperation
 source install/setup.bash
 
 ros2 run haption_teleoperation virtuose_server_node
-ros2 run haption_teleoperation teleop_triago_clutch.py
 
-# pick the force node matching cfg.BLENDING:
-ros2 run haption_teleoperation haptic_force_manager_tutorial.py            # BLENDING=False
-ros2 run haption_teleoperation haptic_force_manager_blending_tutorial.py   # BLENDING=True
+# pick the teleop + force node pair matching cfg.BLENDING:
+#   BLENDING=False (Virtual Fixture):
+ros2 run haption_teleoperation teleop_triago_clutch.py
+ros2 run haption_teleoperation haptic_force_manager_tutorial.py
+#   BLENDING=True (Joystick Mode):
+ros2 run haption_teleoperation teleop_triago_joystick.py
+ros2 run haption_teleoperation haptic_force_manager_blending_tutorial.py
 
 ros2 run haption_teleoperation virtuose_calibration      # joint-limit discovery
 ros2 run haption_teleoperation haption_plotter.py        # debug plotting
