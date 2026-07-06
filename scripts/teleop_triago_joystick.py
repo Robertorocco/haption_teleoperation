@@ -74,11 +74,13 @@ class TeleopJoystick(Node):
         # --- Robot EE state (TRIAGo base frame) ---
         self.ee_pos = None
         self.ee_rot = None
-        # Reference gripper orientation that maps to the neutral handle quat. Captured
-        # from the "robot initial pose" (first EE sample) and re-captured on arm switch
-        # / post-grasp, so the handle recenters cleanly onto the new context.
-        self.grip_ref_rot = None
-        self.grip_ref_pending = True
+        # PER-ARM gripper reference orientation that maps to the neutral handle quat.
+        # Captured from an arm's gripper the FIRST time that arm becomes active (its
+        # home then == neutral); re-anchored after an autonomous grasp (the gripper
+        # moved a lot); and SAVED/RESTORED across arm switches -- switching away keeps
+        # the arm's reference in this dict, switching back reuses it so the arm
+        # resumes its own home pose instead of resetting to neutral.
+        self.grip_ref_rot = {'right': None, 'left': None}
 
         # --- Authority handover ---
         # While shared_autonomy drives a grasp autonomously it publishes
@@ -127,12 +129,20 @@ class TeleopJoystick(Node):
 
     # ------------------------------------------------------------------ callbacks
     def active_arm_cb(self, msg):
-        """Switch which arm the twist is published to; re-capture the gripper reference."""
+        """Switch which arm the twist is published to (per-arm home saved/restored)."""
         if msg.data in ('right', 'left') and msg.data != self.active_arm:
             self.active_arm = msg.data
             self.cmd_pub = self.cmd_pub_right if msg.data == 'right' else self.cmd_pub_left
-            self.grip_ref_pending = True  # rebase the home orientation on the new arm
-            self.get_logger().info(f"[JOYSTICK] Arm switched to {msg.data.upper()}. Rebasing home.")
+            # Drop the stale (old-arm) EE so we don't build a bad home/twist for one
+            # tick; the next ee_cb refills it for the new arm. The new arm's grip_ref
+            # is RESTORED from the dict (or captured on that next sample if this is
+            # its first activation) -- never force-reset to neutral.
+            self.ee_pos = None
+            self.ee_rot = None
+            restored = self.grip_ref_rot[self.active_arm] is not None
+            self.get_logger().info(
+                f"[JOYSTICK] Arm -> {msg.data.upper()} "
+                f"({'home restored' if restored else 'first activation, home = neutral'}).")
 
     def grasp_active_cb(self, msg):
         """Suspend publishing while the grasp SM drives the arm; rebase on the falling edge."""
@@ -141,8 +151,10 @@ class TeleopJoystick(Node):
             self.get_logger().info("[JOYSTICK] Grasp exec: teleop suspended.")
         elif not msg.data and self.grasp_active:
             self.grasp_active = False
-            self.grip_ref_pending = True  # rebase home onto the post-grasp gripper pose
-            self.get_logger().info("[JOYSTICK] Grasp done: rebasing home, teleop resuming.")
+            # The autonomous grasp moved THIS arm's gripper a lot -> re-anchor its
+            # home onto the post-grasp orientation (recapture on the next EE sample).
+            self.grip_ref_rot[self.active_arm] = None
+            self.get_logger().info("[JOYSTICK] Grasp done: re-anchoring home, teleop resuming.")
 
     def handle_pose_cb(self, msg):
         """Latest Haption handle pose (position in m, orientation quat), Haption base frame."""
@@ -162,24 +174,26 @@ class TeleopJoystick(Node):
             self.ee_pos = np.array(msg.data[6:9])
             rpy = np.array(msg.data[15:18])
         self.ee_rot = R.from_euler('xyz', rpy)
-        if self.grip_ref_pending:
-            self.grip_ref_rot = self.ee_rot
-            self.grip_ref_pending = False
-            self.get_logger().info("[JOYSTICK] Gripper reference orientation captured (home rebased).")
+        if self.grip_ref_rot[self.active_arm] is None:
+            self.grip_ref_rot[self.active_arm] = self.ee_rot
+            self.get_logger().info(
+                f"[JOYSTICK] {self.active_arm.upper()} gripper reference captured (home = neutral).")
 
     # ------------------------------------------------------------------ math
     def _update_home_orientation(self):
-        """Rebase the home orientation onto the gripper's current orientation.
+        """Rebase the home orientation onto the ACTIVE arm's current gripper orientation.
 
         home_rot = map(scaled gripper delta) * neutral_rot, where the gripper delta
-        R_grip * R_grip_ref^-1 (TRIAGo base frame) has its ANGLE divided by
-        JOYSTICK_ROT_HOME_SCALE and its AXIS mapped into the Haption base frame.
+        R_grip * R_grip_ref^-1 (TRIAGo base frame, R_grip_ref = this arm's saved
+        reference) has its ANGLE divided by JOYSTICK_ROT_HOME_SCALE and its AXIS
+        mapped into the Haption base frame.
         """
-        if self.ee_rot is None or self.grip_ref_rot is None:
+        ref = self.grip_ref_rot[self.active_arm]
+        if self.ee_rot is None or ref is None:
             return
-        delta_triago = (self.ee_rot * self.grip_ref_rot.inv()).as_rotvec()  # base-frame axis*angle
+        delta_triago = (self.ee_rot * ref.inv()).as_rotvec()  # base-frame axis*angle
         scaled_triago = delta_triago / cfg.JOYSTICK_ROT_HOME_SCALE
-        delta_haption = _FRAME_FLIP * scaled_triago                          # map axis to Haption frame
+        delta_haption = _FRAME_FLIP * scaled_triago            # map axis to Haption frame
         self.home_rot = R.from_rotvec(delta_haption) * self.neutral_rot
 
     @staticmethod
