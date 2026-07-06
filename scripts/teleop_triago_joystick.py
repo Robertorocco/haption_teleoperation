@@ -41,7 +41,7 @@ it still routes to /arm_*/cartesian_reference and warns.
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import Pose
 from std_msgs.msg import Float64MultiArray, Bool, String
 
 import numpy as np
@@ -94,7 +94,9 @@ class TeleopJoystick(Node):
         # --- ROS 2 interfaces ---
         self.active_arm = 'right'
         # Handle Cartesian pose (position + orientation) drives the displacement.
-        self.create_subscription(PoseStamped, 'virtuose/pose', self.handle_pose_cb, 10)
+        # NOTE: virtuose_server_node publishes virtuose/pose as geometry_msgs/Pose
+        # (NOT PoseStamped) -- the wrong type silently receives nothing.
+        self.create_subscription(Pose, 'virtuose/pose', self.handle_pose_cb, 10)
         # EE pose: reference orientation + the pose slots of the outgoing message.
         self.create_subscription(Float64MultiArray, '/qp_debug/ee_real', self.ee_cb, 10)
         self.create_subscription(Bool, '/shared_autonomy/grasp_active', self.grasp_active_cb, 10)
@@ -144,8 +146,8 @@ class TeleopJoystick(Node):
 
     def handle_pose_cb(self, msg):
         """Latest Haption handle pose (position in m, orientation quat), Haption base frame."""
-        p = msg.pose.position
-        q = msg.pose.orientation
+        p = msg.position
+        q = msg.orientation
         self.handle_pos = np.array([p.x, p.y, p.z])
         self.handle_rot = R.from_quat([q.x, q.y, q.z, q.w])
 

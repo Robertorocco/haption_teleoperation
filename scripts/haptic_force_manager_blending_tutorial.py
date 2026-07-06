@@ -37,7 +37,7 @@ from scipy.spatial.transform import Rotation as R
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Wrench, Twist, PoseStamped
+from geometry_msgs.msg import Wrench, Twist, Pose
 from std_msgs.msg import Float64MultiArray
 
 import matplotlib
@@ -72,7 +72,10 @@ class HapticForceManagerBlending(Node):
         self.MAX_TORQUE = 1.0
 
         # --- Subscribers ---
-        self.create_subscription(PoseStamped, 'virtuose/pose', self.handle_pose_cb, 10)
+        # NOTE: virtuose_server_node publishes virtuose/pose as geometry_msgs/Pose
+        # (NOT PoseStamped) -- subscribing with the wrong type silently receives
+        # nothing, which zeroes the spring (handle_pos stays None).
+        self.create_subscription(Pose, 'virtuose/pose', self.handle_pose_cb, 10)
         self.create_subscription(Twist, 'virtuose/velocity', self.vel_cb, 10)
         self.create_subscription(
             Float64MultiArray, cfg.JOYSTICK_HOME_POSE_TOPIC, self.home_pose_cb, 10)
@@ -106,8 +109,8 @@ class HapticForceManagerBlending(Node):
 
     # ------------------------------------------------------------------ callbacks
     def handle_pose_cb(self, msg):
-        p = msg.pose.position
-        q = msg.pose.orientation
+        p = msg.position
+        q = msg.orientation
         self.handle_pos = np.array([p.x, p.y, p.z])
         self.handle_rot = R.from_quat([q.x, q.y, q.z, q.w])
 
