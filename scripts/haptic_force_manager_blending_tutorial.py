@@ -294,16 +294,10 @@ class HapticForceManagerBlending(Node):
         ax.set_ylabel("alpha")
         ax.set_ylim(-0.05, 1.0)
         ax.grid(True, linestyle='--', alpha=0.6)
-        # NOTE (2026-07-03): alpha's TRUE dynamic ceiling is
-        # cfg.ALPHA_PROXIMITY_CAP (the near-goal boost, §11.6), not cfg.ALPHA_MAX
-        # (only the away-from-goal ceiling) -- alpha visibly exceeded the old
-        # ALPHA_MAX line near a goal, which looked like a bug but wasn't. Both
-        # lines are now shown so the "belief-only" floor and the "boosted"
-        # ceiling are both visible.
+        # alpha's hard ceiling is cfg.ALPHA_MAX (2026-07-06: alpha is now
+        # belief * distance-gate, both in [0,1] -- proximity boost removed).
         ax.axhline(cfg.ALPHA_MAX, color='orange', linestyle='--', linewidth=1.3,
-                   alpha=0.7, label=f'ALPHA_MAX={cfg.ALPHA_MAX} (away from goal)')
-        ax.axhline(cfg.ALPHA_PROXIMITY_CAP, color='#c0392b', linestyle=':', linewidth=1.5,
-                   alpha=0.8, label=f'ALPHA_PROXIMITY_CAP={cfg.ALPHA_PROXIMITY_CAP} (near-goal ceiling)')
+                   alpha=0.7, label=f'ALPHA_MAX={cfg.ALPHA_MAX}')
         self.line_alpha, = ax.plot([], [], color='#9b59b6', linewidth=2.0, label='alpha')
         ax.legend(loc='upper left', fontsize=7, ncol=1)
 
@@ -470,37 +464,62 @@ class HapticForceManagerBlending(Node):
     # FORCE COMPONENTS
     # =========================
     def compute_F_sync(self):
-        """Spring-damper tether: keeps the operator synced with the real robot EE.
+        """Distance-decaying tether pulling the handle toward the real robot EE.
+
+        A constant-stiffness spring (F = Kp * error) has a magnitude that GROWS
+        with distance -- so when the operator tries to move far from the EE it
+        fights them hard and, because that induced handle motion is read back as
+        user twist, injects a FAKE intention into the blending loop. Instead the
+        linear force MAGNITUDE now follows a 1/d-shaped law that is MAXIMUM near
+        the reference and MINIMUM far away:
+
+            |F|(d) = A/d + B,   with  |F|(SYNC_D_MIN) = SYNC_F_MAX
+                                      |F|(SYNC_D_MAX) = SYNC_F_MIN
+            A = (F_MAX - F_MIN) / (1/D_MIN - 1/D_MAX)
+            B = F_MIN - A / D_MAX
+
+        d = ||pos_real - pos_target|| is clamped to [SYNC_D_MIN, SYNC_D_MAX], so
+        the force saturates to SYNC_F_MAX within 3cm (the lock/settle zone) and
+        to SYNC_F_MIN beyond 30cm (free-roam zone -- the operator can move the
+        handle freely to express intent without the tether fighting them).
+        Direction is the unit vector toward the EE. The orientation torque is
+        scaled by the SAME normalised distance weight so it too relaxes far out.
 
         self.pos_target/rot_target hold the PURE USER reference (see the
-        topic-routing note in __init__): in BLENDING mode the real EE has been
-        pulled toward the assistive policy on top of the user's own input, so
-        this tether is what makes the operator FEEL that authority -- the
-        stronger the autonomy's pull, the bigger pos_real diverges from
-        pos_target, and the harder F_sync tugs the handle to follow it.
+        topic-routing note in __init__).
         """
         F_sync = np.zeros(6)
         if self.pos_target is None or self.pos_real is None:
             return F_sync
 
-        # Position spring: pulls the handle toward the real EE
-        error_pos_tiago = self.pos_real - self.pos_target
-        F_spring_tiago = self.Kp_sync * error_pos_tiago
+        error_pos_tiago = self.pos_real - self.pos_target   # points toward the EE
+        d = float(np.linalg.norm(error_pos_tiago))
+        if d < 1e-6:
+            return F_sync   # already matched -- no tether force
+
+        # 1/d-shaped magnitude hitting SYNC_F_MAX at SYNC_D_MIN and SYNC_F_MIN at
+        # SYNC_D_MAX (see docstring). d clamped so it saturates outside that band.
+        d_c = float(np.clip(d, cfg.SYNC_D_MIN, cfg.SYNC_D_MAX))
+        A = (cfg.SYNC_F_MAX - cfg.SYNC_F_MIN) / (1.0 / cfg.SYNC_D_MIN - 1.0 / cfg.SYNC_D_MAX)
+        B = cfg.SYNC_F_MIN - A / cfg.SYNC_D_MAX
+        f_mag = A / d_c + B
+
+        # Normalised distance weight in [0,1]: 1 close (SYNC_F_MAX), 0 far (SYNC_F_MIN).
+        w = float(np.clip((f_mag - cfg.SYNC_F_MIN) / max(cfg.SYNC_F_MAX - cfg.SYNC_F_MIN, 1e-9),
+                          0.0, 1.0))
+
+        F_spring_tiago = f_mag * (error_pos_tiago / d)   # magnitude * unit direction
 
         # Map TRIAGo frame -> Haption frame (180 deg Z-flip)
-        F_spring_haption = np.zeros(3)
-        F_spring_haption[0] = -F_spring_tiago[0]
-        F_spring_haption[1] = -F_spring_tiago[1]
-        F_spring_haption[2] =  F_spring_tiago[2]
+        F_spring_haption = np.array([-F_spring_tiago[0], -F_spring_tiago[1], F_spring_tiago[2]])
+        F_sync[0:3] = F_spring_haption - (self.Kd_sync * self.vel_haption[0:3])
 
-        F_damped_haption = F_spring_haption - (self.Kd_sync * self.vel_haption[0:3])
-        F_sync[0:3] = F_damped_haption
-
-        # Orientation sync spring
+        # Orientation sync spring, scaled by the same distance weight so it also
+        # relaxes when the operator is far from the reference.
         if self.rot_real is not None and self.rot_target is not None:
             err_rot = R.from_matrix(
                 self.rot_real.as_matrix() @ self.rot_target.as_matrix().T).as_rotvec()
-            Tau_tiago = self.Kp_sync_ang * err_rot
+            Tau_tiago = self.Kp_sync_ang * w * err_rot
             F_sync[3] = -Tau_tiago[0]
             F_sync[4] = -Tau_tiago[1]
             F_sync[5] =  Tau_tiago[2]
