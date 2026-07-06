@@ -72,6 +72,11 @@ class HapticForceManagerBlending(Node):
         self.pos_real = None         # Real EE position (from QP controller)
         self.rot_real = None         # Real EE orientation
         self.vel_real = np.zeros(3)  # Real EE linear velocity
+        # Blended reference pose (the QP's commanded target, from
+        # /arm_*/cartesian_reference). F_sync now tethers the handle to THIS
+        # (see compute_F_sync) rather than to the lagging/CBF-buffeted real EE.
+        self.pos_blended = None
+        self.rot_blended = None
         self.vel_haption = np.zeros(6)  # Haption handle velocity (raw)
 
         # --- Authority-share telemetry (read verbatim from main_shared_autonomy.py
@@ -168,6 +173,10 @@ class HapticForceManagerBlending(Node):
         self.create_subscription(Float64MultiArray, _user_ref_topic_right, self.target_cb, 10)
         self.create_subscription(Float64MultiArray, _user_ref_topic_left, self.target_cb_left, 10)
         self.create_subscription(Float64MultiArray, '/qp_debug/ee_real', self.real_cb, 10)
+        # Blended reference (the QP's commanded pose) = the F_sync tether target.
+        # In BLENDING mode main_shared_autonomy is the sole publisher here.
+        self.create_subscription(Float64MultiArray, '/arm_right/cartesian_reference', self.blended_ref_cb, 10)
+        self.create_subscription(Float64MultiArray, '/arm_left/cartesian_reference', self.blended_ref_cb_left, 10)
         self.create_subscription(Twist, 'virtuose/velocity', self.vel_cb, 10)
         self.create_subscription(Float64MultiArray, 'virtuose/articular_position', self.joint_cb, 10)
         self.create_subscription(Bool, 'virtuose/button_right', self.button_cb, 10)
@@ -302,7 +311,7 @@ class HapticForceManagerBlending(Node):
         ax.legend(loc='upper left', fontsize=7, ncol=1)
 
         ax = self.axs3[2]
-        ax.set_title("Position Divergence ||pos_real - pos_user|| [m]",
+        ax.set_title("Position Divergence ||pos_blended - pos_user|| [m]",
                     fontsize=10, fontweight='bold')
         ax.set_ylabel("m")
         ax.set_xlabel("Time (s)")
@@ -433,6 +442,22 @@ class HapticForceManagerBlending(Node):
             self.pos_target = np.array(msg.data[0:3])
             self.rot_target = R.from_euler('xyz', np.array(msg.data[3:6]), degrees=False)
 
+    def blended_ref_cb(self, msg):
+        """Blended reference pose (right arm) = the F_sync tether target."""
+        if self.active_arm != 'right':
+            return
+        if len(msg.data) >= 6:
+            self.pos_blended = np.array(msg.data[0:3])
+            self.rot_blended = R.from_euler('xyz', np.array(msg.data[3:6]), degrees=False)
+
+    def blended_ref_cb_left(self, msg):
+        """Blended reference pose (left arm) = the F_sync tether target."""
+        if self.active_arm != 'left':
+            return
+        if len(msg.data) >= 6:
+            self.pos_blended = np.array(msg.data[0:3])
+            self.rot_blended = R.from_euler('xyz', np.array(msg.data[3:6]), degrees=False)
+
 
     def real_cb(self, msg):
         """Updates the real EE position and orientation of the active arm."""
@@ -464,14 +489,22 @@ class HapticForceManagerBlending(Node):
     # FORCE COMPONENTS
     # =========================
     def compute_F_sync(self):
-        """Distance-decaying tether pulling the handle toward the real robot EE.
+        """Distance-decaying tether pulling the handle toward the BLENDED REFERENCE.
+
+        The tether target is the QP's commanded pose (self.pos_blended, from
+        /arm_*/cartesian_reference), NOT the real EE. Syncing to the EE transmits
+        its tracking lag, CBF push-off and settling wobble straight into the
+        handle (disorienting); the blended reference is the clean commanded
+        trajectory, so the handle is gently pulled ALONG the shared-control path
+        the robot is trying to follow. Combined with the slow autonomous cruise
+        (V_POLICY_MIN), a relaxed hand gets gently guided toward the goal.
 
         A constant-stiffness spring (F = Kp * error) has a magnitude that GROWS
-        with distance -- so when the operator tries to move far from the EE it
-        fights them hard and, because that induced handle motion is read back as
-        user twist, injects a FAKE intention into the blending loop. Instead the
-        linear force MAGNITUDE now follows a 1/d-shaped law that is MAXIMUM near
-        the reference and MINIMUM far away:
+        with distance -- so when the operator tries to move far it fights them
+        hard and, because that induced handle motion is read back as user twist,
+        injects a FAKE intention into the blending loop. Instead the linear force
+        MAGNITUDE follows a 1/d-shaped law that is MAXIMUM near the reference and
+        MINIMUM far away:
 
             |F|(d) = A/d + B,   with  |F|(SYNC_D_MIN) = SYNC_F_MAX
                                       |F|(SYNC_D_MAX) = SYNC_F_MIN
@@ -492,10 +525,10 @@ class HapticForceManagerBlending(Node):
         topic-routing note in __init__).
         """
         F_sync = np.zeros(6)
-        if self.pos_target is None or self.pos_real is None:
+        if self.pos_target is None or self.pos_blended is None:
             return F_sync
 
-        error_pos_tiago = self.pos_real - self.pos_target   # points toward the EE
+        error_pos_tiago = self.pos_blended - self.pos_target   # toward the blended reference
         d = float(np.linalg.norm(error_pos_tiago))
         if d < 1e-6:
             return F_sync   # already matched -- no tether force
@@ -525,11 +558,11 @@ class HapticForceManagerBlending(Node):
         F_spring_haption = np.array([-F_spring_tiago[0], -F_spring_tiago[1], F_spring_tiago[2]])
         F_sync[0:3] = F_spring_haption - (self.Kd_sync * self.vel_haption[0:3])
 
-        # Orientation sync spring, scaled by the same distance weight so it also
-        # relaxes when the operator is far from the reference.
-        if self.rot_real is not None and self.rot_target is not None:
+        # Orientation sync spring toward the blended reference orientation,
+        # scaled by the same distance weight so it also relaxes when far.
+        if self.rot_blended is not None and self.rot_target is not None:
             err_rot = R.from_matrix(
-                self.rot_real.as_matrix() @ self.rot_target.as_matrix().T).as_rotvec()
+                self.rot_blended.as_matrix() @ self.rot_target.as_matrix().T).as_rotvec()
             Tau_tiago = self.Kp_sync_ang * w * err_rot
             F_sync[3] = -Tau_tiago[0]
             F_sync[4] = -Tau_tiago[1]
@@ -621,8 +654,8 @@ class HapticForceManagerBlending(Node):
 
         # --- Buffer Data for Plotting ---
         t = time.time() - self.start_time
-        pos_div = (float(np.linalg.norm(self.pos_real - self.pos_target))
-                  if (self.pos_real is not None and self.pos_target is not None) else 0.0)
+        pos_div = (float(np.linalg.norm(self.pos_blended - self.pos_target))
+                  if (self.pos_blended is not None and self.pos_target is not None) else 0.0)
         with self.plot_lock:
             self.t_data.append(t)
             for i in range(3):
