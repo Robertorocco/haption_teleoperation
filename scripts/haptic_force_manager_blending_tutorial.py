@@ -478,12 +478,15 @@ class HapticForceManagerBlending(Node):
             A = (F_MAX - F_MIN) / (1/D_MIN - 1/D_MAX)
             B = F_MIN - A / D_MAX
 
-        d = ||pos_real - pos_target|| is clamped to [SYNC_D_MIN, SYNC_D_MAX], so
-        the force saturates to SYNC_F_MAX within 3cm (the lock/settle zone) and
-        to SYNC_F_MIN beyond 30cm (free-roam zone -- the operator can move the
-        handle freely to express intent without the tether fighting them).
-        Direction is the unit vector toward the EE. The orientation torque is
-        scaled by the SAME normalised distance weight so it too relaxes far out.
+        Below SYNC_D_MIN the magnitude RAMPS LINEARLY DOWN TO ZERO at exact
+        match (a non-vanishing force at d~0 has no stable rest point -- it
+        chatters and injects a fake twist into the loop, which the belief policy
+        then amplifies into a slow creep toward the table). It PEAKS at
+        SYNC_F_MAX at SYNC_D_MIN (3cm), then decays as 1/d to SYNC_F_MIN beyond
+        SYNC_D_MAX (30cm, free-roam zone -- the operator can move the handle
+        freely without the tether fighting them). Direction is the unit vector
+        toward the EE. The orientation torque is scaled by a distance weight
+        that relaxes far out but stays firm through exact match.
 
         self.pos_target/rot_target hold the PURE USER reference (see the
         topic-routing note in __init__).
@@ -497,16 +500,24 @@ class HapticForceManagerBlending(Node):
         if d < 1e-6:
             return F_sync   # already matched -- no tether force
 
-        # 1/d-shaped magnitude hitting SYNC_F_MAX at SYNC_D_MIN and SYNC_F_MIN at
-        # SYNC_D_MAX (see docstring). d clamped so it saturates outside that band.
-        d_c = float(np.clip(d, cfg.SYNC_D_MIN, cfg.SYNC_D_MAX))
-        A = (cfg.SYNC_F_MAX - cfg.SYNC_F_MIN) / (1.0 / cfg.SYNC_D_MIN - 1.0 / cfg.SYNC_D_MAX)
-        B = cfg.SYNC_F_MIN - A / cfg.SYNC_D_MAX
-        f_mag = A / d_c + B
+        # Magnitude profile: RAMPS LINEARLY 0 -> SYNC_F_MAX across [0, SYNC_D_MIN]
+        # so the force VANISHES at exact match (stable rest point -- the previous
+        # clamped version held SYNC_F_MAX all the way in, which chattered and
+        # injected a fake twist); PEAKS at SYNC_F_MAX at SYNC_D_MIN; then decays
+        # as 1/d to SYNC_F_MIN at SYNC_D_MAX, and stays SYNC_F_MIN beyond.
+        if d <= cfg.SYNC_D_MIN:
+            f_mag = cfg.SYNC_F_MAX * (d / cfg.SYNC_D_MIN)
+        elif d >= cfg.SYNC_D_MAX:
+            f_mag = cfg.SYNC_F_MIN
+        else:
+            A = (cfg.SYNC_F_MAX - cfg.SYNC_F_MIN) / (1.0 / cfg.SYNC_D_MIN - 1.0 / cfg.SYNC_D_MAX)
+            B = cfg.SYNC_F_MIN - A / cfg.SYNC_D_MAX
+            f_mag = A / d + B
 
-        # Normalised distance weight in [0,1]: 1 close (SYNC_F_MAX), 0 far (SYNC_F_MIN).
-        w = float(np.clip((f_mag - cfg.SYNC_F_MIN) / max(cfg.SYNC_F_MAX - cfg.SYNC_F_MIN, 1e-9),
-                          0.0, 1.0))
+        # Orientation weight in [0,1]: 1 inside the match zone (d <= SYNC_D_MIN),
+        # linearly -> 0 by SYNC_D_MAX. Unlike the linear force it does NOT vanish
+        # at exact match, so the orientation tether stays firm when position-matched.
+        w = float(np.clip((cfg.SYNC_D_MAX - d) / (cfg.SYNC_D_MAX - cfg.SYNC_D_MIN), 0.0, 1.0))
 
         F_spring_tiago = f_mag * (error_pos_tiago / d)   # magnitude * unit direction
 
