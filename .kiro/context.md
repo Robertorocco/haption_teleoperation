@@ -79,9 +79,9 @@ Haption pose ─┐
        renders ONLY the restorative spring toward home → virtuose/force_cmd
 ```
 
-**Home pose** (Haption base frame): position fixed at `JOYSTICK_NEUTRAL_POSITION_M = [0.5, -0.03, -0.03]`; orientation starts from `JOYSTICK_NEUTRAL_ORIENTATION_XYZW = [0, 0.7071068, 0, 0.7071068]` and is **dynamically re-based** to track the gripper's orientation (so "handle at rest" always means "hold current gripper orientation"). The gripper's rotation away from its **startup reference** is scaled DOWN by `JOYSTICK_ROT_HOME_SCALE = 1.5` (gripper 90° → handle 60°) when building the home orientation, because the Haption's rotational workspace is more restrictive — this scaling applies ONLY to the home pose, never to the commanded twist. `teleop_triago_joystick.py` owns and publishes the live home pose so the spring and the twist zero-point stay identical.
+**Home pose** (Haption base frame): position fixed at `JOYSTICK_NEUTRAL_POSITION_M = [0.5, -0.03, -0.03]`; orientation starts from `JOYSTICK_NEUTRAL_ORIENTATION_XYZW = [0, 0.7071068, 0, 0.7071068]` and is **dynamically re-based** to track the gripper's orientation (so "handle at rest" always means "hold current gripper orientation"). The gripper's rotation away from its **startup reference** is scaled DOWN by `JOYSTICK_ROT_HOME_SCALE = 1.25` (gripper 90° → handle 72°) when building the home orientation — lower scale = tighter (more synchronized) tracking, kept above 1.0 so the handle stays within the Haption's more restrictive rotational workspace. This scaling applies ONLY to the home pose, never to the commanded twist. `teleop_triago_joystick.py` owns and publishes the live home pose so the spring and the twist zero-point stay identical.
 
-**Deadband**: handle displacement below `JOYSTICK_DEADBAND_LIN = 5 cm` / `JOYSTICK_DEADBAND_ANG = 5°` yields zero user twist (removed radially, continuous at the boundary). A zero user twist is treated by the arbitration as perfectly aligned, so the autonomy leads.
+**Deadband**: handle displacement below `JOYSTICK_DEADBAND_LIN = 2 cm` / `JOYSTICK_DEADBAND_ANG = 2°` yields zero user twist (removed radially, continuous at the boundary). A still handle (zero user twist) makes the arbitration fall back to a gentle autonomous crawl (see triago §5).
 
 ## 4. C++ Node: virtuose_server_node
 
@@ -114,8 +114,8 @@ Both output the same 13-float `Float64MultiArray` protocol: `[pos(3), rpy(3), ve
 The **only** force rendered in Joystick Mode: a spring-damper pulling the handle back to the (dynamic) home pose (§3.2), in the Haption base frame:
 
 ```
-F_lin = KP_LIN·(home_pos − handle_pos) − KD_LIN·handle_vel_lin       (KP_LIN=40 N/m, KD_LIN=0.7)
-Tau   = KP_ANG·rotvec(home_rot · handle_rot⁻¹) − KD_ANG·handle_vel_ang (KP_ANG=1 Nm/rad, KD_ANG=0.1)
+F_lin = KP_LIN·(home_pos − handle_pos) − KD_LIN·handle_vel_lin       (KP_LIN=60 N/m, KD_LIN=1.0)
+Tau   = KP_ANG·rotvec(home_rot · handle_rot⁻¹) − KD_ANG·handle_vel_ang (KP_ANG=1.5 Nm/rad, KD_ANG=0.15)
 ```
 
 Clipped to `MAX_FORCE=10N` / `MAX_TORQUE=1Nm`. No `F_guide`/`F_fixture`/`F_sync`/`F_cbf`, no clutch-align, no joint-limit vibration — coupling any robot-state-derived force onto the handle is exactly what destabilized the previous design. The home pose target is subscribed from `/joystick/home_pose` (single source of truth = the joystick teleop), falling back to the config neutral until the first message.
