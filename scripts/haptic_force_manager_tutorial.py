@@ -129,10 +129,10 @@ class HapticForceManager(Node):
         self.fix_goal_pos = None
         self.fix_goal_rot = None
         self.fix_confidence = 0.0
-        self.K_fix_force  = 24.0      # N/m   position spring toward the grasp pose [+20%, for testing]
-        self.K_fix_torque = 0.15      # Nm/rad orientation spring toward grasp orientation
-        self.MAX_FIX_FORCE  = 3.6     # N     saturation [+20%, for testing]
-        self.MAX_FIX_TORQUE = 0.25    # Nm    saturation
+        self.K_fix_force  = 28.8      # N/m   position spring toward the grasp pose [+20% guidance boost]
+        self.K_fix_torque = 0.18      # Nm/rad orientation spring toward grasp orientation [+20% guidance boost]
+        self.MAX_FIX_FORCE  = 4.32    # N     saturation [+20% guidance boost]
+        self.MAX_FIX_TORQUE = 0.30    # Nm    saturation [+20% guidance boost]
         self.FIX_CONF_LO = 0.55       # below this belief -> fixture OFF
         self.FIX_CONF_HI = 0.85       # at/above this belief -> full fixture
         self.alpha_fix = 0.15         # LPF on the fixture wrench (C0 continuity)
@@ -220,8 +220,8 @@ class HapticForceManager(Node):
         # is scaled down proportionally — so the relative contribution proportions
         # are preserved, but the autonomy can never overpower the operator. Tune
         # these to set "how much the assistance is allowed to push".
-        self.MAX_TOTAL_FORCE  = 5.0   # N
-        self.MAX_TOTAL_TORQUE = 0.4   # Nm
+        self.MAX_TOTAL_FORCE  = 6.0   # N  [+20% overall guidance authority]
+        self.MAX_TOTAL_TORQUE = 0.48  # Nm [+20% overall guidance authority]
 
         # --- Data Buffers & Synchronization ---
         self.plot_lock = threading.Lock()
