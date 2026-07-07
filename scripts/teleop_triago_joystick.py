@@ -93,11 +93,6 @@ class TeleopJoystick(Node):
         self.ee_pos = None
         self.ee_rot = None
 
-        # --- Debug tracking (jump detection) ---
-        self._prev_ee_rot = None            # previous tick's raw gripper orientation
-        self._prev_target_home_rot = None   # previous tick's PRE-rate-limit target home
-        self._DEBUG_JUMP_THRESHOLD_RAD = 0.15  # ~8.6 deg/tick (~1290 deg/s @150Hz) -- clearly non-physical
-
         # --- Authority handover ---
         # While shared_autonomy drives a grasp autonomously it publishes
         # grasp_active=True; we stop publishing twist commands. No re-anchoring
@@ -155,9 +150,8 @@ class TeleopJoystick(Node):
             # tick; the next ee_cb refills it for the new arm.
             self.ee_pos = None
             self.ee_rot = None
-            self._prev_ee_rot = None            # new arm: don't compare across the switch
-            self._prev_target_home_rot = None   # same -- avoid a false jump warning
-            self._log_pose_debug(f"[JOYSTICK] Arm -> {msg.data.upper()} (home derived from new arm's gripper).")
+            self.get_logger().info(
+                f"[JOYSTICK] Arm -> {msg.data.upper()} (home derived from new arm's gripper).")
 
     def grasp_active_cb(self, msg):
         """Suspend publishing while the grasp SM drives the arm.
@@ -168,25 +162,10 @@ class TeleopJoystick(Node):
         """
         if msg.data and not self.grasp_active:
             self.grasp_active = True
-            self._log_pose_debug("[JOYSTICK] Grasp exec STARTED: teleop suspended.")
+            self.get_logger().info("[JOYSTICK] Grasp exec: teleop suspended.")
         elif not msg.data and self.grasp_active:
             self.grasp_active = False
-            self._log_pose_debug("[JOYSTICK] Grasp exec ENDED: teleop resuming (home auto-derived).")
-
-    def _log_pose_debug(self, tag):
-        """Dump the current ee_rot / home_rot state (quat + euler deg) for debugging."""
-        if self.ee_rot is not None:
-            ee_deg = np.degrees(self.ee_rot.as_euler('xyz'))
-            ee_quat = self.ee_rot.as_quat()
-        else:
-            ee_deg, ee_quat = None, None
-        home_deg = np.degrees(self.home_rot.as_euler('xyz'))
-        home_quat = self.home_rot.as_quat()
-        self.get_logger().info(
-            f"{tag} | ee_rot(deg)={np.round(ee_deg, 1).tolist() if ee_deg is not None else None} "
-            f"ee_quat={np.round(ee_quat, 4).tolist() if ee_quat is not None else None} | "
-            f"home_rot(deg)={np.round(home_deg, 1).tolist()} "
-            f"home_quat={np.round(home_quat, 4).tolist()}")
+            self.get_logger().info("[JOYSTICK] Grasp done: teleop resuming (home auto-derived).")
 
     def handle_pose_cb(self, msg):
         """Latest Haption handle pose (position in m, orientation quat), Haption base frame."""
@@ -211,23 +190,7 @@ class TeleopJoystick(Node):
         else:
             self.ee_pos = np.array(msg.data[6:9])
             rpy = np.array(msg.data[15:18])
-        new_ee_rot = R.from_euler('xyz', rpy)
-
-        # --- DEBUG: detect discontinuous jumps in the RAW gripper orientation ---
-        # /qp_debug/ee_real's RPY comes from pin.rpy.matrixToRpy, which is prone to
-        # gimbal-lock branch flips near pitch=+-90 deg (e.g. Top-grasp orientations,
-        # gripper pointing straight down). A flip there can make consecutive rpy
-        # samples decode to a large jump. Logged so we can see it happen live.
-        if self._prev_ee_rot is not None:
-            jump = float(np.linalg.norm((new_ee_rot * self._prev_ee_rot.inv()).as_rotvec()))
-            if jump > self._DEBUG_JUMP_THRESHOLD_RAD:
-                self.get_logger().warn(
-                    f"[JOYSTICK-DEBUG] RAW ee_rot JUMP of {np.degrees(jump):.1f} deg in one tick! "
-                    f"prev_rpy(deg)={np.round(np.degrees(self._prev_ee_rot.as_euler('xyz')), 1).tolist()} "
-                    f"-> new_rpy(deg)={np.round(np.degrees(rpy), 1).tolist()} "
-                    f"(raw msg rpy slice, active_arm={self.active_arm}, grasp_active={self.grasp_active})")
-        self._prev_ee_rot = new_ee_rot
-        self.ee_rot = new_ee_rot
+        self.ee_rot = R.from_euler('xyz', rpy)
 
     # Maximum angular rate at which the home orientation is allowed to change
     # (rad/s). Prevents the handle spring from yanking when the gripper rotates
@@ -277,24 +240,6 @@ class TeleopJoystick(Node):
 
         # Step 5: Compute the target home orientation.
         target_home_rot = R.from_rotvec(scaled_delta) * self.neutral_rot
-
-        # --- DEBUG: detect discontinuous jumps in the TARGET home (pre-rate-limit) ---
-        # This isolates whether a jump originates from the raw gripper orientation
-        # (see ee_cb's jump detector) or is introduced/amplified by the alignment +
-        # scaling math itself.
-        if self._prev_target_home_rot is not None:
-            target_jump = float(np.linalg.norm(
-                (target_home_rot * self._prev_target_home_rot.inv()).as_rotvec()))
-            if target_jump > self._DEBUG_JUMP_THRESHOLD_RAD:
-                self.get_logger().warn(
-                    f"[JOYSTICK-DEBUG] TARGET home_rot JUMP of {np.degrees(target_jump):.1f} deg "
-                    f"in one tick! prev_target(deg)="
-                    f"{np.round(np.degrees(self._prev_target_home_rot.as_euler('xyz')), 1).tolist()} "
-                    f"-> new_target(deg)={np.round(np.degrees(target_home_rot.as_euler('xyz')), 1).tolist()} "
-                    f"(current home before clamp(deg)="
-                    f"{np.round(np.degrees(self.home_rot.as_euler('xyz')), 1).tolist()}, "
-                    f"grasp_active={self.grasp_active})")
-        self._prev_target_home_rot = target_home_rot
 
         # Step 6: Rate-limit the change from current home_rot to target.
         # This prevents the spring from yanking the handle when the gripper
