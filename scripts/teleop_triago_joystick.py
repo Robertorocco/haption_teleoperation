@@ -18,15 +18,15 @@ Handle mechanics (per axis):
     v mapped Haption -> TRIAGo base via the 180-deg-Z flip (negate X, negate Y).
 A displacement inside JOYSTICK_DEADBAND_{LIN,ANG} yields exactly zero twist.
 
-Dynamic home orientation (kinematic-mismatch handling):
-    The gripper may be posed very differently from the handle (e.g. a top-down
-    grasp). So the home ORIENTATION tracks the gripper: it starts from the
-    gripper's INITIAL orientation (captured at startup / arm-switch / post-grasp)
-    mapped to the neutral handle quat, and thereafter rotates with the gripper's
-    delta from that reference, with the rotation ANGLE scaled DOWN by
-    JOYSTICK_ROT_HOME_SCALE (gripper 90 deg -> handle 60 deg) because the Haption's
-    rotational workspace is more restrictive. This scaling applies ONLY here to the
-    home pose, never to the commanded twist. The home POSITION stays fixed.
+Dynamic home orientation (stateless derivation from gripper pose):
+    The home ORIENTATION is derived ON-THE-FLY from the gripper's CURRENT
+    orientation using a fixed frame-alignment rotation that maps:
+        gripper +X (approach axis, toward object) → handle -Z (toward user torso)
+    This eliminates the old grip_ref_rot save/restore/re-anchor state machine.
+    The gripper's deviation from its default pose (encoded by the neutral handle
+    quaternion) is scaled DOWN by JOYSTICK_ROT_HOME_SCALE so the handle's limited
+    rotational workspace covers the gripper's full range. The home POSITION stays
+    fixed at JOYSTICK_NEUTRAL_POSITION_M.
 
 Ownership: this node is the single source of truth for the live home pose and
 publishes it on cfg.JOYSTICK_HOME_POSE_TOPIC so the force manager renders its
@@ -57,6 +57,14 @@ import triago_control.qp_controller.config as cfg
 # rotation, so it maps both linear vectors and rotation vectors (axial) identically.
 _FRAME_FLIP = np.array([-1.0, -1.0, 1.0])
 
+# Fixed frame-alignment rotation: maps the gripper frame convention to the Haption
+# handle frame convention.
+#   Gripper: +X = approach axis (toward object), +Z ≈ up
+#   Handle:  -Z = approach axis (toward user torso, i.e. away from workspace)
+# So gripper +X → handle -Z is a rotation of +90° about Y (right-hand rule:
+# rotates +X toward -Z). This is the constant R_align applied in the Haption frame.
+_R_ALIGN = R.from_euler('y', 90.0, degrees=True)
+
 
 class TeleopJoystick(Node):
     def __init__(self):
@@ -67,6 +75,15 @@ class TeleopJoystick(Node):
         self.neutral_rot = R.from_quat(cfg.JOYSTICK_NEUTRAL_ORIENTATION_XYZW)  # xyzw
         self.home_rot = self.neutral_rot  # updated live to track the gripper
 
+        # The gripper's "default" orientation (TRIAGo base frame) that corresponds
+        # to neutral_rot on the handle. Back-derived from the fixed alignment:
+        #   neutral_rot = _R_ALIGN * FRAME_FLIP_rot(gripper_default_rot)
+        # Since the user confirmed JOYSTICK_NEUTRAL_ORIENTATION_XYZW approximates
+        # the startup gripper pose (mapped through _R_ALIGN and the frame flip),
+        # we store the INVERSE of the combined transform for efficient per-tick use.
+        # Computed once at startup from the neutral quaternion.
+        self._neutral_rot_inv = self.neutral_rot.inv()
+
         # --- Live handle state (Haption base frame) ---
         self.handle_pos = None
         self.handle_rot = None
@@ -75,18 +92,11 @@ class TeleopJoystick(Node):
         # --- Robot EE state (TRIAGo base frame) ---
         self.ee_pos = None
         self.ee_rot = None
-        # PER-ARM gripper reference orientation that maps to the neutral handle quat.
-        # Captured from an arm's gripper the FIRST time that arm becomes active (its
-        # home then == neutral); re-anchored after an autonomous grasp (the gripper
-        # moved a lot); and SAVED/RESTORED across arm switches -- switching away keeps
-        # the arm's reference in this dict, switching back reuses it so the arm
-        # resumes its own home pose instead of resetting to neutral.
-        self.grip_ref_rot = {'right': None, 'left': None}
 
         # --- Authority handover ---
         # While shared_autonomy drives a grasp autonomously it publishes
-        # grasp_active=True; we stop publishing and, on the falling edge, re-capture
-        # the gripper reference so the resumed home matches the post-grasp pose.
+        # grasp_active=True; we stop publishing twist commands. No re-anchoring
+        # needed anymore (home is derived statelessly from the current gripper).
         self.grasp_active = False
 
         # --- Parameters ---
@@ -125,39 +135,37 @@ class TeleopJoystick(Node):
                 "[JOYSTICK] cfg.BLENDING=False -- this joystick node is intended for "
                 "BLENDING mode. Publishing directly to /arm_*/cartesian_reference.")
         self.get_logger().info(
-            f"[JOYSTICK] Joystick Mode teleop started. Home position (Haption) "
-            f"= {self.home_pos.tolist()}; deadband = "
+            f"[JOYSTICK] Joystick Mode teleop started (STATELESS home orientation). "
+            f"Home position (Haption) = {self.home_pos.tolist()}; deadband = "
             f"{cfg.JOYSTICK_DEADBAND_LIN*100:.1f} cm / "
             f"{np.degrees(cfg.JOYSTICK_DEADBAND_ANG):.1f} deg. Waiting for handle + EE...")
 
     # ------------------------------------------------------------------ callbacks
     def active_arm_cb(self, msg):
-        """Switch which arm the twist is published to (per-arm home saved/restored)."""
+        """Switch which arm the twist is published to."""
         if msg.data in ('right', 'left') and msg.data != self.active_arm:
             self.active_arm = msg.data
             self.cmd_pub = self.cmd_pub_right if msg.data == 'right' else self.cmd_pub_left
             # Drop the stale (old-arm) EE so we don't build a bad home/twist for one
-            # tick; the next ee_cb refills it for the new arm. The new arm's grip_ref
-            # is RESTORED from the dict (or captured on that next sample if this is
-            # its first activation) -- never force-reset to neutral.
+            # tick; the next ee_cb refills it for the new arm.
             self.ee_pos = None
             self.ee_rot = None
-            restored = self.grip_ref_rot[self.active_arm] is not None
             self.get_logger().info(
-                f"[JOYSTICK] Arm -> {msg.data.upper()} "
-                f"({'home restored' if restored else 'first activation, home = neutral'}).")
+                f"[JOYSTICK] Arm -> {msg.data.upper()} (home derived from new arm's gripper).")
 
     def grasp_active_cb(self, msg):
-        """Suspend publishing while the grasp SM drives the arm; rebase on the falling edge."""
+        """Suspend publishing while the grasp SM drives the arm.
+
+        No re-anchoring needed: the home orientation is derived statelessly from
+        the current gripper pose each tick, so it automatically reflects wherever
+        the gripper ends up after the grasp (success, failure, or abort).
+        """
         if msg.data and not self.grasp_active:
             self.grasp_active = True
             self.get_logger().info("[JOYSTICK] Grasp exec: teleop suspended.")
         elif not msg.data and self.grasp_active:
             self.grasp_active = False
-            # The autonomous grasp moved THIS arm's gripper a lot -> re-anchor its
-            # home onto the post-grasp orientation (recapture on the next EE sample).
-            self.grip_ref_rot[self.active_arm] = None
-            self.get_logger().info("[JOYSTICK] Grasp done: re-anchoring home, teleop resuming.")
+            self.get_logger().info("[JOYSTICK] Grasp done: teleop resuming (home auto-derived).")
 
     def handle_pose_cb(self, msg):
         """Latest Haption handle pose (position in m, orientation quat), Haption base frame."""
@@ -183,27 +191,53 @@ class TeleopJoystick(Node):
             self.ee_pos = np.array(msg.data[6:9])
             rpy = np.array(msg.data[15:18])
         self.ee_rot = R.from_euler('xyz', rpy)
-        if self.grip_ref_rot[self.active_arm] is None:
-            self.grip_ref_rot[self.active_arm] = self.ee_rot
-            self.get_logger().info(
-                f"[JOYSTICK] {self.active_arm.upper()} gripper reference captured (home = neutral).")
 
     # ------------------------------------------------------------------ math
     def _update_home_orientation(self):
-        """Rebase the home orientation onto the ACTIVE arm's current gripper orientation.
+        """Derive the home handle orientation directly from the gripper's CURRENT pose.
 
-        home_rot = map(scaled gripper delta) * neutral_rot, where the gripper delta
-        R_grip * R_grip_ref^-1 (TRIAGo base frame, R_grip_ref = this arm's saved
-        reference) has its ANGLE divided by JOYSTICK_ROT_HOME_SCALE and its AXIS
-        mapped into the Haption base frame.
+        Stateless: no saved reference needed. The formula is:
+
+            1. Map the gripper's orientation into the Haption frame via the 180°-Z
+               frame flip (same as linear vectors: negate X and Y components of the
+               rotation vector).
+            2. Apply the fixed alignment rotation _R_ALIGN that maps gripper-X
+               (approach axis) to handle-(-Z) (toward-user axis).
+            3. Compute the angular deviation from the neutral handle orientation.
+            4. Scale that deviation DOWN by JOYSTICK_ROT_HOME_SCALE so the handle's
+               limited rotational workspace covers the gripper's full range.
+            5. Apply the scaled deviation to neutral_rot → home_rot.
+
+        This means:
+          - At the default gripper pose → home_rot = neutral_rot (zero deviation).
+          - As the gripper rotates (e.g. top-down grasp) → the home smoothly follows,
+            compressed by the scale factor so the handle workspace is never exceeded.
+          - No state transitions, no save/restore, no re-anchoring edge cases.
         """
-        ref = self.grip_ref_rot[self.active_arm]
-        if self.ee_rot is None or ref is None:
+        if self.ee_rot is None:
             return
-        delta_triago = (self.ee_rot * ref.inv()).as_rotvec()  # base-frame axis*angle
-        scaled_triago = delta_triago / cfg.JOYSTICK_ROT_HOME_SCALE
-        delta_haption = _FRAME_FLIP * scaled_triago            # map axis to Haption frame
-        self.home_rot = R.from_rotvec(delta_haption) * self.neutral_rot
+
+        # Step 1: Map gripper rotation to Haption frame.
+        # The rotation vector's axis is a free vector that transforms like a
+        # pseudovector under the 180°-Z frame change (negate X,Y components).
+        ee_rotvec_triago = self.ee_rot.as_rotvec()
+        ee_rotvec_haption = _FRAME_FLIP * ee_rotvec_triago
+        ee_rot_haption = R.from_rotvec(ee_rotvec_haption)
+
+        # Step 2: Apply the fixed frame-alignment rotation.
+        # This maps the gripper's approach convention to the handle's approach convention.
+        aligned_rot = _R_ALIGN * ee_rot_haption
+
+        # Step 3: Compute deviation from the neutral handle orientation.
+        # When the gripper is in its default startup pose, aligned_rot ≈ neutral_rot
+        # (by the user's confirmation), so the deviation ≈ identity (zero rotvec).
+        delta_rotvec = (aligned_rot * self._neutral_rot_inv).as_rotvec()
+
+        # Step 4: Scale the deviation down to fit the handle's workspace.
+        scaled_delta = delta_rotvec / cfg.JOYSTICK_ROT_HOME_SCALE
+
+        # Step 5: Apply to neutral to get the final home orientation.
+        self.home_rot = R.from_rotvec(scaled_delta) * self.neutral_rot
 
     @staticmethod
     def _deadband_radial(vec, deadband):
