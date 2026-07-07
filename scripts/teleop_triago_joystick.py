@@ -192,6 +192,11 @@ class TeleopJoystick(Node):
             rpy = np.array(msg.data[15:18])
         self.ee_rot = R.from_euler('xyz', rpy)
 
+    # Maximum angular rate at which the home orientation is allowed to change
+    # (rad/s). Prevents the handle spring from yanking when the gripper rotates
+    # abruptly (e.g. during autonomous grasp execution or abort retreat).
+    _HOME_ROT_RATE_LIMIT = 0.5  # rad/s — smooth enough for the spring to follow
+
     # ------------------------------------------------------------------ math
     def _update_home_orientation(self):
         """Derive the home handle orientation directly from the gripper's CURRENT pose.
@@ -207,37 +212,47 @@ class TeleopJoystick(Node):
             4. Scale that deviation DOWN by JOYSTICK_ROT_HOME_SCALE so the handle's
                limited rotational workspace covers the gripper's full range.
             5. Apply the scaled deviation to neutral_rot → home_rot.
+            6. RATE-LIMIT the change so the handle is never yanked abruptly.
 
         This means:
           - At the default gripper pose → home_rot = neutral_rot (zero deviation).
           - As the gripper rotates (e.g. top-down grasp) → the home smoothly follows,
             compressed by the scale factor so the handle workspace is never exceeded.
           - No state transitions, no save/restore, no re-anchoring edge cases.
+          - Abrupt gripper orientation changes (grasp exec, abort) are smoothed.
         """
         if self.ee_rot is None:
             return
 
         # Step 1: Map gripper rotation to Haption frame.
-        # The rotation vector's axis is a free vector that transforms like a
-        # pseudovector under the 180°-Z frame change (negate X,Y components).
         ee_rotvec_triago = self.ee_rot.as_rotvec()
         ee_rotvec_haption = _FRAME_FLIP * ee_rotvec_triago
         ee_rot_haption = R.from_rotvec(ee_rotvec_haption)
 
         # Step 2: Apply the fixed frame-alignment rotation.
-        # This maps the gripper's approach convention to the handle's approach convention.
         aligned_rot = _R_ALIGN * ee_rot_haption
 
         # Step 3: Compute deviation from the neutral handle orientation.
-        # When the gripper is in its default startup pose, aligned_rot ≈ neutral_rot
-        # (by the user's confirmation), so the deviation ≈ identity (zero rotvec).
         delta_rotvec = (aligned_rot * self._neutral_rot_inv).as_rotvec()
 
         # Step 4: Scale the deviation down to fit the handle's workspace.
         scaled_delta = delta_rotvec / cfg.JOYSTICK_ROT_HOME_SCALE
 
-        # Step 5: Apply to neutral to get the final home orientation.
-        self.home_rot = R.from_rotvec(scaled_delta) * self.neutral_rot
+        # Step 5: Compute the target home orientation.
+        target_home_rot = R.from_rotvec(scaled_delta) * self.neutral_rot
+
+        # Step 6: Rate-limit the change from current home_rot to target.
+        # This prevents the spring from yanking the handle when the gripper
+        # orientation changes faster than the operator can comfortably follow.
+        diff_rotvec = (target_home_rot * self.home_rot.inv()).as_rotvec()
+        diff_angle = float(np.linalg.norm(diff_rotvec))
+        max_step = self._HOME_ROT_RATE_LIMIT * self.dt  # max rad per tick
+        if diff_angle > max_step and diff_angle > 1e-9:
+            # Clamp to max_step along the same axis
+            clamped_rotvec = diff_rotvec * (max_step / diff_angle)
+            self.home_rot = R.from_rotvec(clamped_rotvec) * self.home_rot
+        else:
+            self.home_rot = target_home_rot
 
     @staticmethod
     def _deadband_radial(vec, deadband):
