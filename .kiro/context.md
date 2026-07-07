@@ -218,10 +218,15 @@ ros2 run haption_teleoperation haption_plotter.py        # debug plotting
 - No per-tick console spam — only startup banners, state transitions, warnings.
 - Matplotlib plots on the main thread, ROS spin on a daemon thread.
 
-## 12. Git Workflow
+## 12. User Workspace Paths
+
+- **Colcon workspace**: `~/exchange/ros2-ws/`
+- **This repo clone location**: `~/exchange/ros2-ws/src/haption_teleoperation`
+
+## 13. Git Workflow
 
 - Push directly to `main` (no feature branches / PRs for this repo).
-- **After every push**, run for the user on their local machine:
+- **After every push**, ALWAYS provide the user with the exact commands to sync their local machine:
 
 ```bash
 cd ~/exchange/ros2-ws/src/haption_teleoperation
