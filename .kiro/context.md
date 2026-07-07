@@ -29,6 +29,7 @@ haption_teleoperation/
     ├── teleop_triago_clutch.py                    clutch-indexing teleop (Virtual Fixture, cfg.BLENDING=False)
     ├── teleop_triago_joystick.py                  Joystick Mode teleop (cfg.BLENDING=True)
     ├── haptic_force_manager_tutorial.py           active when cfg.BLENDING=False (Virtual Fixture)
+    ├── haptic_force_manager_noguidance_tutorial.py  no-guidance baseline: F_sync only (see §3.3)
     ├── haptic_force_manager_blending_tutorial.py  active when cfg.BLENDING=True (Joystick Mode centering spring)
     ├── teleop_triago.py / teleop_demo_integrator.py   alternate/demo teleop variants
     └── haption_plotter.py / workspace_debug_visualizer.py   debug visualization
@@ -81,7 +82,13 @@ Haption pose ─┐
 
 **Home pose** (Haption base frame): position fixed at `JOYSTICK_NEUTRAL_POSITION_M = [0.5, -0.03, -0.03]`; orientation starts from `JOYSTICK_NEUTRAL_ORIENTATION_XYZW` (measured on the device at the operator's comfortable rest orientation) and is **dynamically re-based** to track the gripper's orientation (so "handle at rest" always means "hold current gripper orientation"). The gripper reference that defines this mapping is **per-arm**: captured ONCE the first time each arm becomes active, and saved/restored across arm switches (returning to an arm resumes its own home, not neutral). It is **never re-anchored** after first capture — in particular NOT after an autonomous grasp: the home is recomputed every tick (including while suspended during grasp execution) as a scaled delta from the persistent reference, so it stays continuously synced to the gripper with no jump-to-neutral at any transition. The gripper's rotation away from its reference is scaled DOWN by `JOYSTICK_ROT_HOME_SCALE = 1.3` (gripper 90° → handle ~69°) when building the home orientation — lower scale = tighter (more synchronized) tracking, kept above 1.0 so the handle stays within the Haption's more restrictive rotational workspace. This scaling applies ONLY to the home pose, never to the commanded twist. `teleop_triago_joystick.py` owns and publishes the live home pose so the spring and the twist zero-point stay identical.
 
-**Deadband**: handle displacement below `JOYSTICK_DEADBAND_LIN = 9.6 cm` / `JOYSTICK_DEADBAND_ANG = ~16.5°` yields zero user twist (removed radially, continuous at the boundary). It is intentionally large because the centering spring cannot settle the handle to mm/sub-degree precision — a tighter band would read the residual settle-oscillation as spurious user input. A still handle (zero user twist) makes the arbitration fall back to a gentle autonomous crawl (see triago §5).
+**Deadband**: handle displacement below `JOYSTICK_DEADBAND_LIN = 8.64 cm` / `JOYSTICK_DEADBAND_ANG = ~14.85°` yields zero user twist (removed radially, continuous at the boundary). It is intentionally large because the centering spring cannot settle the handle to mm/sub-degree precision — a tighter band would read the residual settle-oscillation as spurious user input. A still handle (zero user twist) makes the arbitration fall back to a gentle autonomous crawl (see triago §5).
+
+### 3.3 No-Guidance Baseline (`haptic_force_manager_noguidance_tutorial.py`)
+
+A control-condition strategy for the user study: **pure manual teleoperation with NO predictive assistance**. Runs the SAME `teleop_triago_clutch.py` as Mode A (`cfg.BLENDING=False`, clutch-indexing to `/arm_*/cartesian_reference`), but pairs it with a stripped force manager whose ONLY assistive wrench is **`F_sync`, computed exactly as in Mode A but 30% stronger** (sync stiffnesses ×1.3: `Kp_sync=13.0`, `Kp_sync_ang=0.39`). No `F_guide`, no `F_fixture`, no `F_cbf`, no clutch alignment guidance, no adaptive sync-share, no `MAX_TOTAL` authority cap — so `main_shared_autonomy`'s guidance topics are irrelevant here.
+
+To stay consistent with Mode A it KEEPS the non-guidance features/rules: the `grasp_active` EE-following wrench (feel the autonomous grasp/lift/abort — active only if the grasp state machine is running), the clutch-freeze (50% on press), global viscous damping, arm switching, the 180°-Z frame map, and the `MAX_FORCE`/`MAX_TORQUE` device clip.
 
 ## 4. C++ Node: virtuose_server_node
 
@@ -202,6 +209,9 @@ ros2 run haption_teleoperation virtuose_server_node
 #   BLENDING=False (Virtual Fixture):
 ros2 run haption_teleoperation teleop_triago_clutch.py
 ros2 run haption_teleoperation haptic_force_manager_tutorial.py
+#   No-guidance baseline (BLENDING=False, §3.3): F_sync only, +30%:
+ros2 run haption_teleoperation teleop_triago_clutch.py
+ros2 run haption_teleoperation haptic_force_manager_noguidance_tutorial.py
 #   BLENDING=True (Joystick Mode):
 ros2 run haption_teleoperation teleop_triago_joystick.py
 ros2 run haption_teleoperation haptic_force_manager_blending_tutorial.py
