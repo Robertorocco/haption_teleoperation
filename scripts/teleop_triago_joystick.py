@@ -41,7 +41,7 @@ it still routes to /arm_*/cartesian_reference and warns.
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Pose, Twist
 from std_msgs.msg import Float64MultiArray, Bool, String
 
 import numpy as np
@@ -70,6 +70,7 @@ class TeleopJoystick(Node):
         # --- Live handle state (Haption base frame) ---
         self.handle_pos = None
         self.handle_rot = None
+        self.handle_vel = np.zeros(6)   # 6-DOF spatial velocity (for viscous twist damping)
 
         # --- Robot EE state (TRIAGo base frame) ---
         self.ee_pos = None
@@ -99,6 +100,8 @@ class TeleopJoystick(Node):
         # NOTE: virtuose_server_node publishes virtuose/pose as geometry_msgs/Pose
         # (NOT PoseStamped) -- the wrong type silently receives nothing.
         self.create_subscription(Pose, 'virtuose/pose', self.handle_pose_cb, 10)
+        # Handle velocity, for the viscous damping term on the commanded twist.
+        self.create_subscription(Twist, 'virtuose/velocity', self.vel_cb, 10)
         # EE pose: reference orientation + the pose slots of the outgoing message.
         self.create_subscription(Float64MultiArray, '/qp_debug/ee_real', self.ee_cb, 10)
         self.create_subscription(Bool, '/shared_autonomy/grasp_active', self.grasp_active_cb, 10)
@@ -163,6 +166,12 @@ class TeleopJoystick(Node):
         self.handle_pos = np.array([p.x, p.y, p.z])
         self.handle_rot = R.from_quat([q.x, q.y, q.z, q.w])
 
+    def vel_cb(self, msg):
+        """Latest Haption handle 6-DOF spatial velocity (Haption base frame)."""
+        self.handle_vel = np.array([
+            msg.linear.x, msg.linear.y, msg.linear.z,
+            msg.angular.x, msg.angular.y, msg.angular.z])
+
     def ee_cb(self, msg):
         """Active arm's EE pose. Layout: [pos_R(3), vel_R(3), pos_L(3), vel_L(3), rpy_R(3), rpy_L(3)]."""
         if len(msg.data) < 18:
@@ -216,18 +225,32 @@ class TeleopJoystick(Node):
         return vec
 
     def _compute_user_twist(self):
-        """Handle displacement from home -> Cartesian twist in the TRIAGo base frame."""
+        """Handle displacement from home -> Cartesian twist in the TRIAGo base frame.
+
+        Twist magnitude is proportional to the displacement past the deadband, minus
+        a viscous damping term (-DAMP * handle_velocity) that smooths quick handle
+        motions. Damping is applied ONLY outside the deadband, so a handle resting or
+        oscillating near home still commands exactly zero (deadband guarantee kept).
+        """
         # --- Linear: displacement of the handle position from home ---
         d_lin = self.handle_pos - self.home_pos                       # Haption frame
         eff_lin = self._deadband_radial(d_lin, cfg.JOYSTICK_DEADBAND_LIN)
-        v_haption = cfg.JOYSTICK_K_TRANS * eff_lin
+        if float(np.linalg.norm(eff_lin)) < 1e-9:
+            v_haption = np.zeros(3)                                    # inside deadband -> zero (no damping)
+        else:
+            v_haption = (cfg.JOYSTICK_K_TRANS * eff_lin
+                         - cfg.JOYSTICK_DAMP_LIN * self.handle_vel[0:3])
         v_triago = _FRAME_FLIP * v_haption
         v_triago = self._clamp_norm(v_triago, cfg.JOYSTICK_V_MAX_LIN)
 
         # --- Angular: rotational displacement of the handle from the home orientation ---
         delta_rot = (self.handle_rot * self.home_rot.inv()).as_rotvec()  # Haption frame axis*angle
         eff_ang = self._deadband_radial(delta_rot, cfg.JOYSTICK_DEADBAND_ANG)
-        w_haption = cfg.JOYSTICK_K_ROT * eff_ang
+        if float(np.linalg.norm(eff_ang)) < 1e-9:
+            w_haption = np.zeros(3)                                    # inside deadband -> zero (no damping)
+        else:
+            w_haption = (cfg.JOYSTICK_K_ROT * eff_ang
+                         - cfg.JOYSTICK_DAMP_ANG * self.handle_vel[3:6])
         w_triago = _FRAME_FLIP * w_haption
         w_triago = self._clamp_norm(w_triago, cfg.JOYSTICK_V_MAX_ANG)
 
