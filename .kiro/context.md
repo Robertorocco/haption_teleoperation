@@ -86,7 +86,7 @@ Haption pose ─┐
 
 ### 3.3 No-Guidance Baseline (`haptic_force_manager_noguidance_tutorial.py`)
 
-A control-condition strategy for the user study: **pure manual teleoperation with NO predictive assistance**. Runs the SAME `teleop_triago_clutch.py` as Mode A (`cfg.BLENDING=False`, clutch-indexing to `/arm_*/cartesian_reference`), but pairs it with a stripped force manager whose ONLY assistive wrench is **`F_sync`, computed exactly as in Mode A but 30% stronger** (sync stiffnesses ×1.3: `Kp_sync=13.0`, `Kp_sync_ang=0.39`). No `F_guide`, no `F_fixture`, no `F_cbf`, no clutch alignment guidance, no adaptive sync-share, no `MAX_TOTAL` authority cap — so `main_shared_autonomy`'s guidance topics are irrelevant here.
+A control-condition strategy for the user study: **pure manual teleoperation with NO predictive assistance**. Runs the SAME `teleop_triago_clutch.py` as Mode A (`cfg.BLENDING=False`, clutch-indexing to `/arm_*/cartesian_reference`), but pairs it with a stripped force manager whose ONLY assistive wrench is **`F_sync`, computed exactly as in Mode A but with a much stronger tether** (`Kp_sync=26.0`, `Kp_sync_ang=0.78` — 2.6× the tutorial's `10.0`/`0.3`, since sync is the sole feedback here). No `F_guide`, no `F_fixture`, no `F_cbf`, no clutch alignment guidance, no adaptive sync-share, no `MAX_TOTAL` authority cap — so `main_shared_autonomy`'s guidance topics are irrelevant here.
 
 To stay consistent with Mode A it KEEPS the non-guidance features/rules: the `grasp_active` EE-following wrench (feel the autonomous grasp/lift/abort — active only if the grasp state machine is running), the clutch-freeze (50% on press), global viscous damping, arm switching, the 180°-Z frame map, and the `MAX_FORCE`/`MAX_TORQUE` device clip.
 

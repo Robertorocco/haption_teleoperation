@@ -61,13 +61,14 @@ class HapticForceManagerNoGuidance(Node):
         self.vel_real = np.zeros(3)     # active-arm EE linear velocity (from ee_real)
         self.vel_haption = np.zeros(6)  # handle 6D spatial velocity (Haption frame)
 
-        # --- F_sync gains (30% STRONGER than haptic_force_manager_tutorial) ---
+        # --- F_sync gains (DOUBLED for this baseline) ---
         # Tutorial: Kp_sync = 10.0, Kp_sync_ang = 0.3, Kd_sync = 0.0.
-        # This baseline: x1.3 on the spring stiffnesses (Kd stays 0 -> global
-        # damping below provides the viscous term, matching the tutorial).
-        self.Kp_sync = 13.0        # N/m     translation sync spring  [10.0 x1.3]
+        # This baseline renders ONLY F_sync, so the tether is made much stronger:
+        # 2x the previous setting of this node (13.0 / 0.39) = 2.6x the tutorial.
+        # Kd stays 0 -> the global damping below supplies the viscous term.
+        self.Kp_sync = 26.0        # N/m     translation sync spring  [was 13.0, now x2]
         self.Kd_sync = 0.0         # Ns/m    (0: global damping supplies the viscous term)
-        self.Kp_sync_ang = 0.39    # Nm/rad  orientation sync spring  [0.3 x1.3]
+        self.Kp_sync_ang = 0.78    # Nm/rad  orientation sync spring  [was 0.39, now x2]
 
         # --- Grasp-execution coupling (identical to the tutorial) ---
         # While /shared_autonomy/grasp_active = True the SM drives the arm and the
@@ -132,7 +133,7 @@ class HapticForceManagerNoGuidance(Node):
         self.setup_plot()
         self.get_logger().info(
             "Haptic Force Manager (NO-GUIDANCE baseline) started: F_sync only, "
-            f"30% stronger (Kp_sync={self.Kp_sync}, Kp_sync_ang={self.Kp_sync_ang}).")
+            f"doubled tether (Kp_sync={self.Kp_sync}, Kp_sync_ang={self.Kp_sync_ang}).")
 
     # =========================
     # PLOT SETUP & UPDATE
