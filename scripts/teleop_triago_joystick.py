@@ -20,13 +20,17 @@ A displacement inside JOYSTICK_DEADBAND_{LIN,ANG} yields exactly zero twist.
 
 Dynamic home orientation (kinematic-mismatch handling):
     The gripper may be posed very differently from the handle (e.g. a top-down
-    grasp). So the home ORIENTATION tracks the gripper: it starts from the
-    gripper's INITIAL orientation (captured at startup / arm-switch / post-grasp)
-    mapped to the neutral handle quat, and thereafter rotates with the gripper's
-    delta from that reference, with the rotation ANGLE scaled DOWN by
-    JOYSTICK_ROT_HOME_SCALE (gripper 90 deg -> handle 60 deg) because the Haption's
-    rotational workspace is more restrictive. This scaling applies ONLY here to the
-    home pose, never to the commanded twist. The home POSITION stays fixed.
+    grasp). So the home ORIENTATION tracks the gripper: per arm, the gripper's
+    orientation is captured ONCE at that arm's first activation (its home then ==
+    neutral), and thereafter the home rotates with the gripper's delta from that
+    reference, with the rotation ANGLE scaled DOWN by JOYSTICK_ROT_HOME_SCALE
+    (gripper 90 deg -> handle ~69 deg) because the Haption's rotational workspace
+    is more restrictive. This scaling applies ONLY here to the home pose, never to
+    the commanded twist. The home POSITION stays fixed. The reference is SAVED /
+    RESTORED across arm switches but is NEVER re-anchored mid-session (in
+    particular not after an autonomous grasp) -- the home is updated every tick,
+    including while suspended during grasp execution, so it stays continuously
+    synchronized with the gripper with no jumps at any state transition.
 
 Ownership: this node is the single source of truth for the live home pose and
 publishes it on cfg.JOYSTICK_HOME_POSE_TOPIC so the force manager renders its
@@ -77,16 +81,18 @@ class TeleopJoystick(Node):
         self.ee_rot = None
         # PER-ARM gripper reference orientation that maps to the neutral handle quat.
         # Captured from an arm's gripper the FIRST time that arm becomes active (its
-        # home then == neutral); re-anchored after an autonomous grasp (the gripper
-        # moved a lot); and SAVED/RESTORED across arm switches -- switching away keeps
-        # the arm's reference in this dict, switching back reuses it so the arm
-        # resumes its own home pose instead of resetting to neutral.
+        # home then == neutral), and SAVED/RESTORED across arm switches -- switching
+        # away keeps the arm's reference in this dict, switching back reuses it so the
+        # arm resumes its own home pose instead of resetting to neutral. It is NEVER
+        # cleared/re-anchored after the first capture (see grasp_active_cb) so the home
+        # stays continuously synced to the gripper through grasp execution.
         self.grip_ref_rot = {'right': None, 'left': None}
 
         # --- Authority handover ---
         # While shared_autonomy drives a grasp autonomously it publishes
-        # grasp_active=True; we stop publishing and, on the falling edge, re-capture
-        # the gripper reference so the resumed home matches the post-grasp pose.
+        # grasp_active=True; we stop publishing the user twist. The home orientation
+        # keeps updating every tick against the persistent reference (no re-anchor),
+        # so the handle stays synced to the gripper and never snaps when teleop resumes.
         self.grasp_active = False
 
         # --- Parameters ---
@@ -148,16 +154,24 @@ class TeleopJoystick(Node):
                 f"({'home restored' if restored else 'first activation, home = neutral'}).")
 
     def grasp_active_cb(self, msg):
-        """Suspend publishing while the grasp SM drives the arm; rebase on the falling edge."""
+        """Suspend twist publishing while the grasp SM drives the arm.
+
+        We DELIBERATELY do NOT re-anchor grip_ref_rot on the falling edge. The
+        home orientation is updated every tick (even while grasp_active, see
+        control_loop) as a scaled DELTA from this arm's persistent reference, so
+        it already tracked the gripper smoothly all the way through the grasp
+        (success, failure, or abort). Resetting the reference here would snap the
+        delta to zero -> home would JUMP back to neutral and the spring would yank
+        the handle. Keeping the reference means the handle stays continuously
+        synchronized with the current gripper orientation across the whole grasp.
+        """
         if msg.data and not self.grasp_active:
             self.grasp_active = True
             self.get_logger().info("[JOYSTICK] Grasp exec: teleop suspended.")
         elif not msg.data and self.grasp_active:
             self.grasp_active = False
-            # The autonomous grasp moved THIS arm's gripper a lot -> re-anchor its
-            # home onto the post-grasp orientation (recapture on the next EE sample).
-            self.grip_ref_rot[self.active_arm] = None
-            self.get_logger().info("[JOYSTICK] Grasp done: re-anchoring home, teleop resuming.")
+            self.get_logger().info(
+                "[JOYSTICK] Grasp done: teleop resuming (home stayed synced to the gripper).")
 
     def handle_pose_cb(self, msg):
         """Latest Haption handle pose (position in m, orientation quat), Haption base frame."""
