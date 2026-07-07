@@ -292,17 +292,12 @@ class TeleopJoystick(Node):
 
     # ------------------------------------------------------------------ loop
     def control_loop(self):
-        # Update the home orientation ONLY when NOT in autonomous grasp execution.
-        # During grasp_active the gripper's orientation changes significantly
-        # (approach/close/lift) but the operator isn't commanding — if we tracked
-        # those changes the home would jump and yank the handle the instant teleop
-        # resumes. Freezing home during grasp means it stays where it was pre-grasp
-        # and the operator's handle position is unchanged on resume.
-        # The home pose is STILL published every tick (even while frozen) so the
-        # spring keeps centering the handle toward the pre-grasp home.
-        if self.ee_rot is not None and not self.grasp_active:
-            self._update_home_orientation()
+        # Always keep the home orientation and force manager's home target fresh,
+        # even while grasp_active (suspended). This way the spring continuously
+        # tracks wherever the gripper is — including during autonomous grasp
+        # execution — so the handle never snaps when teleop resumes.
         if self.ee_rot is not None:
+            self._update_home_orientation()
             self._publish_home_pose()
 
         if self.grasp_active:
