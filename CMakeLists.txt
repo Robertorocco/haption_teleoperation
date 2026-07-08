@@ -94,6 +94,7 @@ install(PROGRAMS
   scripts/haption_plotter.py
   scripts/haptic_force_manager_battery.py
   scripts/haptic_force_manager_tutorial.py
+  scripts/haptic_force_manager_full_tutorial.py
   scripts/haptic_force_manager_noguidance_tutorial.py
   scripts/haptic_force_manager_blending_tutorial.py
   scripts/teleop_demo_integrator.py
