@@ -33,6 +33,7 @@ haption_teleoperation/
     ├── haptic_force_manager_CFB.py  CLUTCH full-guid    (F=1,B=1): VF forces (same weights as F=1,B=0) + reference blending
     ├── haptic_force_manager_J.py    JOYSTICK sync-only  (F=0,B=0): centering spring + orientation-sync + vibration cue
     ├── haptic_force_manager_JB.py   JOYSTICK guided-bld (F=0,B=1): centering spring
+    ├── haptic_force_manager_JFB.py  JOYSTICK full-guid  (F=1,B=1): centering spring + F_guide (overlapped), guide calibrated to the deadzone-exit force
     └── haption_plotter.py / workspace_debug_visualizer.py   debug visualization
 ```
 
@@ -105,6 +106,18 @@ Both assistance channels active on the SAME position-control clutch teleop (`tel
 - **Feedback channel (F):** `haptic_force_manager_CFB.py` renders the identical superposition (`F_sync` + `F_guide` + `F_fixture`) and weights as the feedback-only VF manager (§6.1) — it is a copy of `haptic_force_manager_CF.py` with the startup guard flipped to `(CLUTCH, F=True, B=True)`. Because `ASSIST_BLENDING=True`, its `F_sync` now tethers the handle to the **blended** reference that `main_shared_autonomy` publishes on `/arm_*/cartesian_reference`.
 - **Blending channel (B):** `teleop_triago_clutch.py` publishes to `/arm_*/user_cartesian_reference` (integrated pose + user twist); `main_shared_autonomy` blends it with the belief-weighted policy and is the sole writer of `/arm_*/cartesian_reference`. Intent inference anchors the goal policies at the **blended reference gripper** (the pose the operator actually watches), NOT the clutch's integrated pose — the operator defines their twist relative to the blended gripper. See `triago_control` context.md §5.2 (CLUTCH control mode).
 - **Clutch = suspend:** while the clutch button is held the reference stays absolutely still (`alpha` forced to 0); releasing resumes the blend. So the "both loops" interaction (guidance force moves handle → clutch reads it as `v_user` → blended) is only live while un-clutched, and is bounded by `F_sync` + global damping + `MAX_TOTAL` caps + alignment-gated `alpha`.
+
+### 3.5 JOYSTICK · Full guidance (`JOYSTICK, F=1, B=1`, `haptic_force_manager_JFB.py`)
+
+Both channels active on the spring-centered joystick teleop (`teleop_triago_joystick.py`): the handle renders the **superposition** `F_home (centering spring) + F_guide`, and `main_shared_autonomy` blends the reference (channel B, unchanged from JB).
+
+- **`F_guide` is CFB's velocity field, copied verbatim** (`pi_blend = Σ P(k)·pi_k` → `v_field = map_180Z(pi_blend)` → `F = D·(v_field − handle_vel)`, self-damped, tanh-saturated, LPF'd), with three deliberate retunes so it *overlaps* the home spring rather than using free gains:
+  1. **Calibrated to the home force:** the saturation is the **deadzone-exit force** — `MAX_GUIDE_FORCE = GUIDE_K·KP_LIN·DEADBAND_LIN` (≈5.70 N), `MAX_GUIDE_TORQUE = GUIDE_K·KP_ANG·DEADBAND_ANG` (≈0.43 Nm), `GUIDE_K≈1.1`. So at full gain the guidance alone displaces the handle just past the deadband against the spring.
+  2. **`gain` applied AFTER the tanh** (linear "fraction of the exit force"): `gain=1` → autonomous deadzone exit / self-terminating approach in the `F_guide` direction; `gain<1` → the handle is only *biased* inside the deadband (a felt "preferred direction": easy to clear the deadband with the guidance, must beat spring+guidance to oppose it).
+  3. **`gain = confidence(b_max) × proximity`**: confidence gate `smoothstep(b_max; 0.60, 0.90)` on the active-goal belief (not the entropy measure); proximity gate over ref→goal distance `[0.10, 0.30] m`. Dead when `b_max<0.6` or `dist>0.30 m`; full when confident and `≤0.10 m`.
+- The velocity-field form keeps CFB's good properties: self-damped (`−handle_vel`, no runaway) and vanishing at the goal (`pi_blend→0`, settles). `D_guide_lin=400`, `D_guide_ang=30` are set high on purpose so the tanh reaches the exit-force saturation for the small (cm/s) policy speeds, fading only in the final approach.
+- **Balance plot:** a dedicated window shows `|F_home|`/`|F_guide|`/`|F_total|` and `|T_*|` norms (with the deadzone-exit and guide-saturation thresholds drawn) plus the per-axis force/torque components (home solid, guide dashed), so the operator can read where the guidance is doing the work.
+- Stability note: this cell intentionally re-introduces the force→handle→twist→robot loop the pure joystick avoided; it stays bounded because the guidance saturates *at* the exit force (spring dominates any larger displacement) and is self-damped + belief/proximity-gated. `GUIDE_K` is kept conservative (1.1).
 
 ## 4. C++ Node: virtuose_server_node
 

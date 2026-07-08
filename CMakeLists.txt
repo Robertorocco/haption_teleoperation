@@ -100,6 +100,7 @@ install(PROGRAMS
   scripts/haptic_force_manager_CFB.py
   scripts/haptic_force_manager_J.py
   scripts/haptic_force_manager_JB.py
+  scripts/haptic_force_manager_JFB.py
   scripts/teleop_triago_clutch.py
   scripts/teleop_triago_joystick.py
   scripts/workspace_debug_visualizer.py
