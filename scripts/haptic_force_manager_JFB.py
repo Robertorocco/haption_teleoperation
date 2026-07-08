@@ -16,15 +16,19 @@ Design of the F_guide / F_home overlap (this is the whole point of JFB):
   centering spring, displaces the handle exactly to the edge of the joystick
   deadband:
         F_exit_lin = KP_LIN * DEADBAND_LIN ,   Tau_exit_ang = KP_ANG * DEADBAND_ANG
-  MAX_GUIDE_{FORCE,TORQUE} = GUIDE_K * F_exit (GUIDE_K ~1.1), and the guidance is
-  scaled LINEARLY by  gain = confidence(b_max) x proximity(ref->goal). Therefore:
-    * gain = 1  (confident AND near the goal): the guidance ALONE pushes the handle
-      just past the deadband -> the teleop reads a non-zero twist -> the arm
-      approaches the goal autonomously, in the F_guide direction.
-    * gain in (0,1): the guidance only BIASES the handle inside the deadband -> the
-      operator feels a "preferred direction": they clear the deadband easily going
-      WITH the guidance, and to oppose it they must overcome spring + guidance.
+  MAX_GUIDE_{FORCE,TORQUE} = GUIDE_K * F_exit, and the guidance is scaled LINEARLY
+  by  gain = confidence(b_max) x proximity(ref->goal). With GUIDE_K < 1 (currently
+  0.55) the guidance is a pure BIAS -- it can no longer clear the deadband on its
+  own, even at gain=1:
+    * gain = 1  (confident AND near the goal): the handle is pushed toward the goal
+      but stays INSIDE the deadband -> a clear "preferred direction": the operator
+      clears the deadband easily going WITH the guidance (toward the goal), and to
+      oppose it they must overcome spring + guidance. The operator still drives.
+    * gain in (0,1): the same bias, weaker.
     * gain = 0 (unsure, or far): pure joystick, no bias.
+  (GUIDE_K >= 1 would let the guidance clear the deadband autonomously; it was
+  reduced to 0.55 because full-authority guidance felt like constantly fighting
+  forces rather than being gently biased.)
   NOTE: unlike CFB, F_guide here is FEED-FORWARD (built from v_field only, no
   -handle_vel term). CFB's velocity-field self-damping is a virtual damper whose
   coefficient, at the value needed to reach the exit force on this device, exceeds
@@ -97,11 +101,14 @@ class HapticForceManagerJFB(Node):
         self.active_arm = 'right'
 
         # --- Guidance tuning, DEFINED RELATIVE TO THE HOME SPRING ---------------
-        # Saturation = deadzone-exit force x GUIDE_K, so at gain=1 the guidance
-        # alone pushes the handle just past the deadband (see module docstring).
-        self.GUIDE_K = 1.1
-        self.MAX_GUIDE_FORCE  = self.GUIDE_K * self.KP_LIN * cfg.JOYSTICK_DEADBAND_LIN   # ~5.70 N
-        self.MAX_GUIDE_TORQUE = self.GUIDE_K * self.KP_ANG * cfg.JOYSTICK_DEADBAND_ANG   # ~0.43 Nm
+        # Saturation = deadzone-exit force x GUIDE_K. GUIDE_K < 1 -> the guidance
+        # BIASES the handle toward the goal but does NOT clear the deadband on its
+        # own (even at gain=1); the operator feels a preferred direction yet still
+        # drives. Reduced 1.1 -> 0.55 (50%) because full-authority guidance felt
+        # like fighting forces rather than being gently biased.
+        self.GUIDE_K = 0.55
+        self.MAX_GUIDE_FORCE  = self.GUIDE_K * self.KP_LIN * cfg.JOYSTICK_DEADBAND_LIN   # ~2.85 N
+        self.MAX_GUIDE_TORQUE = self.GUIDE_K * self.KP_ANG * cfg.JOYSTICK_DEADBAND_ANG   # ~0.21 Nm
         # FEED-FORWARD magnitude-shaping gains (policy speed -> force), NOT velocity
         # feedback: F_guide is built from v_field ONLY (no -handle_vel term), so
         # these are not virtual dampers and don't threaten device passivity. Set
@@ -116,6 +123,15 @@ class HapticForceManagerJFB(Node):
         self.GUIDE_CONF_HI = 0.90   # b_max at/above this -> full confidence gate
         self.GUIDE_PROX_NEAR = 0.10  # m: ref->goal distance at/below this -> full proximity gate
         self.GUIDE_PROX_FAR  = 0.30  # m: at/beyond this -> guidance dead
+
+        # --- Out-of-deadzone vibration cue (same as J / JB) ---
+        # A constant, low-amplitude, zero-mean buzz on the three torque axes,
+        # rendered the WHOLE time the handle sits OUTSIDE the joystick deadband --
+        # i.e. exactly while a non-zero twist is being commanded. It makes the
+        # operator always AWARE of WHEN they are impressing a command (whether from
+        # their own push or from the guidance biasing the handle past the deadband).
+        self.VIB_AMP = 0.05           # Nm  constant torque amplitude while outside the deadband
+        self.vib_toggle = 1.0         # per-frame sign toggle (~75 Hz square wave)
 
         # --- Subscribers ---
         # NOTE: virtuose_server_node publishes virtuose/pose as geometry_msgs/Pose.
@@ -313,6 +329,21 @@ class HapticForceManagerJFB(Node):
         f_home = self.compute_spring()
         f_guide = self.compute_F_guide()
         f_total = f_home + f_guide
+
+        # --- Out-of-deadzone vibration cue (same as J / JB) ---
+        # Buzz whenever the handle displacement from home exceeds EITHER deadband,
+        # i.e. exactly when the teleop is commanding a non-zero twist -- so the
+        # operator always feels WHEN a command is being impressed.
+        if self.handle_pos is not None and self.handle_rot is not None:
+            lin_disp = float(np.linalg.norm(self.home_pos - self.handle_pos))
+            ang_disp = float(np.linalg.norm((self.home_rot * self.handle_rot.inv()).as_rotvec()))
+            if (lin_disp > cfg.JOYSTICK_DEADBAND_LIN
+                    or ang_disp > cfg.JOYSTICK_DEADBAND_ANG):
+                self.vib_toggle *= -1.0
+                buzz = self.VIB_AMP * self.vib_toggle
+                f_total[3] += buzz
+                f_total[4] += buzz
+                f_total[5] += buzz
 
         f_total[0:3] = np.clip(f_total[0:3], -self.MAX_FORCE, self.MAX_FORCE)
         f_total[3:6] = np.clip(f_total[3:6], -self.MAX_TORQUE, self.MAX_TORQUE)
