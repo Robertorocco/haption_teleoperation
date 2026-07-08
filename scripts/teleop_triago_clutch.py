@@ -19,6 +19,11 @@ class TeleopClutch(Node):
     def __init__(self):
         super().__init__('teleop_clutch')
 
+        # Fail loudly if launched under the wrong study condition. The clutch
+        # teleop is the position-control input for ALL three CLUTCH conditions
+        # (sync / guided-feedback / full), so it only constrains the control mode.
+        cfg.validate_condition('teleop_triago_clutch', control_mode=cfg.CLUTCH)
+
         # --- State Variables ---
         self.initialized = False
         self.ref_pos = np.zeros(3)
@@ -69,17 +74,17 @@ class TeleopClutch(Node):
         #     publisher of the real /arm_*/cartesian_reference. This avoids two
         #     nodes ever racing to publish the same topic.
         self.active_arm = 'right'
-        _topic_right = ('/arm_right/user_cartesian_reference' if cfg.BLENDING
+        _topic_right = ('/arm_right/user_cartesian_reference' if cfg.ASSIST_BLENDING
                         else '/arm_right/cartesian_reference')
-        _topic_left = ('/arm_left/user_cartesian_reference' if cfg.BLENDING
+        _topic_left = ('/arm_left/user_cartesian_reference' if cfg.ASSIST_BLENDING
                        else '/arm_left/cartesian_reference')
         self.cmd_pub_right = self.create_publisher(Float64MultiArray, _topic_right, 10)
         self.cmd_pub_left = self.create_publisher(Float64MultiArray, _topic_left, 10)
         self.cmd_pub = self.cmd_pub_right  # current active publisher
 
         self.get_logger().info(
-            f"[TELEOP] cfg.BLENDING={cfg.BLENDING} -> publishing user reference on "
-            f"'{_topic_right}' (right) / '{_topic_left}' (left).")
+            f"[TELEOP] CONTROL_MODE={cfg.CONTROL_MODE}, ASSIST_BLENDING={cfg.ASSIST_BLENDING} "
+            f"-> publishing user reference on '{_topic_right}' (right) / '{_topic_left}' (left).")
 
         # 4. Subscribe to arm-switch notifications from shared_autonomy
         self.create_subscription(String, '/shared_autonomy/active_arm', self.active_arm_cb, 10)

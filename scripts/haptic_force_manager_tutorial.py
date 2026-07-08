@@ -13,6 +13,9 @@ from geometry_msgs.msg import PoseStamped #
 import matplotlib.pyplot as plt
 import matplotlib
 
+# Single source of truth for the experiment-condition selector (2x3 study).
+import triago_control.qp_controller.config as cfg
+
 # Set backend to avoid blocking the ROS spin loop
 matplotlib.use('TkAgg') 
 
@@ -20,6 +23,12 @@ class HapticForceManager(Node):
     def __init__(self):
         """Initializes the Haptic Force Manager, publishers, subscribers, thread locks, and plot buffers."""
         super().__init__('haptic_force_manager')
+
+        # Fail loudly if launched under the wrong study condition. This is the
+        # CLUTCH "Guided feedback" manager: assistive haptic FORCES on, reference
+        # blending OFF (Virtual Fixture, feedback-only channel).
+        cfg.validate_condition('haptic_force_manager_tutorial',
+                               control_mode=cfg.CLUTCH, feedback=True, blending=False)
 
         # --- State Variables ---
         self.pos_target = None

@@ -49,6 +49,9 @@ from collections import deque
 import matplotlib.pyplot as plt
 import matplotlib
 
+# Single source of truth for the experiment-condition selector (2x3 study).
+import triago_control.qp_controller.config as cfg
+
 # Set backend to avoid blocking the ROS spin loop
 matplotlib.use('TkAgg')
 
@@ -57,6 +60,12 @@ class HapticForceManagerNoGuidance(Node):
     def __init__(self):
         """Initializes the no-guidance haptic force manager (F_sync tether only)."""
         super().__init__('haptic_force_manager_noguidance')
+
+        # Fail loudly if launched under the wrong study condition. This is the
+        # CLUTCH "Sync only" baseline: NO assistive feedback, NO blending
+        # (F_sync tether is the only rendered force).
+        cfg.validate_condition('haptic_force_manager_noguidance_tutorial',
+                               control_mode=cfg.CLUTCH, feedback=False, blending=False)
 
         # --- State Variables ---
         self.pos_target = None
