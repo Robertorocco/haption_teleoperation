@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""haptic_force_manager_noguidance_tutorial -- "no-guidance" baseline force feedback.
+"""haptic_force_manager_C -- "no-guidance" baseline force feedback.
 
 THIRD feedback strategy (baseline / control condition for the user study). It runs
 alongside the EXISTING clutch teleop node (teleop_triago_clutch.py); no predictive
@@ -8,10 +8,10 @@ assistance is provided and main_shared_autonomy's guidance is NOT used.
 The operator teleoperates the TRIAGo hand entirely by hand. The ONLY assistive
 feedback rendered is F_sync -- the spring-damper tether that keeps the Haption
 handle synced with the real EE pose -- computed EXACTLY as in
-haptic_force_manager_tutorial.py but 30% STRONGER (sync gains x1.3). There is no
+haptic_force_manager_CF.py but 30% STRONGER (sync gains x1.3). There is no
 F_guide, no F_fixture, no F_cbf, and no clutch alignment guidance.
 
-To stay CONSISTENT with haptic_force_manager_tutorial (same rules/features), this
+To stay CONSISTENT with haptic_force_manager_CF (same rules/features), this
 node keeps everything that is not guidance:
   * grasp_active EE-FOLLOWING: while the grasp state machine drives the arm
     autonomously (/shared_autonomy/grasp_active = True) the user input is ignored
@@ -64,7 +64,7 @@ class HapticForceManagerNoGuidance(Node):
         # Fail loudly if launched under the wrong study condition. This is the
         # CLUTCH "Sync only" baseline: NO assistive feedback, NO blending
         # (F_sync tether is the only rendered force).
-        cfg.validate_condition('haptic_force_manager_noguidance_tutorial',
+        cfg.validate_condition('haptic_force_manager_C',
                                control_mode=cfg.CLUTCH, feedback=False, blending=False)
 
         # --- State Variables ---
@@ -335,7 +335,7 @@ class HapticForceManagerNoGuidance(Node):
     def compute_F_sync(self):
         """3D+3D spring tether keeping the handle synced with the real EE pose.
 
-        Identical formulation to haptic_force_manager_tutorial.compute_F_sync (the
+        Identical formulation to haptic_force_manager_CF.compute_F_sync (the
         180-deg-Z Haption<->TRIAGo frame map on both the position spring and the
         orientation spring), only with the 30%-boosted gains set in __init__.
         """
@@ -363,7 +363,7 @@ class HapticForceManagerNoGuidance(Node):
     def compute_F_limit_warning(self):
         """Joint-limit "clutch advice" vibration: a ONE-SHOT 1 s torque burst.
 
-        IDENTICAL to haptic_force_manager_tutorial.compute_F_limit_warning (Mode A):
+        IDENTICAL to haptic_force_manager_CF.compute_F_limit_warning (Mode A):
           * Trigger — the moment any Haption joint enters LIMIT_OUTER of a limit,
             AND the burst is currently armed, a single fixed-amplitude
             (LIMIT_VIB_AMP) 75 Hz square-wave buzz is started on the three torque

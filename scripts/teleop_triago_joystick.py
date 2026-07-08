@@ -7,7 +7,7 @@ F_sync tether force back onto the handle; that force displaced the handle, the
 displacement was read back as user twist, and the loop went unstable (plus the
 clutch interacted badly with it). Joystick Mode removes that coupling entirely:
 the handle is spring-centered to a FIXED home pose (the spring lives in
-haptic_force_manager_blending_tutorial.py), and this node reads ONLY the handle's
+haptic_force_manager_JB.py), and this node reads ONLY the handle's
 DISPLACEMENT from that home and maps it to a pure Cartesian twist. There is no
 pose integration and no clutch here -- releasing the handle recenters it, which
 is a zero command.

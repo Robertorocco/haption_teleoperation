@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""haptic_force_manager_joystick_sync_tutorial -- JOYSTICK MODE, "Sync only" baseline.
+"""haptic_force_manager_J -- JOYSTICK MODE, "Sync only" baseline.
 
 This is the VELOCITY-CONTROL (joystick) baseline / control condition of the 2x3
-user study -- the joystick-mode analog of haptic_force_manager_noguidance_tutorial
+user study -- the joystick-mode analog of haptic_force_manager_C
 (the clutch "Sync only" baseline). It runs alongside teleop_triago_joystick.py.
 
 Selected study cell (see config.py section 1b and .kiro/context.md):
@@ -13,13 +13,13 @@ Selected study cell (see config.py section 1b and .kiro/context.md):
 With BOTH assistance channels off this is a TRUE no-assistance baseline: the robot
 follows the pure user twist (main_shared_autonomy runs with alpha = 0, so no policy
 authority leaks in), and the handle renders NO robot-state-derived force. It is
-identical on the FORCE side to haptic_force_manager_blending_tutorial (the guided-
+identical on the FORCE side to haptic_force_manager_JB (the guided-
 blending manager); the ONLY difference between the two joystick conditions lives in
 main_shared_autonomy (whether channel B blends the reference). Keeping the rendered
 force byte-for-byte the same across the two joystick cells is deliberate: it isolates
 the effect of reference-level blending for the paper's fair comparison.
 
-What the handle feels (kept verbatim from haptic_force_manager_blending_tutorial):
+What the handle feels (kept verbatim from haptic_force_manager_JB):
   * SYNC (orientation): the restorative spring's ANGULAR term pulls the handle
     toward the (dynamic) home orientation, which tracks the gripper -- so the
     handle stays synchronized in ORIENTATION with the gripper (per the user's
@@ -84,7 +84,7 @@ class HapticForceManagerJoystickSync(Node):
         # NO reference blending (channel B off). The handle renders only the
         # restorative centering spring (orientation-sync) + the out-of-deadband
         # vibration home cue.
-        cfg.validate_condition('haptic_force_manager_joystick_sync_tutorial',
+        cfg.validate_condition('haptic_force_manager_J',
                                control_mode=cfg.JOYSTICK, feedback=False, blending=False)
 
         # --- Home pose (Haption base frame) -- neutral until teleop publishes ---

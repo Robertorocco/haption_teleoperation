@@ -27,7 +27,7 @@ class HapticForceManager(Node):
         # Fail loudly if launched under the wrong study condition. This is the
         # CLUTCH "Guided feedback" manager: assistive haptic FORCES on, reference
         # blending OFF (Virtual Fixture, feedback-only channel).
-        cfg.validate_condition('haptic_force_manager_tutorial',
+        cfg.validate_condition('haptic_force_manager_CF',
                                control_mode=cfg.CLUTCH, feedback=True, blending=False)
 
         # --- State Variables ---

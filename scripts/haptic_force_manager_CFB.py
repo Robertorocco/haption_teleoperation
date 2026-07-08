@@ -27,11 +27,11 @@ class HapticForceManagerFull(Node):
         # Fail loudly if launched under the wrong study condition. This is the
         # CLUTCH "Full guidance" manager: assistive haptic FORCES on AND reference
         # blending on (both channels active). It renders the SAME forces / weights
-        # as haptic_force_manager_tutorial (the feedback-only VF manager) -- the
+        # as haptic_force_manager_CF (the feedback-only VF manager) -- the
         # only difference is that main_shared_autonomy is also blending the
         # reference (ASSIST_BLENDING=True), so F_sync tethers the handle to the
         # BLENDED reference rather than the raw user pose.
-        cfg.validate_condition('haptic_force_manager_full_tutorial',
+        cfg.validate_condition('haptic_force_manager_CFB',
                                control_mode=cfg.CLUTCH, feedback=True, blending=True)
 
         # --- State Variables ---

@@ -52,6 +52,13 @@ class HapticForceManagerBlending(Node):
     def __init__(self):
         super().__init__('haptic_force_manager_blending')
 
+        # Fail loudly if launched under the wrong study condition. This is the
+        # JOYSTICK "Guided blending" manager: NO assistive feedback (channel F off),
+        # reference blending ON (channel B). The handle renders only the restorative
+        # centering spring; assistance comes from main_shared_autonomy's alpha blend.
+        cfg.validate_condition('haptic_force_manager_JB',
+                               control_mode=cfg.JOYSTICK, feedback=False, blending=True)
+
         # --- Home pose (Haption base frame) -- neutral until teleop publishes ---
         self.home_pos = np.array(cfg.JOYSTICK_NEUTRAL_POSITION_M, dtype=float)
         self.home_rot = R.from_quat(cfg.JOYSTICK_NEUTRAL_ORIENTATION_XYZW)  # xyzw
