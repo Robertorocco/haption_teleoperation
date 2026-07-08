@@ -179,7 +179,7 @@ class HapticForceManager(Node):
         # lasts LIMIT_VIB_DURATION and then goes silent. It will NOT fire again
         # until the operator completes a full clutch cycle (press -> release), so
         # the burst is unambiguously interpreted as "you should clutch now".
-        self.LIMIT_VIB_DURATION = 0.5   # s   burst length
+        self.LIMIT_VIB_DURATION = 1.0   # s   burst length
         self.LIMIT_VIB_AMP = 0.07       # Nm  fixed torque amplitude of the burst
         self.limit_vib_armed = True     # ready to fire (re-armed by a clutch cycle)
         self.limit_vib_active = False   # a burst is currently playing
@@ -842,7 +842,7 @@ class HapticForceManager(Node):
         return self.f_fix_filtered.copy()
 
     def compute_F_limit_warning(self):
-        """Joint-limit "clutch advice" vibration: a ONE-SHOT 0.5 s torque burst.
+        """Joint-limit "clutch advice" vibration: a ONE-SHOT 1 s torque burst.
 
         Behaviour (replaces the old continuous ramp):
           * Trigger — the moment any Haption joint enters LIMIT_OUTER of a limit,
@@ -850,7 +850,7 @@ class HapticForceManager(Node):
             (LIMIT_VIB_AMP) 75 Hz square-wave buzz is started on the three torque
             axes.
           * Duration — the buzz always plays for its full LIMIT_VIB_DURATION
-            (0.5 s), even if the operator starts clutching partway through.
+            (1 s), even if the operator starts clutching partway through.
           * Latch — once fired the burst is DISARMED and cannot fire again until
             the operator completes a full clutch cycle (button press -> release).
             The operator is meant to read the buzz as "clutch now to re-center".
