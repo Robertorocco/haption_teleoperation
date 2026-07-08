@@ -430,8 +430,13 @@ class HapticForceManagerJFB(Node):
         fh_a = np.abs(np.array([x[:n] for x in fh]))   # (6, n): |home wrench|
         fg_a = np.abs(np.array([x[:n] for x in fg]))   # (6, n): |guide wrench|
         denom = fh_a + fg_a
-        # Guidance share per axis (%): |F_guide| / (|F_guide| + |F_home|).
-        share = np.where(denom > 1e-9, 100.0 * fg_a / denom, 0.0)   # (6, n)
+        # Guidance share per axis (%): |F_guide| / (|F_guide| + |F_home|). Use
+        # np.divide with a mask so the division is ONLY evaluated where denom>0 --
+        # this avoids the harmless 0/0 (both forces ~0, e.g. at home with guidance
+        # off) that np.where would still compute and warn about. Masked-out
+        # entries stay 0 (pre-filled by out=).
+        share = np.divide(100.0 * fg_a, denom,
+                          out=np.zeros_like(fg_a), where=denom > 1e-9)   # (6, n)
 
         win = (t[-1] - self.plot_window_sec, t[-1])
 
