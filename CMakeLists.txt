@@ -97,6 +97,7 @@ install(PROGRAMS
   scripts/haptic_force_manager_full_tutorial.py
   scripts/haptic_force_manager_noguidance_tutorial.py
   scripts/haptic_force_manager_blending_tutorial.py
+  scripts/haptic_force_manager_joystick_sync_tutorial.py
   scripts/teleop_demo_integrator.py
   scripts/teleop_triago.py
   scripts/teleop_triago_clutch.py
