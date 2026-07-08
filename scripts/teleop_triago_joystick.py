@@ -114,6 +114,25 @@ class TeleopJoystick(Node):
         self.dt = 1.0 / self.freq
         self.task_dim = 6.0
 
+        # --- Persistent reference latch (sync-only / direct-drive path only) ---
+        # In the sync-only cell (cfg.BLENDING=False) this node writes
+        # /arm_*/cartesian_reference DIRECTLY. Publishing the LIVE EE pose every
+        # tick would make the reference a FOLLOWER ("your target is wherever you
+        # already are"): with a zero user twist the QP's posture potential field +
+        # soft-CLF slack leak a sub-mm velocity, the EE drifts (notably "toward the
+        # ground"), and because the reference re-anchors on the drifted EE next
+        # tick that drift is never opposed -> it integrates into visible creep.
+        # Fix: integrate the user twist into a PERSISTENT latched SE(3) pose, so a
+        # still handle holds an ABSOLUTE target the CLF actively defends. (This is
+        # exactly what main_shared_autonomy does via T_blend_ref for the blending
+        # cell.) The latch re-anchors to the live EE whenever teleop (re)starts
+        # driving: startup, arm switch, and grasp resume.
+        self.ref_pos = None
+        self.ref_rot = None
+        self._ref_valid = False
+        self.MAX_REF_LEAD_LIN = 0.10   # m       cap on how far the latch may lead the real EE
+        self.MAX_REF_LEAD_ANG = 0.35   # rad (~20 deg) same cap for orientation
+
         # --- ROS 2 interfaces ---
         self.active_arm = 'right'
         # Handle Cartesian pose (position + orientation) drives the displacement.
@@ -161,6 +180,7 @@ class TeleopJoystick(Node):
             # its first activation) -- never force-reset to neutral.
             self.ee_pos = None
             self.ee_rot = None
+            self._ref_valid = False   # re-anchor the direct-drive latch to the new arm's EE
             restored = self.grip_ref_rot[self.active_arm] is not None
             self.get_logger().info(
                 f"[JOYSTICK] Arm -> {msg.data.upper()} "
@@ -183,6 +203,7 @@ class TeleopJoystick(Node):
             self.get_logger().info("[JOYSTICK] Grasp exec: teleop suspended.")
         elif not msg.data and self.grasp_active:
             self.grasp_active = False
+            self._ref_valid = False   # re-anchor the direct-drive latch to the post-grasp EE
             self.get_logger().info(
                 "[JOYSTICK] Grasp done: teleop resuming (home stayed synced to the gripper).")
 
@@ -283,6 +304,43 @@ class TeleopJoystick(Node):
 
         return v_triago, w_triago
 
+    def _advance_ref_latch(self, v_cmd, w_cmd):
+        """Integrate the user twist into the persistent reference latch (sync-only
+        direct-drive path) and return the latched (pos, rot).
+
+        Re-anchors to the live EE when invalid (startup / arm switch / grasp
+        resume), then advances by the commanded base-frame twist over one tick --
+        same convention as main_shared_autonomy.integrate_twist (world-frame twist,
+        rotation left-multiplied). A still handle (twist=0) holds the latch fixed,
+        giving the CLF an absolute target that opposes drift. The latch's lead over
+        the real EE is bounded (lin + ang) so it can't run away if the arm lags or
+        hits a limit; on release the EE catches up by at most the cap.
+        """
+        if not self._ref_valid or self.ref_pos is None or self.ref_rot is None:
+            self.ref_pos = self.ee_pos.copy()
+            self.ref_rot = self.ee_rot
+            self._ref_valid = True
+
+        # Advance the latch by the commanded twist (twist=0 -> latch holds fixed).
+        self.ref_pos = self.ref_pos + v_cmd * self.dt
+        if float(np.linalg.norm(w_cmd)) > 1e-9:
+            self.ref_rot = R.from_rotvec(w_cmd * self.dt) * self.ref_rot
+
+        # Bound the linear lead of the latch over the real EE.
+        lead = self.ref_pos - self.ee_pos
+        lead_norm = float(np.linalg.norm(lead))
+        if lead_norm > self.MAX_REF_LEAD_LIN:
+            self.ref_pos = self.ee_pos + lead * (self.MAX_REF_LEAD_LIN / lead_norm)
+
+        # Bound the angular lead of the latch over the real EE.
+        ang_lead = (self.ref_rot * self.ee_rot.inv()).as_rotvec()
+        ang_norm = float(np.linalg.norm(ang_lead))
+        if ang_norm > self.MAX_REF_LEAD_ANG:
+            clamped = ang_lead * (self.MAX_REF_LEAD_ANG / ang_norm)
+            self.ref_rot = R.from_rotvec(clamped) * self.ee_rot
+
+        return self.ref_pos, self.ref_rot
+
     # ------------------------------------------------------------------ loop
     def control_loop(self):
         # Always keep the force manager's home target fresh (even while suspended),
@@ -298,16 +356,29 @@ class TeleopJoystick(Node):
 
         v_cmd, w_cmd = self._compute_user_twist()
 
-        # Pose slots carry the live EE pose so downstream current_T_user == current_T_EE
-        # (belief + guidance are EE-anchored in joystick mode).
-        rpy_ee = self.ee_rot.as_euler('xyz')
+        if cfg.BLENDING:
+            # Guided-blending cell: publish pure user INTENT on
+            # /arm_*/user_cartesian_reference. The pose slots carry the LIVE EE
+            # pose so downstream current_T_user == current_T_EE (belief + guidance
+            # are EE-anchored), and main_shared_autonomy does its OWN persistent-
+            # latch integration of the blended twist. Byte-identical to before.
+            p_ref = self.ee_pos
+            rot_ref = self.ee_rot
+        else:
+            # Sync-only cell: this node writes /arm_*/cartesian_reference DIRECTLY,
+            # so it must publish a PERSISTENT LATCHED pose (integrated from the
+            # twist) -- NOT the live EE. Otherwise the reference is a follower and
+            # the arm creeps with the handle at rest (see _advance_ref_latch).
+            p_ref, rot_ref = self._advance_ref_latch(v_cmd, w_cmd)
+
+        rpy_ref = rot_ref.as_euler('xyz')
         cmd = Float64MultiArray()
         cmd.data = [
-            float(self.ee_pos[0]), float(self.ee_pos[1]), float(self.ee_pos[2]),  # 0:3 position
-            float(rpy_ee[0]),      float(rpy_ee[1]),      float(rpy_ee[2]),        # 3:6 rpy
-            float(v_cmd[0]),       float(v_cmd[1]),       float(v_cmd[2]),         # 6:9 linear twist
-            float(w_cmd[0]),       float(w_cmd[1]),       float(w_cmd[2]),         # 9:12 angular twist
-            float(self.task_dim),                                                 # 12: task-dim flag
+            float(p_ref[0]),  float(p_ref[1]),  float(p_ref[2]),    # 0:3 position
+            float(rpy_ref[0]), float(rpy_ref[1]), float(rpy_ref[2]),  # 3:6 rpy
+            float(v_cmd[0]),  float(v_cmd[1]),  float(v_cmd[2]),    # 6:9 linear twist
+            float(w_cmd[0]),  float(w_cmd[1]),  float(w_cmd[2]),    # 9:12 angular twist
+            float(self.task_dim),                                  # 12: task-dim flag
         ]
         self.cmd_pub.publish(cmd)
 
