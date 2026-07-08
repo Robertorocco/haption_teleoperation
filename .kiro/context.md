@@ -28,11 +28,11 @@ haption_teleoperation/
 └── scripts/                    Python nodes (teleop + force feedback)
     ├── teleop_triago_clutch.py                    CLUTCH position-control teleop (all 3 clutch cells)
     ├── teleop_triago_joystick.py                  JOYSTICK velocity-control teleop (all 3 joystick cells)
-    ├── haptic_force_manager_noguidance_tutorial.py  CLUTCH sync-only (F=0,B=0): F_sync tether only (§3.3)
-    ├── haptic_force_manager_tutorial.py           CLUTCH guided-feedback (F=1,B=0): Virtual Fixture
-    ├── haptic_force_manager_full_tutorial.py      CLUTCH full-guidance (F=1,B=1): VF forces (same weights as F=1,B=0) + reference blending
-    ├── haptic_force_manager_blending_tutorial.py  JOYSTICK guided-blending (F=0,B=1): centering spring
-    ├── teleop_triago.py / teleop_demo_integrator.py   alternate/demo teleop variants
+    ├── haptic_force_manager_C.py    CLUTCH sync-only    (F=0,B=0): F_sync tether only (§3.3)
+    ├── haptic_force_manager_CF.py   CLUTCH guided-fb    (F=1,B=0): Virtual Fixture
+    ├── haptic_force_manager_CFB.py  CLUTCH full-guid    (F=1,B=1): VF forces (same weights as F=1,B=0) + reference blending
+    ├── haptic_force_manager_J.py    JOYSTICK sync-only  (F=0,B=0): centering spring + orientation-sync + vibration cue
+    ├── haptic_force_manager_JB.py   JOYSTICK guided-bld (F=0,B=1): centering spring
     └── haption_plotter.py / workspace_debug_visualizer.py   debug visualization
 ```
 
@@ -45,6 +45,8 @@ The strategy is selected by the three orthogonal flags in `triago_control/qp_con
 - **CONTROL_MODE** picks the teleop node: `teleop_triago_clutch.py` (position control) vs `teleop_triago_joystick.py` (velocity control).
 - **ASSIST_FEEDBACK / ASSIST_BLENDING** pick the force manager (and whether `main_shared_autonomy` owns `/arm_*/cartesian_reference`).
 
+**Force-manager naming convention.** Every force manager is `haptic_force_manager_<CELL>`, where `<CELL>` encodes the active study condition as letters: **C** = CLUTCH or **J** = JOYSTICK (the control mode, always first), then **F** if `ASSIST_FEEDBACK` is on, then **B** if `ASSIST_BLENDING` is on. The no-assist baseline is just the mode letter. The six cells are `C / CF / CFB` (clutch) and `J / JB / JFB` (joystick); `JFB` (joystick full guidance) is not yet implemented. The old `_tutorial` suffix was dropped in this rename, and the legacy/demo scripts (`haptic_force_manager_battery`, `teleop_demo_integrator`, `teleop_triago`) were removed from the package.
+
 The subsections below describe the currently-implemented cells. `cfg.BLENDING` is a backward-compat alias for `ASSIST_BLENDING`.
 
 ### 3.1 CLUTCH · Guided feedback — Virtual Fixture (`CLUTCH, F=1, B=0`)
@@ -55,7 +57,7 @@ The user's raw reference reaches the QP unmodified; ALL assistance is rendered a
 Haption device → teleop_triago_clutch.py → /arm_right/cartesian_reference → main_qp_controller.py (QP CLF-CBF)
 triago_control/main_shared_autonomy.py → /shared_autonomy/{goal_names, goal_probabilities, ee_policy, user_policy, active_goal_pose}
                                                     ↓
-                          haptic_force_manager_tutorial.py → F_guide + F_fixture
+                          haptic_force_manager_CF.py → F_guide + F_fixture
                                                     ↓
                                   virtuose/force_cmd → Haption device (user feels the force)
 ```
@@ -82,7 +84,7 @@ Haption pose ─┐
               ▼
      main_qp_controller.py (QP CLF-CBF)   [unchanged, topic-agnostic]
 
-     haptic_force_manager_blending_tutorial.py: subscribes /joystick/home_pose;
+     haptic_force_manager_JB.py: subscribes /joystick/home_pose;
        renders ONLY the restorative spring toward home → virtuose/force_cmd
 ```
 
@@ -90,17 +92,17 @@ Haption pose ─┐
 
 **Deadband**: handle displacement below `JOYSTICK_DEADBAND_LIN = 8.64 cm` / `JOYSTICK_DEADBAND_ANG = ~14.85°` yields zero user twist (removed radially, continuous at the boundary). It is intentionally large because the centering spring cannot settle the handle to mm/sub-degree precision — a tighter band would read the residual settle-oscillation as spurious user input. A still handle (zero user twist) makes the arbitration fall back to a gentle autonomous crawl (see triago §5).
 
-### 3.3 CLUTCH · Sync only — No-Guidance Baseline (`CLUTCH, F=0, B=0`, `haptic_force_manager_noguidance_tutorial.py`)
+### 3.3 CLUTCH · Sync only — No-Guidance Baseline (`CLUTCH, F=0, B=0`, `haptic_force_manager_C.py`)
 
 A control-condition strategy for the user study: **pure manual teleoperation with NO predictive assistance**. Runs the SAME `teleop_triago_clutch.py` as §3.1 (clutch-indexing to `/arm_*/cartesian_reference`, `ASSIST_BLENDING=False`), but pairs it with a stripped force manager whose ONLY assistive wrench is **`F_sync`, computed exactly as in Mode A but with a much stronger tether** (`Kp_sync=26.0`, `Kp_sync_ang=0.78` — 2.6× the tutorial's `10.0`/`0.3`, since sync is the sole feedback here). No `F_guide`, no `F_fixture`, no `F_cbf`, no clutch alignment guidance, no adaptive sync-share, no `MAX_TOTAL` authority cap — so `main_shared_autonomy`'s guidance topics are irrelevant here.
 
 To stay consistent with Mode A it KEEPS the non-guidance features/rules: the `grasp_active` EE-following wrench (feel the autonomous grasp/lift/abort — active only if the grasp state machine is running), the clutch-freeze (50% on press), global viscous damping, arm switching, the 180°-Z frame map, and the `MAX_FORCE`/`MAX_TORQUE` device clip.
 
-### 3.4 CLUTCH · Full guidance (`CLUTCH, F=1, B=1`, `haptic_force_manager_full_tutorial.py`)
+### 3.4 CLUTCH · Full guidance (`CLUTCH, F=1, B=1`, `haptic_force_manager_CFB.py`)
 
 Both assistance channels active on the SAME position-control clutch teleop (`teleop_triago_clutch.py`): the handle feels the Virtual-Fixture guidance forces AND the reference is blended with the policy.
 
-- **Feedback channel (F):** `haptic_force_manager_full_tutorial.py` renders the identical superposition (`F_sync` + `F_guide` + `F_fixture`) and weights as the feedback-only VF manager (§6.1) — it is a copy of `haptic_force_manager_tutorial.py` with the startup guard flipped to `(CLUTCH, F=True, B=True)`. Because `ASSIST_BLENDING=True`, its `F_sync` now tethers the handle to the **blended** reference that `main_shared_autonomy` publishes on `/arm_*/cartesian_reference`.
+- **Feedback channel (F):** `haptic_force_manager_CFB.py` renders the identical superposition (`F_sync` + `F_guide` + `F_fixture`) and weights as the feedback-only VF manager (§6.1) — it is a copy of `haptic_force_manager_CF.py` with the startup guard flipped to `(CLUTCH, F=True, B=True)`. Because `ASSIST_BLENDING=True`, its `F_sync` now tethers the handle to the **blended** reference that `main_shared_autonomy` publishes on `/arm_*/cartesian_reference`.
 - **Blending channel (B):** `teleop_triago_clutch.py` publishes to `/arm_*/user_cartesian_reference` (integrated pose + user twist); `main_shared_autonomy` blends it with the belief-weighted policy and is the sole writer of `/arm_*/cartesian_reference`. Intent inference anchors the goal policies at the **blended reference gripper** (the pose the operator actually watches), NOT the clutch's integrated pose — the operator defines their twist relative to the blended gripper. See `triago_control` context.md §5.2 (CLUTCH control mode).
 - **Clutch = suspend:** while the clutch button is held the reference stays absolutely still (`alpha` forced to 0); releasing resumes the blend. So the "both loops" interaction (guidance force moves handle → clutch reads it as `v_user` → blended) is only live while un-clutched, and is bounded by `F_sync` + global damping + `MAX_TOTAL` caps + alignment-gated `alpha`.
 
@@ -130,7 +132,7 @@ Both output the same 13-float `Float64MultiArray` protocol: `[pos(3), rpy(3), ve
 
 ## 6. Force Feedback
 
-### 6.0 Joystick Mode spring (`haptic_force_manager_blending_tutorial.py`, `cfg.BLENDING=True`)
+### 6.0 Joystick Mode spring (`haptic_force_manager_JB.py`, `cfg.BLENDING=True`)
 
 The **only** force rendered in Joystick Mode: a spring-damper pulling the handle back to the (dynamic) home pose (§3.2), in the Haption base frame:
 
@@ -141,7 +143,7 @@ Tau   = KP_ANG·rotvec(home_rot · handle_rot⁻¹) − KD_ANG·handle_vel_ang (
 
 Clipped to `MAX_FORCE=10N` / `MAX_TORQUE=1Nm`. No `F_guide`/`F_fixture`/`F_sync`/`F_cbf`, no clutch-align, no joint-limit vibration — coupling any robot-state-derived force onto the handle is exactly what destabilized the previous design. The home pose target is subscribed from `/joystick/home_pose` (single source of truth = the joystick teleop), falling back to the config neutral until the first message.
 
-### 6.1 Virtual Fixture superposition (`haptic_force_manager_tutorial.py`, `cfg.BLENDING=False`)
+### 6.1 Virtual Fixture superposition (`haptic_force_manager_CF.py`, `cfg.BLENDING=False`)
 
 Multi-layer force superposition, summed and clipped to `MAX_FORCE=10N`/`MAX_TORQUE=1Nm`:
 
@@ -191,21 +193,21 @@ Vibration warning at `LIMIT_OUTER=0.25 rad` from a limit; maximum at `LIMIT_INNE
 | Direction | Topic | Publisher | Subscriber |
 |---|---|---|---|
 | Haption → Robot | `/arm_right/cartesian_reference` | `teleop_triago_clutch.py` | `main_qp_controller.py` |
-| Robot → Haption | `virtuose/force_cmd` | `haptic_force_manager_tutorial.py` | `virtuose_server_node` |
-| Inference → Force | `/shared_autonomy/goal_names`, `goal_probabilities`, `user_policy` | `main_shared_autonomy.py` | `haptic_force_manager_tutorial.py` |
+| Robot → Haption | `virtuose/force_cmd` | `haptic_force_manager_CF.py` | `virtuose_server_node` |
+| Inference → Force | `/shared_autonomy/goal_names`, `goal_probabilities`, `user_policy` | `main_shared_autonomy.py` | `haptic_force_manager_CF.py` |
 | Robot state | `/qp_debug/ee_real` | `main_qp_controller.py` | both teleop scripts |
-| CBF telemetry | `/collision_constraints`, `/qp_debug/lambda_cbf` | `main_qp_controller.py` | `haptic_force_manager_tutorial.py` |
+| CBF telemetry | `/collision_constraints`, `/qp_debug/lambda_cbf` | `main_qp_controller.py` | `haptic_force_manager_CF.py` |
 | Authority handover | `/shared_autonomy/grasp_active` | `main_shared_autonomy.py` | `teleop_triago_clutch.py` |
-| Virtual fixture | `/shared_autonomy/active_goal_pose` | `main_shared_autonomy.py` | `haptic_force_manager_tutorial.py` |
+| Virtual fixture | `/shared_autonomy/active_goal_pose` | `main_shared_autonomy.py` | `haptic_force_manager_CF.py` |
 
 **Joystick Mode (`cfg.BLENDING=True`) — topics that differ**
 
 | Direction | Topic | Publisher | Subscriber |
 |---|---|---|---|
 | Haption → Robot (pure user twist) | `/arm_right/user_cartesian_reference` | `teleop_triago_joystick.py` | `main_shared_autonomy.py` |
-| Joystick home pose | `/joystick/home_pose` | `teleop_triago_joystick.py` | `haptic_force_manager_blending_tutorial.py` |
+| Joystick home pose | `/joystick/home_pose` | `teleop_triago_joystick.py` | `haptic_force_manager_JB.py` |
 | Robot (blended) → QP | `/arm_right/cartesian_reference` | `main_shared_autonomy.py` (sole publisher) | `main_qp_controller.py` |
-| Robot → Haption (centering spring) | `virtuose/force_cmd` | `haptic_force_manager_blending_tutorial.py` | `virtuose_server_node` |
+| Robot → Haption (centering spring) | `virtuose/force_cmd` | `haptic_force_manager_JB.py` | `virtuose_server_node` |
 | Authority-share telemetry | `/shared_autonomy/blend_debug` | `main_shared_autonomy.py` | (optional) |
 
 The joystick teleop + blending force manager read `virtuose/pose` (handle Cartesian pose); the force manager also reads `virtuose/velocity` (spring damping). All other topics (grasp trigger, device velocity, `/qp_debug/ee_real`) are unchanged between modes.
@@ -223,17 +225,17 @@ ros2 run haption_teleoperation virtuose_server_node
 # each node hard-errors if it does not match CONTROL_MODE/ASSIST_FEEDBACK/ASSIST_BLENDING.
 #   CLUTCH, sync only        (F=0, B=0):
 ros2 run haption_teleoperation teleop_triago_clutch.py
-ros2 run haption_teleoperation haptic_force_manager_noguidance_tutorial.py
+ros2 run haption_teleoperation haptic_force_manager_C.py
 #   CLUTCH, guided feedback  (F=1, B=0) — Virtual Fixture:
 ros2 run haption_teleoperation teleop_triago_clutch.py
-ros2 run haption_teleoperation haptic_force_manager_tutorial.py
+ros2 run haption_teleoperation haptic_force_manager_CF.py
 #   CLUTCH, full guidance    (F=1, B=1) — VF forces + reference blending:
 ros2 run haption_teleoperation teleop_triago_clutch.py
-ros2 run haption_teleoperation haptic_force_manager_full_tutorial.py
+ros2 run haption_teleoperation haptic_force_manager_CFB.py
 #     (also run main_shared_autonomy.py on the robot side — it owns the blend)
 #   JOYSTICK, guided blending (F=0, B=1):
 ros2 run haption_teleoperation teleop_triago_joystick.py
-ros2 run haption_teleoperation haptic_force_manager_blending_tutorial.py
+ros2 run haption_teleoperation haptic_force_manager_JB.py
 
 ros2 run haption_teleoperation virtuose_calibration      # joint-limit discovery
 ros2 run haption_teleoperation haption_plotter.py        # debug plotting

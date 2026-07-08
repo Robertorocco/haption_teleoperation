@@ -92,14 +92,14 @@ install(FILES lib/libVirtuoseAPI.so
 # Deploys the Python executable scripts into the ROS 2 package library space
 install(PROGRAMS
   scripts/haption_plotter.py
-  scripts/haptic_force_manager_battery.py
-  scripts/haptic_force_manager_tutorial.py
-  scripts/haptic_force_manager_full_tutorial.py
-  scripts/haptic_force_manager_noguidance_tutorial.py
-  scripts/haptic_force_manager_blending_tutorial.py
-  scripts/haptic_force_manager_joystick_sync_tutorial.py
-  scripts/teleop_demo_integrator.py
-  scripts/teleop_triago.py
+  # Force managers -- suffix encodes the active study cell (see the naming
+  # convention in the READMEs / .kiro context): letters after the underscore are
+  # C=CLUTCH / J=JOYSTICK (control mode), F=ASSIST_FEEDBACK, B=ASSIST_BLENDING.
+  scripts/haptic_force_manager_C.py
+  scripts/haptic_force_manager_CF.py
+  scripts/haptic_force_manager_CFB.py
+  scripts/haptic_force_manager_J.py
+  scripts/haptic_force_manager_JB.py
   scripts/teleop_triago_clutch.py
   scripts/teleop_triago_joystick.py
   scripts/workspace_debug_visualizer.py
