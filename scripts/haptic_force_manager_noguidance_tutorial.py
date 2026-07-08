@@ -21,6 +21,11 @@ node keeps everything that is not guidance:
     never entered.)
   * clutch handling: on clutch press the wrench is frozen at 50% (cognitive
     grounding) -- but WITHOUT the tutorial's added rotational alignment guidance.
+  * joint-limit "clutch advice" vibration: IDENTICAL to the tutorial (Mode A) --
+    a one-shot 1 s / 0.07 Nm torque buzz fired when a Haption joint enters
+    LIMIT_OUTER of a limit, disarmed after firing and re-armed only by a full
+    clutch cycle. Both are clutch teleoperation methods, so the cue is shared
+    verbatim. (Replaces the earlier CBF-proximity buzz.)
   * global viscous damping, arm switching, and the 180-deg-Z Haption<->TRIAGo
     frame map are unchanged.
   * final MAX_FORCE / MAX_TORQUE device safety clip is unchanged.
@@ -96,21 +101,31 @@ class HapticForceManagerNoGuidance(Node):
         # --- Arm the force is computed for (follows /shared_autonomy/active_arm) ---
         self.active_arm = 'right'
 
-        # --- CBF-proximity vibration cue (read-only signal, NOT a guidance force) ---
-        # This baseline renders no guidance wrench, but we still surface obstacle
-        # proximity to the operator as a buzz whose amplitude ramps with the CBF
-        # shadow price lambda_cbf (right arm). lambda is lightly low-pass filtered
-        # so the buzz amplitude does not jitter. Amplitude: silent below
-        # VIB_LAMBDA_LO, linear VIB_AMP_MIN -> VIB_AMP_MAX across [LO, HI], clamped
-        # at VIB_AMP_MAX above HI.
-        self.lambda_cbf = 0.0
-        self.lambda_cbf_f = 0.0        # LPF'd lambda for a smooth amplitude
-        self.CBF_LAMBDA_ALPHA = 0.05   # LPF coefficient (low = very smooth)
-        self.VIB_LAMBDA_LO = 2.0       # lambda at which the buzz begins (amp = MIN)
-        self.VIB_LAMBDA_HI = 10.0      # lambda at which the buzz saturates (amp = MAX)
-        self.VIB_AMP_MIN = 0.05        # Nm torque amplitude at lambda = LO
-        self.VIB_AMP_MAX = 0.07        # Nm torque amplitude at lambda >= HI
-        self.vib_toggle = 1.0          # per-frame sign toggle (~75 Hz square wave)
+        # --- Articular Limit Variables (Haption joint positions + bounds) ---
+        self.joint_pos = np.zeros(6)
+        self.joint_min = np.array([-0.804283, -1.65038, 0.728283, -3.02431, -1.28196, -2.05398])
+        self.joint_max = np.array([0.781944, -0.0654231, 2.49752, 2.82038, 1.04722, 2.09453])
+
+        #  Articular Limit Vibration Tuning Parameters
+        self.LIMIT_OUTER = 0.25       # Radians where vibration starts
+        self.LIMIT_INNER = 0.15       # Radians where vibration hits maximum
+        self.AMP_MIN = 0.05           # Nm torque at the outer boundary
+        self.AMP_MAX = 0.07           # Nm torque at the inner boundary
+        self.vib_toggle = 1.0         # Toggles between 1 and -1 every frame for 75Hz square wave
+
+        # --- Joint-limit "clutch advice" one-shot burst (IDENTICAL to Mode A) ---
+        # When a joint enters LIMIT_OUTER, fire a SINGLE fixed-amplitude buzz that
+        # lasts LIMIT_VIB_DURATION and then goes silent. It will NOT fire again
+        # until the operator completes a full clutch cycle (press -> release), so
+        # the burst is unambiguously interpreted as "you should clutch now". Both
+        # this baseline and Mode A are clutch teleoperation methods, so the cue is
+        # shared verbatim.
+        self.LIMIT_VIB_DURATION = 1.0   # s   burst length
+        self.LIMIT_VIB_AMP = 0.07       # Nm  fixed torque amplitude of the burst
+        self.limit_vib_armed = True     # ready to fire (re-armed by a clutch cycle)
+        self.limit_vib_active = False   # a burst is currently playing
+        self.limit_vib_start_time = 0.0 # wall-clock start of the active burst
+        self._vib_clutch_prev = False   # previous clutch state (for cycle edge detect)
 
         # --- Data Buffers & Synchronization (live plot) ---
         self.plot_lock = threading.Lock()
@@ -139,8 +154,8 @@ class HapticForceManagerNoGuidance(Node):
         self.create_subscription(Bool, '/shared_autonomy/grasp_active', self.grasp_active_cb, 10)
         # Arm switch: follow the active arm for EE state slicing and reference topic.
         self.create_subscription(String, '/shared_autonomy/active_arm', self.active_arm_cb, 10)
-        # Read-only CBF shadow price for the proximity vibration cue (right arm).
-        self.create_subscription(Float64MultiArray, '/qp_debug/lambda_cbf', self.lambda_cb, 10)
+        # Haption joint encoders for the joint-limit clutch-advice vibration.
+        self.create_subscription(Float64MultiArray, 'virtuose/articular_position', self.joint_cb, 10)
 
         self.force_pub = self.create_publisher(Wrench, 'virtuose/force_cmd', 10)
 
@@ -264,19 +279,10 @@ class HapticForceManagerNoGuidance(Node):
             self.active_arm = msg.data
             self.get_logger().info(f"[FORCE MGR] Active arm switched to {msg.data.upper()}")
 
-    def lambda_cb(self, msg):
-        """Reads the right-arm CBF shadow price (obstacle proximity) for the buzz.
-
-        msg.data = [lambda_cbf_R, lambda_cbf_L]; this device always drives the
-        right gripper, so we take index 0. The value is clamped to >= 0 and lightly
-        low-pass filtered to keep the vibration amplitude smooth.
-        """
-        if len(msg.data) < 1:
-            return
-        lam = max(0.0, float(msg.data[0]))
-        self.lambda_cbf = lam
-        self.lambda_cbf_f = ((1.0 - self.CBF_LAMBDA_ALPHA) * self.lambda_cbf_f
-                             + self.CBF_LAMBDA_ALPHA * lam)
+    def joint_cb(self, msg):
+        """Updates the current 6-DoF joint positions directly from the Haption encoders."""
+        if len(msg.data) >= 6:
+            self.joint_pos = np.array(msg.data[0:6])
 
     def target_cb(self, msg):
         """Updates the target Cartesian pose (right arm reference)."""
@@ -345,6 +351,55 @@ class HapticForceManagerNoGuidance(Node):
 
         return F_sync
 
+    def compute_F_limit_warning(self):
+        """Joint-limit "clutch advice" vibration: a ONE-SHOT 1 s torque burst.
+
+        IDENTICAL to haptic_force_manager_tutorial.compute_F_limit_warning (Mode A):
+          * Trigger — the moment any Haption joint enters LIMIT_OUTER of a limit,
+            AND the burst is currently armed, a single fixed-amplitude
+            (LIMIT_VIB_AMP) 75 Hz square-wave buzz is started on the three torque
+            axes.
+          * Duration — the buzz always plays for its full LIMIT_VIB_DURATION
+            (1 s), even if the operator starts clutching partway through.
+          * Latch — once fired the burst is DISARMED and cannot fire again until
+            the operator completes a full clutch cycle (button press -> release).
+            The operator is meant to read the buzz as "clutch now to re-center".
+        """
+        F_vib = np.zeros(6)
+        now = time.time()
+
+        # Re-arm on a COMPLETED clutch cycle (press -> release = falling edge).
+        if self._vib_clutch_prev and not self.is_clutching:
+            self.limit_vib_armed = True
+        self._vib_clutch_prev = self.is_clutching
+
+        # Closest distance to any of the 12 joint bounds.
+        dist_to_min = self.joint_pos - self.joint_min
+        dist_to_max = self.joint_max - self.joint_pos
+        min_margin = float(np.min(np.concatenate([dist_to_min, dist_to_max])))
+
+        # Trigger a fresh one-shot burst (only if armed and not already playing).
+        if (min_margin <= self.LIMIT_OUTER
+                and self.limit_vib_armed
+                and not self.limit_vib_active):
+            self.limit_vib_active = True
+            self.limit_vib_start_time = now
+            self.limit_vib_armed = False   # stay silent until the next clutch cycle
+
+        # Emit the burst for its fixed duration, then stop (let it finish even if
+        # the user is already clutching).
+        if self.limit_vib_active:
+            if (now - self.limit_vib_start_time) <= self.LIMIT_VIB_DURATION:
+                self.vib_toggle *= -1.0
+                amp = self.LIMIT_VIB_AMP
+                F_vib[3] = amp * self.vib_toggle
+                F_vib[4] = amp * self.vib_toggle
+                F_vib[5] = amp * self.vib_toggle
+            else:
+                self.limit_vib_active = False
+
+        return F_vib
+
     # =========================
     # MAIN LOOP
     # =========================
@@ -385,19 +440,12 @@ class HapticForceManagerNoGuidance(Node):
         f_total[0:3] -= self.Kd_global_lin * self.vel_haption[0:3]
         f_total[3:6] -= self.Kd_global_ang * self.vel_haption[3:6]
 
-        # CBF-proximity vibration cue (injected last so it rides on top of the
-        # possibly clutch-frozen wrench and toggles every frame). Amplitude ramps
-        # 0.05 -> 0.07 Nm as the filtered lambda grows from LO to HI; silent below.
-        if self.lambda_cbf_f > self.VIB_LAMBDA_LO:
-            ratio = float(np.clip(
-                (self.lambda_cbf_f - self.VIB_LAMBDA_LO)
-                / (self.VIB_LAMBDA_HI - self.VIB_LAMBDA_LO), 0.0, 1.0))
-            amp = self.VIB_AMP_MIN + ratio * (self.VIB_AMP_MAX - self.VIB_AMP_MIN)
-            self.vib_toggle *= -1.0
-            buzz = amp * self.vib_toggle
-            f_total[3] += buzz
-            f_total[4] += buzz
-            f_total[5] += buzz
+        # Joint-limit "clutch advice" vibration (IDENTICAL to Mode A): a ONE-SHOT
+        # 1 s burst fired when a Haption joint nears a limit, re-armed only by a
+        # full clutch cycle. Injected last so it rides on top of the possibly
+        # clutch-frozen wrench and toggles every frame.
+        f_vib = self.compute_F_limit_warning()
+        f_total[3:6] += f_vib[3:6]
 
         # Device safety clip.
         f_total[0:3] = np.clip(f_total[0:3], -self.MAX_FORCE, self.MAX_FORCE)
