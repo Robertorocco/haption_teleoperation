@@ -174,6 +174,18 @@ class HapticForceManager(Node):
         self.AMP_MAX = 0.07           # Nm torque at the inner boundary
         self.vib_toggle = 1.0         # Toggles between 1 and -1 every frame for 75Hz square wave
 
+        # --- Joint-limit "clutch advice" one-shot burst ---
+        # When a joint enters LIMIT_OUTER, fire a SINGLE fixed-amplitude buzz that
+        # lasts LIMIT_VIB_DURATION and then goes silent. It will NOT fire again
+        # until the operator completes a full clutch cycle (press -> release), so
+        # the burst is unambiguously interpreted as "you should clutch now".
+        self.LIMIT_VIB_DURATION = 0.5   # s   burst length
+        self.LIMIT_VIB_AMP = 0.07       # Nm  fixed torque amplitude of the burst
+        self.limit_vib_armed = True     # ready to fire (re-armed by a clutch cycle)
+        self.limit_vib_active = False   # a burst is currently playing
+        self.limit_vib_start_time = 0.0 # wall-clock start of the active burst
+        self._vib_clutch_prev = False   # previous clutch state (for cycle edge detect)
+
         # --- Tunable Force Parameters ---
         self.Kp_sync = 10.0#15.0  
         self.Kd_sync = 0.0  #if global damping is added, set this to 0 to avoid overdamping
@@ -830,31 +842,53 @@ class HapticForceManager(Node):
         return self.f_fix_filtered.copy()
 
     def compute_F_limit_warning(self):
-        """Joint-limit vibration warning — DISABLED for now (returns zero wrench).
+        """Joint-limit "clutch advice" vibration: a ONE-SHOT 0.5 s torque burst.
 
-        The 75 Hz square-wave rumble is commented out pending a redesign of the
-        vibration pattern. Kept as a no-op so the force-superposition pipeline and
-        the 'Limit' plot trace stay structurally intact.
+        Behaviour (replaces the old continuous ramp):
+          * Trigger — the moment any Haption joint enters LIMIT_OUTER of a limit,
+            AND the burst is currently armed, a single fixed-amplitude
+            (LIMIT_VIB_AMP) 75 Hz square-wave buzz is started on the three torque
+            axes.
+          * Duration — the buzz always plays for its full LIMIT_VIB_DURATION
+            (0.5 s), even if the operator starts clutching partway through.
+          * Latch — once fired the burst is DISARMED and cannot fire again until
+            the operator completes a full clutch cycle (button press -> release).
+            The operator is meant to read the buzz as "clutch now to re-center".
         """
         F_vib = np.zeros(6)
-        return F_vib
+        now = time.time()
 
-        # --- VIBRATION SIGNAL (commented out) ---
-        # dist_to_min = self.joint_pos - self.joint_min
-        # dist_to_max = self.joint_max - self.joint_pos
-        # min_margin = np.min(np.concatenate([dist_to_min, dist_to_max]))
-        #
-        # if min_margin <= self.LIMIT_OUTER:
-        #     if min_margin <= self.LIMIT_INNER:
-        #         amplitude = self.AMP_MAX
-        #     else:
-        #         ratio = (self.LIMIT_OUTER - min_margin) / (self.LIMIT_OUTER - self.LIMIT_INNER)
-        #         amplitude = self.AMP_MIN + ratio * (self.AMP_MAX - self.AMP_MIN)
-        #     self.vib_toggle *= -1.0
-        #     F_vib[3] = amplitude * self.vib_toggle
-        #     F_vib[4] = amplitude * self.vib_toggle
-        #     F_vib[5] = amplitude * self.vib_toggle
-        # return F_vib
+        # Re-arm on a COMPLETED clutch cycle (press -> release = falling edge).
+        if self._vib_clutch_prev and not self.is_clutching:
+            self.limit_vib_armed = True
+        self._vib_clutch_prev = self.is_clutching
+
+        # Closest distance to any of the 12 joint bounds.
+        dist_to_min = self.joint_pos - self.joint_min
+        dist_to_max = self.joint_max - self.joint_pos
+        min_margin = float(np.min(np.concatenate([dist_to_min, dist_to_max])))
+
+        # Trigger a fresh one-shot burst (only if armed and not already playing).
+        if (min_margin <= self.LIMIT_OUTER
+                and self.limit_vib_armed
+                and not self.limit_vib_active):
+            self.limit_vib_active = True
+            self.limit_vib_start_time = now
+            self.limit_vib_armed = False   # stay silent until the next clutch cycle
+
+        # Emit the burst for its fixed duration, then stop (let it finish even if
+        # the user is already clutching).
+        if self.limit_vib_active:
+            if (now - self.limit_vib_start_time) <= self.LIMIT_VIB_DURATION:
+                self.vib_toggle *= -1.0
+                amp = self.LIMIT_VIB_AMP
+                F_vib[3] = amp * self.vib_toggle
+                F_vib[4] = amp * self.vib_toggle
+                F_vib[5] = amp * self.vib_toggle
+            else:
+                self.limit_vib_active = False
+
+        return F_vib
 
     # =========================
     # MAIN LOOP
@@ -924,8 +958,11 @@ class HapticForceManager(Node):
             f_guide_s = guide_gain * f_guide
             f_fix_s = guide_gain * f_fix
 
-            # Calculate the normal running force (F_sync + guidance; F_cbf excluded)
-            f_total_normal = f_sync + f_cbf_s + f_guide_s + f_fix_s + f_vib
+            # Calculate the normal running force (F_sync + guidance; F_cbf excluded).
+            # NOTE: f_vib is intentionally NOT summed here — the one-shot limit
+            # burst is injected AFTER the clutch/grasp branching (see below) so it
+            # is felt live and never captured/frozen by the clutch snapshot.
+            f_total_normal = f_sync + f_cbf_s + f_guide_s + f_fix_s
 
             # --- AUTHORITY CAP --------------------------------------------- #
             # Bound the MAGNITUDE only when it is exceeded (does NOT force a fixed
@@ -999,6 +1036,13 @@ class HapticForceManager(Node):
             
             f_total[0:3] -= Kd_global_lin * self.vel_haption[0:3]
             f_total[3:6] -= Kd_global_ang * self.vel_haption[3:6]
+
+        # ========================================================
+        # JOINT-LIMIT "CLUTCH ADVICE" VIBRATION (injected last, on top of
+        # whatever wrench the branch produced — normal, clutch-frozen or grasp —
+        # so the one-shot burst is always felt live and toggles every frame).
+        # ========================================================
+        f_total[3:6] += f_vib[3:6]
 
         # ========================================================
         # CLIPPING & PUBLISHING

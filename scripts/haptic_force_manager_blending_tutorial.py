@@ -71,6 +71,15 @@ class HapticForceManagerBlending(Node):
         self.MAX_FORCE = 10.0
         self.MAX_TORQUE = 1.0
 
+        # --- Out-of-deadzone vibration cue ---
+        # A constant, low-amplitude buzz on the three torque axes rendered the
+        # WHOLE time the handle sits outside the joystick deadband (i.e. exactly
+        # while the teleop is commanding a non-zero twist). It tells the operator
+        # "you are actively driving". Zero-mean + high-frequency, so it does not
+        # bias the displacement the teleop reads back.
+        self.VIB_AMP = 0.05           # Nm  constant torque amplitude while outside the deadband
+        self.vib_toggle = 1.0         # per-frame sign toggle (~75 Hz square wave)
+
         # --- Subscribers ---
         # NOTE: virtuose_server_node publishes virtuose/pose as geometry_msgs/Pose
         # (NOT PoseStamped) -- subscribing with the wrong type silently receives
@@ -143,6 +152,22 @@ class HapticForceManagerBlending(Node):
 
     def control_loop(self):
         f = self.compute_spring()
+
+        # --- Out-of-deadzone vibration cue ---
+        # Buzz whenever the handle displacement from home exceeds EITHER the
+        # linear OR the angular deadband (matches the teleop's radial deadband on
+        # each channel, so the buzz starts exactly when a non-zero twist is sent).
+        if self.handle_pos is not None and self.handle_rot is not None:
+            lin_disp = float(np.linalg.norm(self.home_pos - self.handle_pos))
+            ang_disp = float(np.linalg.norm((self.home_rot * self.handle_rot.inv()).as_rotvec()))
+            if (lin_disp > cfg.JOYSTICK_DEADBAND_LIN
+                    or ang_disp > cfg.JOYSTICK_DEADBAND_ANG):
+                self.vib_toggle *= -1.0
+                buzz = self.VIB_AMP * self.vib_toggle
+                f[3] += buzz
+                f[4] += buzz
+                f[5] += buzz
+
         f[0:3] = np.clip(f[0:3], -self.MAX_FORCE, self.MAX_FORCE)
         f[3:6] = np.clip(f[3:6], -self.MAX_TORQUE, self.MAX_TORQUE)
 

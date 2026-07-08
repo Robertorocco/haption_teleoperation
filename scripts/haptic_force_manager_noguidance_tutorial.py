@@ -96,6 +96,22 @@ class HapticForceManagerNoGuidance(Node):
         # --- Arm the force is computed for (follows /shared_autonomy/active_arm) ---
         self.active_arm = 'right'
 
+        # --- CBF-proximity vibration cue (read-only signal, NOT a guidance force) ---
+        # This baseline renders no guidance wrench, but we still surface obstacle
+        # proximity to the operator as a buzz whose amplitude ramps with the CBF
+        # shadow price lambda_cbf (right arm). lambda is lightly low-pass filtered
+        # so the buzz amplitude does not jitter. Amplitude: silent below
+        # VIB_LAMBDA_LO, linear VIB_AMP_MIN -> VIB_AMP_MAX across [LO, HI], clamped
+        # at VIB_AMP_MAX above HI.
+        self.lambda_cbf = 0.0
+        self.lambda_cbf_f = 0.0        # LPF'd lambda for a smooth amplitude
+        self.CBF_LAMBDA_ALPHA = 0.05   # LPF coefficient (low = very smooth)
+        self.VIB_LAMBDA_LO = 2.0       # lambda at which the buzz begins (amp = MIN)
+        self.VIB_LAMBDA_HI = 10.0      # lambda at which the buzz saturates (amp = MAX)
+        self.VIB_AMP_MIN = 0.05        # Nm torque amplitude at lambda = LO
+        self.VIB_AMP_MAX = 0.07        # Nm torque amplitude at lambda >= HI
+        self.vib_toggle = 1.0          # per-frame sign toggle (~75 Hz square wave)
+
         # --- Data Buffers & Synchronization (live plot) ---
         self.plot_lock = threading.Lock()
         self.plot_window_sec = 10.0
@@ -123,6 +139,8 @@ class HapticForceManagerNoGuidance(Node):
         self.create_subscription(Bool, '/shared_autonomy/grasp_active', self.grasp_active_cb, 10)
         # Arm switch: follow the active arm for EE state slicing and reference topic.
         self.create_subscription(String, '/shared_autonomy/active_arm', self.active_arm_cb, 10)
+        # Read-only CBF shadow price for the proximity vibration cue (right arm).
+        self.create_subscription(Float64MultiArray, '/qp_debug/lambda_cbf', self.lambda_cb, 10)
 
         self.force_pub = self.create_publisher(Wrench, 'virtuose/force_cmd', 10)
 
@@ -246,6 +264,20 @@ class HapticForceManagerNoGuidance(Node):
             self.active_arm = msg.data
             self.get_logger().info(f"[FORCE MGR] Active arm switched to {msg.data.upper()}")
 
+    def lambda_cb(self, msg):
+        """Reads the right-arm CBF shadow price (obstacle proximity) for the buzz.
+
+        msg.data = [lambda_cbf_R, lambda_cbf_L]; this device always drives the
+        right gripper, so we take index 0. The value is clamped to >= 0 and lightly
+        low-pass filtered to keep the vibration amplitude smooth.
+        """
+        if len(msg.data) < 1:
+            return
+        lam = max(0.0, float(msg.data[0]))
+        self.lambda_cbf = lam
+        self.lambda_cbf_f = ((1.0 - self.CBF_LAMBDA_ALPHA) * self.lambda_cbf_f
+                             + self.CBF_LAMBDA_ALPHA * lam)
+
     def target_cb(self, msg):
         """Updates the target Cartesian pose (right arm reference)."""
         if self.active_arm != 'right':
@@ -352,6 +384,20 @@ class HapticForceManagerNoGuidance(Node):
         # Global viscous damping (impedance-device stability), same as the tutorial.
         f_total[0:3] -= self.Kd_global_lin * self.vel_haption[0:3]
         f_total[3:6] -= self.Kd_global_ang * self.vel_haption[3:6]
+
+        # CBF-proximity vibration cue (injected last so it rides on top of the
+        # possibly clutch-frozen wrench and toggles every frame). Amplitude ramps
+        # 0.05 -> 0.07 Nm as the filtered lambda grows from LO to HI; silent below.
+        if self.lambda_cbf_f > self.VIB_LAMBDA_LO:
+            ratio = float(np.clip(
+                (self.lambda_cbf_f - self.VIB_LAMBDA_LO)
+                / (self.VIB_LAMBDA_HI - self.VIB_LAMBDA_LO), 0.0, 1.0))
+            amp = self.VIB_AMP_MIN + ratio * (self.VIB_AMP_MAX - self.VIB_AMP_MIN)
+            self.vib_toggle *= -1.0
+            buzz = amp * self.vib_toggle
+            f_total[3] += buzz
+            f_total[4] += buzz
+            f_total[5] += buzz
 
         # Device safety clip.
         f_total[0:3] = np.clip(f_total[0:3], -self.MAX_FORCE, self.MAX_FORCE)
