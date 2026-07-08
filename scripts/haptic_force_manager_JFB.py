@@ -25,8 +25,12 @@ Design of the F_guide / F_home overlap (this is the whole point of JFB):
       operator feels a "preferred direction": they clear the deadband easily going
       WITH the guidance, and to oppose it they must overcome spring + guidance.
     * gain = 0 (unsure, or far): pure joystick, no bias.
-  The velocity-field form keeps CFB's good properties -- self-damped by -handle_vel
-  (no runaway) and it vanishes at the goal (pi_blend -> 0) so the approach settles.
+  NOTE: unlike CFB, F_guide here is FEED-FORWARD (built from v_field only, no
+  -handle_vel term). CFB's velocity-field self-damping is a virtual damper whose
+  coefficient, at the value needed to reach the exit force on this device, exceeds
+  the 150 Hz impedance-device passivity limit and excites a hard high-frequency
+  limit cycle. The feed-forward force still vanishes at the goal (v_field -> 0);
+  handle damping is provided by the centering spring's KD + device friction.
 
 Final wrench (Haption base frame): F_home + F_guide, clipped to +/- MAX_FORCE /
 MAX_TORQUE, published on virtuose/force_cmd.
@@ -98,12 +102,13 @@ class HapticForceManagerJFB(Node):
         self.GUIDE_K = 1.1
         self.MAX_GUIDE_FORCE  = self.GUIDE_K * self.KP_LIN * cfg.JOYSTICK_DEADBAND_LIN   # ~5.70 N
         self.MAX_GUIDE_TORQUE = self.GUIDE_K * self.KP_ANG * cfg.JOYSTICK_DEADBAND_ANG   # ~0.43 Nm
-        # Velocity-field tracking gains. Set HIGH (vs CFB's 33.6/0.54) on purpose:
-        # the policy twist is small (~cm/s), so a large gain makes the tanh reach
-        # the (exit-force) saturation for any meaningful policy speed, fading only
-        # in the final approach where pi_blend -> 0. Still self-damped by -handle_vel.
-        self.D_guide_lin = 400.0   # Ns/m
-        self.D_guide_ang = 30.0    # Nms/rad
+        # FEED-FORWARD magnitude-shaping gains (policy speed -> force), NOT velocity
+        # feedback: F_guide is built from v_field ONLY (no -handle_vel term), so
+        # these are not virtual dampers and don't threaten device passivity. Set
+        # HIGH so the tanh reaches the (exit-force) saturation for any meaningful
+        # policy speed (~cm/s), fading only in the final approach where v_field->0.
+        self.D_guide_lin = 400.0   # N per (m/s) of policy speed (feed-forward shaping)
+        self.D_guide_ang = 30.0    # Nm per (rad/s) of policy speed (feed-forward shaping)
         self.alpha_guide = 0.15    # LPF on the guidance wrench (C0 continuity)
         self.f_guide_filtered = np.zeros(6)
         # gain = confidence(b_max) x proximity(ref->goal):
@@ -228,13 +233,17 @@ class HapticForceManagerJFB(Node):
         """Velocity-field guidance (copied from CFB.compute_F_guide), retuned to
         overlap the home spring.
 
-        Structure (unchanged from CFB):
+        Structure:
           1. pi_blend = Sum_k P(k) * pi_k          (belief-weighted policy twist)
           2. v_field  = map_180Z(pi_blend)         (robot -> Haption frame)
-          3. velocity-field force F = D * (v_field - handle_vel), self-damped,
-             tanh-saturated, LPF'd.
+          3. FEED-FORWARD force F = MAX * tanh(D * v_field / MAX) (direction from
+             the policy field, magnitude saturated at the exit force), tanh-sat, LPF'd.
 
         Retuned vs CFB (per the JFB plan):
+          * FEED-FORWARD (v_field only, NO -handle_vel term): CFB's velocity-field
+            self-damping is a virtual damper too strong for the 150 Hz device
+            passivity limit and caused a hard limit cycle -- removed here (handle
+            damping comes from the spring's KD + device friction);
           * saturation MAX_GUIDE_{FORCE,TORQUE} = deadzone-exit force (not free gains);
           * gain applied AFTER the tanh (linear 'fraction of the exit force'), so
             gain=1 exits the deadband and gain<1 only biases inside it;
@@ -279,13 +288,19 @@ class HapticForceManagerJFB(Node):
             -pi_blend[3], -pi_blend[4],  pi_blend[5],
         ])
 
-        # Velocity-field tracking force, self-damped by -handle_vel. Saturate to the
-        # deadzone-exit force FIRST (fixes direction + magnitude cap), THEN scale by
-        # gain, so gain maps LINEARLY onto "fraction of the exit force".
-        dv = v_field - self.handle_vel
+        # FEED-FORWARD guidance (NOT the CFB velocity field): shape the magnitude
+        # from the (smooth, LPF'd) policy field v_field ONLY -- do NOT feed the
+        # handle velocity back. CFB's `-D*handle_vel` term is a VIRTUAL DAMPER of
+        # coefficient D; at the D needed here to reach the exit force (~400 Ns/m)
+        # it is ~100x above what a 150 Hz impedance device can render passively,
+        # which excited a hard high-frequency limit cycle. Dropping it makes
+        # F_guide a smooth goal-directed force that merely shifts the centering
+        # spring's equilibrium (stable); the handle is damped by the spring's own
+        # KD + device friction (exactly like the JB manager). Direction from
+        # v_field, magnitude saturated at the exit force, then linearly gain-scaled.
         F_dir = np.zeros(6)
-        F_dir[0:3] = self.MAX_GUIDE_FORCE * np.tanh(self.D_guide_lin * dv[0:3] / self.MAX_GUIDE_FORCE)
-        F_dir[3:6] = self.MAX_GUIDE_TORQUE * np.tanh(self.D_guide_ang * dv[3:6] / self.MAX_GUIDE_TORQUE)
+        F_dir[0:3] = self.MAX_GUIDE_FORCE * np.tanh(self.D_guide_lin * v_field[0:3] / self.MAX_GUIDE_FORCE)
+        F_dir[3:6] = self.MAX_GUIDE_TORQUE * np.tanh(self.D_guide_ang * v_field[3:6] / self.MAX_GUIDE_TORQUE)
         F_guide_raw = gain * F_dir
 
         # Temporal smoothing (LPF)
