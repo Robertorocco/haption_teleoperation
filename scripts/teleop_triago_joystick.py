@@ -36,11 +36,19 @@ Ownership: this node is the single source of truth for the live home pose and
 publishes it on cfg.JOYSTICK_HOME_POSE_TOPIC so the force manager renders its
 spring toward the exact same target (no drift between the two nodes).
 
-Outputs (BLENDING=True): the pure user twist on /arm_*/user_cartesian_reference
-(13-float protocol [pos(3), rpy(3), vel_lin(3), vel_ang(3), task_dim]); the pose
-slots carry the live EE pose so downstream current_T_user == current_T_EE. In
-BLENDING=False this node is not the intended teleop (teleop_triago_clutch.py is);
-it still routes to /arm_*/cartesian_reference and warns.
+This node serves BOTH JOYSTICK study cells; ASSIST_BLENDING only switches its
+output topic:
+  - ASSIST_BLENDING=True  (guided blending): publishes the pure user twist on
+    /arm_*/user_cartesian_reference (13-float protocol [pos(3), rpy(3),
+    vel_lin(3), vel_ang(3), task_dim]; the pose slots carry the live EE pose so
+    downstream current_T_user == current_T_EE). main_shared_autonomy then blends
+    it with the policy and is the sole writer of /arm_*/cartesian_reference.
+  - ASSIST_BLENDING=False (sync-only baseline): publishes the pure user twist
+    DIRECTLY on /arm_*/cartesian_reference (main_shared_autonomy does not blend,
+    so the robot follows the raw joystick command). This is the intended,
+    correct routing for that cell -- not a fallback.
+A cfg.validate_condition(control_mode=JOYSTICK) guard at startup rejects a
+CLUTCH-mode launch.
 """
 
 import rclpy
@@ -65,6 +73,12 @@ _FRAME_FLIP = np.array([-1.0, -1.0, 1.0])
 class TeleopJoystick(Node):
     def __init__(self):
         super().__init__('teleop_joystick')
+
+        # Fail loudly if launched under the wrong study condition. This joystick
+        # teleop is the velocity-control input for BOTH JOYSTICK conditions
+        # (sync-only and guided-blending), so it only constrains the control mode;
+        # ASSIST_BLENDING merely switches its output topic (see the routing below).
+        cfg.validate_condition('teleop_triago_joystick', control_mode=cfg.JOYSTICK)
 
         # --- Home pose (Haption base frame) ---
         self.home_pos = np.array(cfg.JOYSTICK_NEUTRAL_POSITION_M, dtype=float)
@@ -126,10 +140,9 @@ class TeleopJoystick(Node):
 
         self.timer = self.create_timer(self.dt, self.control_loop)
 
-        if not cfg.BLENDING:
-            self.get_logger().warn(
-                "[JOYSTICK] cfg.BLENDING=False -- this joystick node is intended for "
-                "BLENDING mode. Publishing directly to /arm_*/cartesian_reference.")
+        self.get_logger().info(
+            f"[JOYSTICK] CONTROL_MODE={cfg.CONTROL_MODE}, ASSIST_BLENDING={cfg.ASSIST_BLENDING} "
+            f"-> publishing user twist on '{_topic_right}' (right) / '{_topic_left}' (left).")
         self.get_logger().info(
             f"[JOYSTICK] Joystick Mode teleop started. Home position (Haption) "
             f"= {self.home_pos.tolist()}; deadband = "
