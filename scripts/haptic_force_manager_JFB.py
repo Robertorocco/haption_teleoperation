@@ -160,6 +160,8 @@ class HapticForceManagerJFB(Node):
         self.t_data = deque(maxlen=self.buffer_size)
         self.fh_data = [deque(maxlen=self.buffer_size) for _ in range(6)]  # home wrench
         self.fg_data = [deque(maxlen=self.buffer_size) for _ in range(6)]  # guide wrench
+        self.pos_err_data = deque(maxlen=self.buffer_size)  # ||home_pos - handle_pos|| (deadzone plot)
+        self.ang_err_data = deque(maxlen=self.buffer_size)  # geodesic home<->handle    (deadzone plot)
 
         self.dt = 1.0 / 150.0
         self.timer = self.create_timer(self.dt, self.control_loop)
@@ -354,63 +356,60 @@ class HapticForceManagerJFB(Node):
         self.force_pub.publish(msg)
 
         t = time.time() - self.start_time
+        pos_err = (float(np.linalg.norm(self.home_pos - self.handle_pos))
+                   if self.handle_pos is not None else 0.0)
+        ang_err = (float(np.linalg.norm((self.home_rot * self.handle_rot.inv()).as_rotvec()))
+                   if self.handle_rot is not None else 0.0)
         with self.plot_lock:
             self.t_data.append(t)
             for i in range(6):
                 self.fh_data[i].append(f_home[i])
                 self.fg_data[i].append(f_guide[i])
+            self.pos_err_data.append(pos_err)
+            self.ang_err_data.append(ang_err)
 
     # ------------------------------------------------------------------ plotting
     def setup_plot(self):
         plt.ion()
-        self.fig, self.axs = plt.subplots(2, 2, figsize=(13, 8))
-        self.fig.canvas.manager.set_window_title('JFB: Home spring vs Guidance (balance)')
         colors = ['r', 'g', 'b']
         labels = ['X', 'Y', 'Z']
 
-        # [0,0] FORCE norms + reference thresholds.
-        ax = self.axs[0, 0]
-        ax.set_title('FORCE norm (N): home vs guide vs total', fontsize=10, fontweight='bold')
-        ax.set_ylabel('N'); ax.grid(True, linestyle='--', alpha=0.6)
-        self.l_fn_home,  = ax.plot([], [], color='#1f77b4', linewidth=1.4, label='|F_home|')
-        self.l_fn_guide, = ax.plot([], [], color='#2ca02c', linewidth=1.4, label='|F_guide|')
-        self.l_fn_total, = ax.plot([], [], color='k', linewidth=1.0, label='|F_total|')
-        ax.axhline(self.KP_LIN * cfg.JOYSTICK_DEADBAND_LIN, color='r', linestyle=':',
-                   linewidth=1.0, alpha=0.8, label='deadzone-exit force')
-        ax.axhline(self.MAX_GUIDE_FORCE, color='g', linestyle=':', linewidth=1.0,
-                   alpha=0.5, label='guide sat')
-        ax.legend(loc='upper left', fontsize=7, ncol=2)
+        # --- Window 1: DEADZONE condition (same clarity as the JB manager) ------
+        self.fig_dz, self.ax_dz = plt.subplots(1, 1, figsize=(10, 4))
+        self.fig_dz.canvas.manager.set_window_title('JFB: Handle displacement from home (deadzone)')
+        ax = self.ax_dz
+        ax.set_title('Displacement from home vs deadband', fontsize=10, fontweight='bold')
+        ax.set_ylabel('m  /  rad'); ax.set_xlabel('Time (s)')
+        ax.grid(True, linestyle='--', alpha=0.6)
+        ax.axhline(cfg.JOYSTICK_DEADBAND_LIN, color='r', linestyle=':', linewidth=1.2,
+                   alpha=0.8, label=f'lin deadband = {cfg.JOYSTICK_DEADBAND_LIN} m')
+        ax.axhline(cfg.JOYSTICK_DEADBAND_ANG, color='b', linestyle=':', linewidth=1.2,
+                   alpha=0.8, label=f'ang deadband = {cfg.JOYSTICK_DEADBAND_ANG:.3f} rad')
+        self.line_pos_err, = ax.plot([], [], color='#e67e22', linewidth=1.6, label='||pos - home|| (m)')
+        self.line_ang_err, = ax.plot([], [], color='#9b59b6', linewidth=1.6, label='ang gap (rad)')
+        ax.legend(loc='upper left', fontsize=8, ncol=2)
+        self.fig_dz.tight_layout()
 
-        # [0,1] TORQUE norms + reference thresholds.
-        ax = self.axs[0, 1]
-        ax.set_title('TORQUE norm (Nm): home vs guide vs total', fontsize=10, fontweight='bold')
-        ax.set_ylabel('Nm'); ax.grid(True, linestyle='--', alpha=0.6)
-        self.l_tn_home,  = ax.plot([], [], color='#1f77b4', linewidth=1.4, label='|T_home|')
-        self.l_tn_guide, = ax.plot([], [], color='#2ca02c', linewidth=1.4, label='|T_guide|')
-        self.l_tn_total, = ax.plot([], [], color='k', linewidth=1.0, label='|T_total|')
-        ax.axhline(self.KP_ANG * cfg.JOYSTICK_DEADBAND_ANG, color='r', linestyle=':',
-                   linewidth=1.0, alpha=0.8, label='deadzone-exit torque')
-        ax.axhline(self.MAX_GUIDE_TORQUE, color='g', linestyle=':', linewidth=1.0,
-                   alpha=0.5, label='guide sat')
-        ax.legend(loc='upper left', fontsize=7, ncol=2)
+        # --- Window 2: GUIDANCE SHARE of the wrench (home share = 100% - this) --
+        # Per-axis fraction of |wrench| contributed by F_guide vs F_home. 3 lines
+        # per subplot (X/Y/Z). The home share is exactly 100% minus each line.
+        self.fig_sh, self.axs_sh = plt.subplots(2, 1, figsize=(10, 7))
+        self.fig_sh.canvas.manager.set_window_title('JFB: Guidance share of the wrench')
+        ax = self.axs_sh[0]
+        ax.set_title('Guidance FORCE share per axis (%)  [home = 100% - this]', fontsize=10, fontweight='bold')
+        ax.set_ylabel('% of |F| on axis'); ax.set_ylim(0, 100); ax.grid(True, linestyle='--', alpha=0.6)
+        ax.axhline(50, color='k', linestyle=':', linewidth=0.8, alpha=0.5)
+        self.l_shF = [ax.plot([], [], color=colors[i], linewidth=1.6, label=f'guide F{labels[i]}')[0] for i in range(3)]
+        ax.legend(loc='upper left', fontsize=8, ncol=3)
+        ax = self.axs_sh[1]
+        ax.set_title('Guidance TORQUE share per axis (%)  [home = 100% - this]', fontsize=10, fontweight='bold')
+        ax.set_ylabel('% of |T| on axis'); ax.set_xlabel('Time (s)'); ax.set_ylim(0, 100)
+        ax.grid(True, linestyle='--', alpha=0.6)
+        ax.axhline(50, color='k', linestyle=':', linewidth=0.8, alpha=0.5)
+        self.l_shT = [ax.plot([], [], color=colors[i], linewidth=1.6, label=f'guide T{labels[i]}')[0] for i in range(3)]
+        ax.legend(loc='upper left', fontsize=8, ncol=3)
+        self.fig_sh.tight_layout()
 
-        # [1,0] FORCE components: home (solid) vs guide (dashed), per axis.
-        ax = self.axs[1, 0]
-        ax.set_title('FORCE components (N): home solid, guide dashed', fontsize=10, fontweight='bold')
-        ax.set_ylabel('N'); ax.set_xlabel('Time (s)'); ax.grid(True, linestyle='--', alpha=0.6)
-        self.l_fh = [ax.plot([], [], color=colors[i], linestyle='-', label=f'home F{labels[i]}')[0] for i in range(3)]
-        self.l_fg = [ax.plot([], [], color=colors[i], linestyle='--', label=f'guide F{labels[i]}')[0] for i in range(3)]
-        ax.legend(loc='upper left', fontsize=6, ncol=3)
-
-        # [1,1] TORQUE components: home (solid) vs guide (dashed), per axis.
-        ax = self.axs[1, 1]
-        ax.set_title('TORQUE components (Nm): home solid, guide dashed', fontsize=10, fontweight='bold')
-        ax.set_ylabel('Nm'); ax.set_xlabel('Time (s)'); ax.grid(True, linestyle='--', alpha=0.6)
-        self.l_th = [ax.plot([], [], color=colors[i], linestyle='-', label=f'home T{labels[i]}')[0] for i in range(3)]
-        self.l_tg = [ax.plot([], [], color=colors[i], linestyle='--', label=f'guide T{labels[i]}')[0] for i in range(3)]
-        ax.legend(loc='upper left', fontsize=6, ncol=3)
-
-        self.fig.tight_layout()
         plt.show(block=False)
 
     def update_plot(self):
@@ -420,41 +419,39 @@ class HapticForceManagerJFB(Node):
             t = list(self.t_data)
             fh = [list(self.fh_data[i]) for i in range(6)]
             fg = [list(self.fg_data[i]) for i in range(6)]
+            pos_err = list(self.pos_err_data)
+            ang_err = list(self.ang_err_data)
 
-        n = min([len(t)] + [len(x) for x in fh] + [len(x) for x in fg])
+        n = min([len(t)] + [len(x) for x in fh] + [len(x) for x in fg]
+                + [len(pos_err), len(ang_err)])
         if n == 0:
             return
         t = t[:n]
-        fh_a = np.array([x[:n] for x in fh])   # (6, n): home wrench
-        fg_a = np.array([x[:n] for x in fg])   # (6, n): guide wrench
-        ft_a = fh_a + fg_a
-
-        fn_home = np.linalg.norm(fh_a[0:3], axis=0)
-        fn_guide = np.linalg.norm(fg_a[0:3], axis=0)
-        fn_total = np.linalg.norm(ft_a[0:3], axis=0)
-        tn_home = np.linalg.norm(fh_a[3:6], axis=0)
-        tn_guide = np.linalg.norm(fg_a[3:6], axis=0)
-        tn_total = np.linalg.norm(ft_a[3:6], axis=0)
+        fh_a = np.abs(np.array([x[:n] for x in fh]))   # (6, n): |home wrench|
+        fg_a = np.abs(np.array([x[:n] for x in fg]))   # (6, n): |guide wrench|
+        denom = fh_a + fg_a
+        # Guidance share per axis (%): |F_guide| / (|F_guide| + |F_home|).
+        share = np.where(denom > 1e-9, 100.0 * fg_a / denom, 0.0)   # (6, n)
 
         win = (t[-1] - self.plot_window_sec, t[-1])
-        self.l_fn_home.set_data(t, fn_home)
-        self.l_fn_guide.set_data(t, fn_guide)
-        self.l_fn_total.set_data(t, fn_total)
-        self.l_tn_home.set_data(t, tn_home)
-        self.l_tn_guide.set_data(t, tn_guide)
-        self.l_tn_total.set_data(t, tn_total)
-        for i in range(3):
-            self.l_fh[i].set_data(t, fh_a[i])
-            self.l_fg[i].set_data(t, fg_a[i])
-            self.l_th[i].set_data(t, fh_a[i + 3])
-            self.l_tg[i].set_data(t, fg_a[i + 3])
 
-        for ax in self.axs.flat:
+        # Deadzone window.
+        self.line_pos_err.set_data(t, pos_err[:n])
+        self.line_ang_err.set_data(t, ang_err[:n])
+        self.ax_dz.set_xlim(*win)
+        self.ax_dz.relim()
+        self.ax_dz.autoscale_view(scalex=False, scaley=True)
+
+        # Share windows (force = axes 0..2, torque = axes 3..5).
+        for i in range(3):
+            self.l_shF[i].set_data(t, share[i])
+            self.l_shT[i].set_data(t, share[i + 3])
+        for ax in self.axs_sh:
             ax.set_xlim(*win)
-            ax.relim()
-            ax.autoscale_view(scalex=False, scaley=True)
-        self.fig.canvas.draw_idle()
-        self.fig.canvas.flush_events()
+
+        self.fig_dz.canvas.draw_idle()
+        self.fig_sh.canvas.draw_idle()
+        self.fig_dz.canvas.flush_events()
 
 
 def main(args=None):
