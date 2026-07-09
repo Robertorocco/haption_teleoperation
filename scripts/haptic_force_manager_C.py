@@ -123,6 +123,10 @@ class HapticForceManagerNoGuidance(Node):
         # --- Device safety clip (final bound published to the handle) ---
         self.MAX_FORCE = 10.0      # N
         self.MAX_TORQUE = 1.0      # Nm
+        # Authority cap (UNIFIED across all 8 cells; currently == the device clip):
+        # one knob for the max assistance magnitude, applied proportionally.
+        self.MAX_TOTAL_FORCE = 10.0
+        self.MAX_TOTAL_TORQUE = 1.0
 
         # --- Arm the force is computed for (follows /shared_autonomy/active_arm) ---
         self.active_arm = 'right'
@@ -453,6 +457,15 @@ class HapticForceManagerNoGuidance(Node):
         else:
             self._grasp_start_pos = None   # reset so the next grasp re-anchors
             f_total_normal = f_sync.copy()
+
+        # Authority cap (UNIFIED across all cells): proportionally bound the
+        # assistive wrench magnitude to MAX_TOTAL_* (currently == the device clip).
+        fn = np.linalg.norm(f_total_normal[0:3])
+        if fn > self.MAX_TOTAL_FORCE:
+            f_total_normal[0:3] *= self.MAX_TOTAL_FORCE / fn
+        tn = np.linalg.norm(f_total_normal[3:6])
+        if tn > self.MAX_TOTAL_TORQUE:
+            f_total_normal[3:6] *= self.MAX_TOTAL_TORQUE / tn
 
         # Clutch handling: freeze the wrench at 50% on press (cognitive grounding).
         # No alignment guidance is added (this is the no-guidance baseline).

@@ -803,65 +803,6 @@ class HapticForceManager(Node):
                                  + (1.0 - self.alpha_guide) * self.f_guide_filtered)
         return self.f_guide_filtered.copy()
 
-    def compute_F_fixture(self):
-        """Position+orientation virtual fixture pulling the user toward the active goal.
-
-        Unlike F_guide (viscous, velocity-based, vanishes at the goal), this is a
-        POSITION spring: F = K·(goal_pose − real_pose), saturated and gated by the
-        goal confidence. It does not weaken near the goal, so it lets the operator
-        settle precisely at the grasp standoff against the CBF that pushes the
-        gripper off the cylinder. Confidence gating (smoothstep over belief) keeps
-        it silent in free space and when intent is ambiguous.
-        """
-        if (self.fix_goal_pos is None or self.pos_real is None
-                or self.rot_real is None):
-            self.f_fix_filtered = (1.0 - self.alpha_fix) * self.f_fix_filtered
-            return self.f_fix_filtered.copy()
-
-        gate = self._smoothstep(self.fix_confidence,
-                                lo=self.FIX_CONF_LO, hi=self.FIX_CONF_HI)
-        if gate <= 0.0:
-            self.f_fix_filtered = (1.0 - self.alpha_fix) * self.f_fix_filtered
-            return self.f_fix_filtered.copy()
-
-        # Position spring in robot frame: points from the real EE toward the goal,
-        # i.e. the direction the user must move the handle to drive the arm in.
-        err_pos = self.fix_goal_pos - self.pos_real
-        F_fix_robot = self.K_fix_force * err_pos
-        F_fix_robot = self.MAX_FIX_FORCE * np.tanh(F_fix_robot / self.MAX_FIX_FORCE)
-
-        # Orientation spring: R_err = R_goal · R_real^T (robot frame)
-        err_rot_vec = R.from_matrix(
-            self.fix_goal_rot.as_matrix() @ self.rot_real.as_matrix().T).as_rotvec()
-
-        # Near-goal orientation ASSIST: strengthen the torque (up to +20%) as the
-        # EE approaches the goal, so small residual rotation errors get actively
-        # driven to alignment (the operator struggles to do this by hand). Ramped
-        # by the EE→goal distance (full within FIX_TORQUE_NEAR, off past *_FAR).
-        d_goal = float(np.linalg.norm(self.fix_goal_pos - self.pos_real))
-        prox = np.clip(
-            (self.FIX_TORQUE_FAR - d_goal)
-            / max(self.FIX_TORQUE_FAR - self.FIX_TORQUE_NEAR, 1e-6), 0.0, 1.0)
-        prox = 3.0 * prox ** 2 - 2.0 * prox ** 3     # smoothstep
-        tau_scale = 1.0 + self.FIX_TORQUE_NEAR_BOOST * prox
-        K_tau = self.K_fix_torque * tau_scale
-        max_tau = self.MAX_FIX_TORQUE * tau_scale
-        Tau_fix_robot = max_tau * np.tanh(K_tau * err_rot_vec / max_tau)
-
-        # Map robot -> Haption frame (180° Z-flip), scaled by the confidence gate.
-        F_fix_raw = np.array([
-            -F_fix_robot[0],   -F_fix_robot[1],    F_fix_robot[2],
-            -Tau_fix_robot[0], -Tau_fix_robot[1],  Tau_fix_robot[2],
-        ])
-        # "Damped but strong": near the goal, oppose the handle's angular velocity
-        # so the strengthened torque settles the orientation instead of ringing.
-        F_fix_raw[3:6] -= self.K_FIX_TORQUE_DAMP * prox * self.vel_haption[3:6]
-        F_fix_raw *= gate
-
-        self.f_fix_filtered = (self.alpha_fix * F_fix_raw
-                               + (1.0 - self.alpha_fix) * self.f_fix_filtered)
-        return self.f_fix_filtered.copy()
-
     def compute_F_limit_warning(self):
         """Joint-limit "clutch advice" vibration: a ONE-SHOT 1 s torque burst.
 

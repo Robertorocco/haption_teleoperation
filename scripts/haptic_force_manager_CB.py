@@ -653,148 +653,6 @@ class HapticForceManagerCB(Node):
     #
     # /shared_autonomy/user_policy : 30 floats (5 goals × 6 DOF)
 
-    def compute_F_guide(self):
-        """
-        Velocity-field guidance: render the belief-weighted policy twist as a
-        velocity FIELD the handle should follow, and apply a damping-style force
-        that drives the handle velocity toward that field.
-
-        Architecture:
-          1. pi_blend = Σ P(k) · pi_k          (belief-weighted policy twist, robot frame)
-          2. v_field_haption = map(pi_blend)   (180° Z-flip into the Haption frame)
-          3. F = D_guide · (v_field_haption − v_handle) · confidence   (saturated)
-
-        Why this and not a position/offset spring (see __init__ for the full
-        rationale): the policy velocity is tanh-saturated to a near-constant
-        magnitude far from the goal, so an offset-spring becomes a constant push
-        that — with no damping in DEBUG mode — just accelerates the handle and
-        never settles. The velocity field instead:
-          * pushes when the handle is still (D · v_field) → starts the motion,
-          * fades to zero as the handle reaches v_field → no runaway / fling,
-          * lets a passive hand cruise at exactly pi_blend, so the teleop
-            reference traces the SAME path the POLICY_BELIEF_TEST=True mode
-            commands directly (the gripper is driven to the goal through the
-            user's hand),
-          * vanishes at the goal (pi_blend → 0) → settles cleanly.
-        """
-        n_goals = len(self.goal_names) if self.goal_names else 0
-        n_policies = len(self.user_policies)
-
-        if (n_goals == 0
-                or len(self.goal_probs) != n_goals
-                or n_policies != n_goals * 6):
-            self.f_guide_filtered = (1.0 - self.alpha_guide) * self.f_guide_filtered
-            return self.f_guide_filtered.copy()
-
-        probs = np.array(self.goal_probs)
-        policies = np.array(self.user_policies).reshape(n_goals, 6)
-        pi_blend = probs @ policies
-
-        # Confidence gate: the ACTIVE-goal belief b_max (max posterior), read from
-        # active_goal_pose[6] into self.fix_confidence -- the SAME signal and
-        # convention JF/JFB/CF/CFB use (unified belief function). NOTE: in this
-        # guided-BLENDING cell F_guide is DELETED from the applied wrench, so this
-        # path is telemetry/dead code; it is kept consistent for clarity only.
-        alpha = self._smoothstep(self.fix_confidence, lo=self.GUIDE_CONF_LO, hi=self.GUIDE_CONF_HI)
-
-        # Proximity gate: distance from the REFERENCE (pos_target) to the active
-        # goal (fix_goal_pos). Fades guidance to zero far away (where the policy
-        # twist is large but the goal pose is still swinging) and ramps to full
-        # near the goal. See GUIDE_PROX_* in __init__ for the rationale.
-        if self.fix_goal_pos is not None and self.pos_target is not None:
-            d_goal = float(np.linalg.norm(self.fix_goal_pos - self.pos_target))
-            prox = np.clip(
-                (self.GUIDE_PROX_FAR - d_goal)
-                / max(self.GUIDE_PROX_FAR - self.GUIDE_PROX_NEAR, 1e-6), 0.0, 1.0)
-            prox_gate = 3.0 * prox ** 2 - 2.0 * prox ** 3   # smoothstep
-        else:
-            prox_gate = 0.0   # no goal/reference info → no guidance (safe)
-
-        gain = alpha * prox_gate   # belief-confidence × proximity
-
-        # Map the policy twist (robot frame) into the Haption frame: this is the
-        # device velocity the handle must have for the teleop integrator to
-        # reproduce pi_blend on the robot (180° Z-flip, matching teleop_triago_clutch).
-        v_field = np.array([
-            -pi_blend[0], -pi_blend[1],  pi_blend[2],
-            -pi_blend[3], -pi_blend[4],  pi_blend[5],
-        ])
-
-        # Velocity-field tracking force: drive the handle velocity toward v_field.
-        # Intrinsically damped via the −v_handle term, so it cannot run away.
-        dv = v_field - self.vel_haption
-        F_guide_raw = np.zeros(6)
-        F_guide_raw[0:3] = self.D_guide_lin * dv[0:3] * gain
-        F_guide_raw[3:6] = self.D_guide_ang * dv[3:6] * gain
-
-        # Saturate (tanh soft-clip) for operator comfort and hard bounding.
-        F_guide_raw[0:3] = self.MAX_GUIDE_FORCE * np.tanh(F_guide_raw[0:3] / self.MAX_GUIDE_FORCE)
-        F_guide_raw[3:6] = self.MAX_GUIDE_TORQUE * np.tanh(F_guide_raw[3:6] / self.MAX_GUIDE_TORQUE)
-
-        # Temporal smoothing (LPF)
-        self.f_guide_filtered = (self.alpha_guide * F_guide_raw
-                                 + (1.0 - self.alpha_guide) * self.f_guide_filtered)
-        return self.f_guide_filtered.copy()
-
-    def compute_F_fixture(self):
-        """Position+orientation virtual fixture pulling the user toward the active goal.
-
-        Unlike F_guide (viscous, velocity-based, vanishes at the goal), this is a
-        POSITION spring: F = K·(goal_pose − real_pose), saturated and gated by the
-        goal confidence. It does not weaken near the goal, so it lets the operator
-        settle precisely at the grasp standoff against the CBF that pushes the
-        gripper off the cylinder. Confidence gating (smoothstep over belief) keeps
-        it silent in free space and when intent is ambiguous.
-        """
-        if (self.fix_goal_pos is None or self.pos_real is None
-                or self.rot_real is None):
-            self.f_fix_filtered = (1.0 - self.alpha_fix) * self.f_fix_filtered
-            return self.f_fix_filtered.copy()
-
-        gate = self._smoothstep(self.fix_confidence,
-                                lo=self.FIX_CONF_LO, hi=self.FIX_CONF_HI)
-        if gate <= 0.0:
-            self.f_fix_filtered = (1.0 - self.alpha_fix) * self.f_fix_filtered
-            return self.f_fix_filtered.copy()
-
-        # Position spring in robot frame: points from the real EE toward the goal,
-        # i.e. the direction the user must move the handle to drive the arm in.
-        err_pos = self.fix_goal_pos - self.pos_real
-        F_fix_robot = self.K_fix_force * err_pos
-        F_fix_robot = self.MAX_FIX_FORCE * np.tanh(F_fix_robot / self.MAX_FIX_FORCE)
-
-        # Orientation spring: R_err = R_goal · R_real^T (robot frame)
-        err_rot_vec = R.from_matrix(
-            self.fix_goal_rot.as_matrix() @ self.rot_real.as_matrix().T).as_rotvec()
-
-        # Near-goal orientation ASSIST: strengthen the torque (up to +20%) as the
-        # EE approaches the goal, so small residual rotation errors get actively
-        # driven to alignment (the operator struggles to do this by hand). Ramped
-        # by the EE→goal distance (full within FIX_TORQUE_NEAR, off past *_FAR).
-        d_goal = float(np.linalg.norm(self.fix_goal_pos - self.pos_real))
-        prox = np.clip(
-            (self.FIX_TORQUE_FAR - d_goal)
-            / max(self.FIX_TORQUE_FAR - self.FIX_TORQUE_NEAR, 1e-6), 0.0, 1.0)
-        prox = 3.0 * prox ** 2 - 2.0 * prox ** 3     # smoothstep
-        tau_scale = 1.0 + self.FIX_TORQUE_NEAR_BOOST * prox
-        K_tau = self.K_fix_torque * tau_scale
-        max_tau = self.MAX_FIX_TORQUE * tau_scale
-        Tau_fix_robot = max_tau * np.tanh(K_tau * err_rot_vec / max_tau)
-
-        # Map robot -> Haption frame (180° Z-flip), scaled by the confidence gate.
-        F_fix_raw = np.array([
-            -F_fix_robot[0],   -F_fix_robot[1],    F_fix_robot[2],
-            -Tau_fix_robot[0], -Tau_fix_robot[1],  Tau_fix_robot[2],
-        ])
-        # "Damped but strong": near the goal, oppose the handle's angular velocity
-        # so the strengthened torque settles the orientation instead of ringing.
-        F_fix_raw[3:6] -= self.K_FIX_TORQUE_DAMP * prox * self.vel_haption[3:6]
-        F_fix_raw *= gate
-
-        self.f_fix_filtered = (self.alpha_fix * F_fix_raw
-                               + (1.0 - self.alpha_fix) * self.f_fix_filtered)
-        return self.f_fix_filtered.copy()
-
     def compute_F_limit_warning(self):
         """Joint-limit "clutch advice" vibration: a ONE-SHOT 1 s torque burst.
 
@@ -851,8 +709,6 @@ class HapticForceManagerCB(Node):
         """Aggregates forces, tracks/enforces passivity, applies safety clippings, publishes, and buffers data."""
         f_sync = self.compute_F_sync()
         f_cbf = self.compute_F_cbf()
-        f_guide = self.compute_F_guide()
-        f_fix = self.compute_F_fixture()
         f_vib = self.compute_F_limit_warning()
 
         # Grasp execution takes PRECEDENCE over every other mode (including DEBUG):
@@ -870,13 +726,12 @@ class HapticForceManagerCB(Node):
             f_guide_s = np.zeros(6)
             f_fix_s = np.zeros(6)
         elif self.DEBUG_ONLY_GUIDE:
-            # Guidance-only mode: F_guide (velocity field, drives from far) +
-            # F_fixture (position spring, holds precisely at the goal).
+            # Guidance-only debug path — not meaningful for CB (guidance removed).
             self._grasp_start_pos = None  # reset so the next grasp re-anchors
-            f_total_normal = f_guide + f_fix
+            f_total_normal = np.zeros(6)
             f_cbf_s = np.zeros(6)
-            f_guide_s = f_guide.copy()
-            f_fix_s = f_fix.copy()
+            f_guide_s = np.zeros(6)
+            f_fix_s = np.zeros(6)
         else:
             self._grasp_start_pos = None  # reset for next grasp
             # CB = CLUTCH, F=0, B=1 (guided BLENDING, no assistive FEEDBACK): the

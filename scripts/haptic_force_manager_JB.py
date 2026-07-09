@@ -77,6 +77,10 @@ class HapticForceManagerBlending(Node):
         # --- Global force limits ---
         self.MAX_FORCE = 10.0
         self.MAX_TORQUE = 1.0
+        # Authority cap (UNIFIED across all 8 cells; currently == the device clip):
+        # one knob for the max assistance magnitude, applied proportionally.
+        self.MAX_TOTAL_FORCE = 10.0
+        self.MAX_TOTAL_TORQUE = 1.0
 
         # --- Out-of-deadzone vibration cue ---
         # A constant, low-amplitude buzz on the three torque axes rendered the
@@ -196,6 +200,16 @@ class HapticForceManagerBlending(Node):
 
     def control_loop(self):
         f = self.compute_spring()
+
+        # --- Authority cap (UNIFIED across all cells) ---
+        # Proportionally bound the assistive wrench magnitude to MAX_TOTAL_*
+        # (currently == the device clip) BEFORE the vibration cues.
+        fn = np.linalg.norm(f[0:3])
+        if fn > self.MAX_TOTAL_FORCE:
+            f[0:3] *= self.MAX_TOTAL_FORCE / fn
+        tn = np.linalg.norm(f[3:6])
+        if tn > self.MAX_TOTAL_TORQUE:
+            f[3:6] *= self.MAX_TOTAL_TORQUE / tn
 
         # --- Out-of-deadzone vibration cue ---
         # Buzz whenever the handle displacement from home exceeds EITHER the
