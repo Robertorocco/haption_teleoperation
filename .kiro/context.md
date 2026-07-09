@@ -14,7 +14,7 @@
 - **Package**: `haption_teleoperation` — ROS 2 Humble, `ament_cmake` (hybrid C++/Python)
 - **Robot**: PAL Robotics TRIAGo++ (bimanual, mobile base) — teleoperated via Haption Virtuose 6D
 - **Repository**: https://github.com/Robertorocco/haption_teleoperation
-- **Sibling package**: `triago_control` (QP controller + shared autonomy). This package cross-imports `triago_control.qp_controller.config` (`package.xml` depends on `triago_control`) — the **fair 2×3 experiment-condition selector** there (`CONTROL_MODE`, `ASSIST_FEEDBACK`, `ASSIST_BLENDING`; see `triago_control` context.md §5.0) is the single source of truth for which strategy is active (§3). Every teleop/force node calls `cfg.validate_condition(...)` at startup and hard-errors if it does not match the selected cell.
+- **Sibling package**: `triago_control` (QP controller + shared autonomy). This package cross-imports `triago_control.qp_controller.config` (`package.xml` depends on `triago_control`) — the **experiment-condition selector** there (full 2×2×2 factorial) (`CONTROL_MODE`, `ASSIST_FEEDBACK`, `ASSIST_BLENDING`; see `triago_control` context.md §5.0) is the single source of truth for which strategy is active (§3). Every teleop/force node calls `cfg.validate_condition(...)` at startup and hard-errors if it does not match the selected cell.
 
 ## 2. Package Structure
 
@@ -30,8 +30,10 @@ haption_teleoperation/
     ├── teleop_triago_joystick.py                  JOYSTICK velocity-control teleop (all 3 joystick cells)
     ├── haptic_force_manager_C.py    CLUTCH sync-only    (F=0,B=0): F_sync tether only (§3.3)
     ├── haptic_force_manager_CF.py   CLUTCH guided-fb    (F=1,B=0): Virtual Fixture
+    ├── haptic_force_manager_CB.py   CLUTCH guided-bld   (F=0,B=1): reference blending only, F_sync tether (TO IMPLEMENT)
     ├── haptic_force_manager_CFB.py  CLUTCH full-guid    (F=1,B=1): VF forces (same weights as F=1,B=0) + reference blending
     ├── haptic_force_manager_J.py    JOYSTICK sync-only  (F=0,B=0): centering spring + orientation-sync + vibration cue
+    ├── haptic_force_manager_JF.py   JOYSTICK guided-fb  (F=1,B=0): centering spring + F_guide, no blending (TO IMPLEMENT)
     ├── haptic_force_manager_JB.py   JOYSTICK guided-bld (F=0,B=1): centering spring
     ├── haptic_force_manager_JFB.py  JOYSTICK full-guid  (F=1,B=1): centering spring + F_guide (overlapped), guide calibrated to the deadzone-exit force
     └── haption_plotter.py / workspace_debug_visualizer.py   debug visualization
@@ -39,14 +41,14 @@ haption_teleoperation/
 
 Which force manager is valid for which `(CONTROL_MODE, ASSIST_FEEDBACK, ASSIST_BLENDING)` cell is enforced at startup by `cfg.validate_condition(...)` (§3, and `triago_control` context.md §5.0).
 
-## 3. Architecture: Fair 2×3 Condition Matrix
+## 3. Architecture: Full 2×2×2 Condition Matrix
 
 The strategy is selected by the three orthogonal flags in `triago_control/qp_controller/config.py` (§1b, authoritative table in that repo's context.md §5.0): `CONTROL_MODE ∈ {CLUTCH, JOYSTICK}`, `ASSIST_FEEDBACK` (haptic guidance forces), `ASSIST_BLENDING` (reference-level user↔policy blending). All nodes read the flags at their own startup (no live toggle — restart after changing) and hard-error via `cfg.validate_condition(...)` if launched for the wrong cell.
 
 - **CONTROL_MODE** picks the teleop node: `teleop_triago_clutch.py` (position control) vs `teleop_triago_joystick.py` (velocity control).
 - **ASSIST_FEEDBACK / ASSIST_BLENDING** pick the force manager (and whether `main_shared_autonomy` owns `/arm_*/cartesian_reference`).
 
-**Force-manager naming convention.** Every force manager is `haptic_force_manager_<CELL>`, where `<CELL>` encodes the active study condition as letters: **C** = CLUTCH or **J** = JOYSTICK (the control mode, always first), then **F** if `ASSIST_FEEDBACK` is on, then **B** if `ASSIST_BLENDING` is on. The no-assist baseline is just the mode letter. The six cells are `C / CF / CFB` (clutch) and `J / JB / JFB` (joystick); `JFB` (joystick full guidance) is not yet implemented. The old `_tutorial` suffix was dropped in this rename, and the legacy/demo scripts (`haptic_force_manager_battery`, `teleop_demo_integrator`, `teleop_triago`) were removed from the package.
+**Force-manager naming convention.** Every force manager is `haptic_force_manager_<CELL>`, where `<CELL>` encodes the active study condition as letters: **C** = CLUTCH or **J** = JOYSTICK (the control mode, always first), then **F** if `ASSIST_FEEDBACK` is on, then **B** if `ASSIST_BLENDING` is on. The no-assist baseline is just the mode letter. The eight cells are `C / CF / CB / CFB` (clutch) and `J / JF / JB / JFB` (joystick). `CB` (clutch + blending-only) and `JF` (joystick + feedback-only) are the two off-diagonal cells that complete the full 2×2×2 factorial for the paper — each pairs a control mode with its **non-native** assist channel (clutch is a position/Virtual-Fixture framework not meant to run on blending alone; the velocity joystick was conceived as the auto-blending solution), so they are conceptually unusual but included for a complete study comparison; both are still **to implement**. The old `_tutorial` suffix was dropped in this rename, and the legacy/demo scripts (`haptic_force_manager_battery`, `teleop_demo_integrator`, `teleop_triago`) were removed from the package.
 
 The subsections below describe the currently-implemented cells. `cfg.BLENDING` is a backward-compat alias for `ASSIST_BLENDING`.
 
