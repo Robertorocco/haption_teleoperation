@@ -129,6 +129,18 @@ The feedback-only cell of the velocity column: assistive **feedback** (channel F
 
 **Plots** (two windows, reworked from JFB for this cell): (1) **contributions** — the magnitude each channel puts on the handle, `‖F_home‖` (homing) vs `‖F_guide‖` (assistance) as separate lines, for force and torque, with **dashed maxima** (guidance saturation `MAX_GUIDE_*` and the device clip `MAX_FORCE`/`MAX_TORQUE`); (2) **feedback share** — the fraction of the total wrench that is homing vs assistance, `‖F_x‖/(‖F_home‖+‖F_guide‖)·100` (the two sum to 100%), for force and torque separately.
 
+### 3.7 UNIFIED guidance gating (all F_guide cells: JF / JFB / CF / CFB, + dead copy in CB)
+
+The task, belief function and policy are the SAME for both teleop modes, so the `F_guide` activation gate (`gain = conf_gate × prox_gate`) is now **identical everywhere**:
+
+- **Proximity gate** (distance from the tracked reference `pos_target` to the active goal `fix_goal_pos`): full ≤ **0.10 m**, dead > **0.60 m** (`GUIDE_PROX_NEAR=0.10`, `GUIDE_PROX_FAR=0.60`), smoothstep between.
+- **Confidence gate**: full ≥ **0.90**, dead < **0.30** (`GUIDE_CONF_LO=0.30`, `GUIDE_CONF_HI=0.90`), smoothstep between.
+
+**Belief-function alignment (important):** the confidence signal was previously *different* between the columns and was unified onto **`b_max`**:
+- `b_max` = max posterior belief of the winning goal, from `BeliefEstimator.get_active_goal() → (key, b_max)`, published by `main_shared_autonomy` in `/shared_autonomy/active_goal_pose[6]` (forced to **0** during autonomous grasp execution). JF/JFB/JB already read this into `self.fix_confidence`.
+- The clutch `F_guide` (CF/CFB, and the dead copy in CB) formerly gated on `1 − H/ln(n_active)` (**1 − normalised Shannon entropy** of the belief distribution), recomputed locally from `goal_probs`. This is a *different working principle* (distribution-peakedness, goal-count dependent, not grasp-gated) and gives different numbers for the same belief (e.g. beliefs `[0.9,0.1]` → `b_max=0.90` but entropy-conf `=0.53`; `[0.5,0.25,0.25]` → `b_max=0.50` vs `0.05`).
+- **Fix:** CF/CFB/CB now gate `F_guide` on `self.fix_confidence` (= published `b_max`), dropping the local entropy math, so all cells share one belief function AND one set of margins. (CF/CFB still use `self.fix_confidence` with the separate `FIX_CONF_*` margins for the *position* virtual fixture `F_fixture` — that gate is unchanged.)
+
 ## 4. C++ Node: virtuose_server_node
 
 - **Frequency**: 150 Hz. **Command mode**: `COMMAND_TYPE_IMPEDANCE` (force in, position out). **Indexing**: `INDEXING_NONE` (button held to track).

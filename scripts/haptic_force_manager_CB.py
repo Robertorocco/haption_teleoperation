@@ -112,7 +112,7 @@ class HapticForceManagerCB(Node):
         # REFERENCE (pos_target) to the active goal (fix_goal_pos). Assistance then
         # only engages once the user has steered the reference close enough that
         # the goal is committed and stable.
-        self.GUIDE_PROX_FAR  = 1.00   # m — beyond this: device free (gate = 0)
+        self.GUIDE_PROX_FAR  = 0.60   # m — beyond this: device free (gate = 0); UNIFIED across all guidance cells
         self.GUIDE_PROX_NEAR = 0.10   # m — at/below this: full guidance (gate = 1)
 
         # DEBUG: set True to output ONLY F_guide (isolate guidance for testing).
@@ -129,10 +129,11 @@ class HapticForceManagerCB(Node):
         # reference twist is a smooth function of the beliefs, so it never jumps.
         #
         # confidence gain : continuous fade-in of the whole guidance wrench based
-        #                   on how "peaked" the blended belief is (1 - normalised
-        #                   entropy), shaped by a smoothstep with a soft floor/cap.
-        self.GUIDE_CONF_LO   = 0.05   # below this confidence -> transparent (almost never)
-        self.GUIDE_CONF_HI   = 0.50   # at/above this confidence -> full guidance gain
+        #                   on the active-goal belief b_max (max posterior, from
+        #                   active_goal_pose[6]) -- the SAME belief function JF/JFB
+        #                   use, shaped by a smoothstep. UNIFIED across all cells.
+        self.GUIDE_CONF_LO   = 0.30   # below this confidence -> transparent; UNIFIED across all guidance cells
+        self.GUIDE_CONF_HI   = 0.90   # at/above this confidence -> full guidance gain
         # Temporal smoothing of the final guidance wrench. Guarantees C0 continuity
         # even if a probability sample arrives noisy; removes any residual stepping.
         self.alpha_guide     = 0.15   # LPF coefficient (lower = smoother, more lag)
@@ -675,16 +676,12 @@ class HapticForceManagerCB(Node):
         policies = np.array(self.user_policies).reshape(n_goals, 6)
         pi_blend = probs @ policies
 
-        # Confidence (entropy-based): fade the whole guidance in as the belief
-        # peaks, so it stays transparent while the user's intent is ambiguous.
-        active_mask = probs > 1e-12
-        n_active = int(np.sum(active_mask))
-        if n_active <= 1:
-            confidence = 1.0
-        else:
-            H = -np.sum(probs[active_mask] * np.log(probs[active_mask]))
-            confidence = 1.0 - H / np.log(n_active)
-        alpha = self._smoothstep(confidence, lo=self.GUIDE_CONF_LO, hi=self.GUIDE_CONF_HI)
+        # Confidence gate: the ACTIVE-goal belief b_max (max posterior), read from
+        # active_goal_pose[6] into self.fix_confidence -- the SAME signal and
+        # convention JF/JFB/CF/CFB use (unified belief function). NOTE: in this
+        # guided-BLENDING cell F_guide is DELETED from the applied wrench, so this
+        # path is telemetry/dead code; it is kept consistent for clarity only.
+        alpha = self._smoothstep(self.fix_confidence, lo=self.GUIDE_CONF_LO, hi=self.GUIDE_CONF_HI)
 
         # Proximity gate: distance from the REFERENCE (pos_target) to the active
         # goal (fix_goal_pos). Fades guidance to zero far away (where the policy

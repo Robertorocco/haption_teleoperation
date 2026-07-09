@@ -119,8 +119,9 @@ class HapticForceManager(Node):
         # reference twist is a smooth function of the beliefs, so it never jumps.
         #
         # confidence gain : continuous fade-in of the whole guidance wrench based
-        #                   on how "peaked" the blended belief is (1 - normalised
-        #                   entropy), shaped by a smoothstep with a soft floor/cap.
+        #                   on the active-goal belief b_max (max posterior, from
+        #                   active_goal_pose[6]) -- the SAME belief function JF/JFB
+        #                   use, shaped by a smoothstep. UNIFIED across all cells.
         self.GUIDE_CONF_LO   = 0.30   # below this confidence -> transparent; UNIFIED across all guidance cells
         self.GUIDE_CONF_HI   = 0.90   # at/above this confidence -> full guidance gain
         # Temporal smoothing of the final guidance wrench. Guarantees C0 continuity
@@ -741,16 +742,13 @@ class HapticForceManager(Node):
         policies = np.array(self.user_policies).reshape(n_goals, 6)
         pi_blend = probs @ policies
 
-        # Confidence (entropy-based): fade the whole guidance in as the belief
-        # peaks, so it stays transparent while the user's intent is ambiguous.
-        active_mask = probs > 1e-12
-        n_active = int(np.sum(active_mask))
-        if n_active <= 1:
-            confidence = 1.0
-        else:
-            H = -np.sum(probs[active_mask] * np.log(probs[active_mask]))
-            confidence = 1.0 - H / np.log(n_active)
-        alpha = self._smoothstep(confidence, lo=self.GUIDE_CONF_LO, hi=self.GUIDE_CONF_HI)
+        # Confidence gate: the ACTIVE-goal belief b_max (max posterior), read from
+        # active_goal_pose[6] into self.fix_confidence -- the SAME signal and
+        # convention JF/JFB/JB use. Replaces the former 1-normalised-entropy metric
+        # so ALL guidance cells gate on one belief function. b_max is forced to 0
+        # during autonomous grasp execution, so the guidance releases cleanly while
+        # the node drives the arm.
+        alpha = self._smoothstep(self.fix_confidence, lo=self.GUIDE_CONF_LO, hi=self.GUIDE_CONF_HI)
 
         # Proximity gate: distance from the REFERENCE (pos_target) to the active
         # goal (fix_goal_pos). Fades guidance to zero far away (where the policy
