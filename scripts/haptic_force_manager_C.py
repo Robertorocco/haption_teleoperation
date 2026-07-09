@@ -103,6 +103,13 @@ class HapticForceManagerNoGuidance(Node):
         # reference while clutching), so it is present in the baseline too.
         self.rot_haption = None
         self.K_align = 10.0  # Nm/rad — clutch orientation-alignment stiffness
+        # DISABLED (bug fix): the alignment error mixes frames — rot_target is in
+        # the robot base frame, rot_haption in the Haption device frame — so the
+        # torque is NON-restorative and drives an unstable limit cycle that
+        # saturates the torque clip ("explosion") on clutch press. It was previously
+        # inert (the PoseStamped subscription never matched the Pose publisher).
+        # Keep OFF until a frame-correct alignment is derived and bench-tested.
+        self.ENABLE_CLUTCH_ALIGN = False
 
         # --- Global viscous damping (impedance-device stability, same as tutorial) ---
         self.Kd_global_lin = 0.7   # Ns/m
@@ -457,7 +464,7 @@ class HapticForceManagerNoGuidance(Node):
             # Clutch orientation-alignment torque (UNIFIED with CF/CB/CFB, treated
             # as a sync effect): pull the HANDLE orientation toward the target
             # orientation, faded to zero near a Haption joint limit.
-            if self.rot_haption is not None and self.rot_target is not None:
+            if self.ENABLE_CLUTCH_ALIGN and self.rot_haption is not None and self.rot_target is not None:
                 error_rot_matrix = self.rot_target.as_matrix() @ self.rot_haption.as_matrix().T
                 error_rot_vec = R.from_matrix(error_rot_matrix).as_rotvec()
                 tau_align_base = self.K_align * error_rot_vec

@@ -167,6 +167,13 @@ class HapticForceManagerFull(Node):
         self.was_clutching_last_frame = False
         self.f_clutch_frozen = np.zeros(6)
         self.K_align = 10.0  # Nm/rad (Rotational stiffness for alignment guidance)
+        # DISABLED (bug fix): the alignment error mixes frames — rot_target is in
+        # the robot base frame, rot_haption in the Haption device frame — so the
+        # torque is NON-restorative and drives an unstable limit cycle that
+        # saturates the torque clip ("explosion") on clutch press. It was previously
+        # inert (the PoseStamped subscription never matched the Pose publisher).
+        # Keep OFF until a frame-correct alignment is derived and bench-tested.
+        self.ENABLE_CLUTCH_ALIGN = False
         self.rot_haption = None
 
 
@@ -1049,7 +1056,7 @@ class HapticForceManagerFull(Node):
             f_total = self.f_clutch_frozen.copy()
             
             # 3. Haptic Alignment Guidance (Orientation Only)
-            if self.rot_haption is not None and self.rot_target is not None:
+            if self.ENABLE_CLUTCH_ALIGN and self.rot_haption is not None and self.rot_target is not None:
                 
                 # Calculate the rotation error pulling the HAPTION HANDLE toward the FROZEN TARGET
                 # Math: R_error = R_target * R_haption^T
