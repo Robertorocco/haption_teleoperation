@@ -206,9 +206,9 @@ class HapticForceManagerCB(Node):
         self._vib_clutch_prev = False   # previous clutch state (for cycle edge detect)
 
         # --- Tunable Force Parameters ---
-        self.Kp_sync = 10.0#15.0  
-        self.Kd_sync = 0.0  #if global damping is added, set this to 0 to avoid overdamping
-        self.Kp_sync_ang = 0.3   # Nm/rad — orientation sync spring (handle -> real EE orientation)
+        self.Kp_sync = 30.0       # N/m   [×3: sync is the ONLY force in CB, must be clearly felt]
+        self.Kd_sync = 0.0        # if global damping is added, set this to 0 to avoid overdamping
+        self.Kp_sync_ang = 0.9    # Nm/rad [×3: orientation sync spring]
 
         # --- Adaptive sync authority (anti reference-runaway) ---
         # When the cartesian REFERENCE drifts far from the REAL EE (the robot can't
@@ -261,10 +261,7 @@ class HapticForceManagerCB(Node):
         self.t_data = deque(maxlen=self.buffer_size)
         self.start_time = time.time()
 
-        # F_sync wrench (the ONLY applied force in this CB cell).
-        self.sync_F = [deque(maxlen=self.buffer_size) for _ in range(3)]
-        self.sync_T = [deque(maxlen=self.buffer_size) for _ in range(3)]
-        # Final published total wrench (includes clutch-frozen + damping + vib).
+        # Final published total wrench (= F_sync + damping + vib in this cell).
         self.tot_F = [deque(maxlen=self.buffer_size) for _ in range(3)]
         self.tot_T = [deque(maxlen=self.buffer_size) for _ in range(3)]
         # Blending authority alpha + share (from /shared_autonomy/blend_debug).
@@ -316,54 +313,41 @@ class HapticForceManagerCB(Node):
     # PLOT SETUP & UPDATE
     # =========================
     def setup_plot(self):
-        """Live plot for CB: F_sync wrench, total published wrench, blending α + share, frequency."""
+        """Live plot for CB: total published wrench, blending α + share, frequency."""
         plt.ion()
         colors = ['r', 'g', 'b']
         labels = ['X', 'Y', 'Z']
 
-        self.fig, self.axs = plt.subplots(4, 2, figsize=(12, 10))
+        self.fig, self.axs = plt.subplots(3, 2, figsize=(12, 8))
         self.fig.canvas.manager.set_window_title('CB: Clutch Guided-Blending (F_sync only)')
 
-        # (0,0) F_sync FORCE
+        # (0,0) Total published FORCE + limits
         ax = self.axs[0, 0]
-        ax.set_title("F_sync — FORCE (N)", fontsize=10, fontweight='bold')
-        ax.set_ylabel("N"); ax.grid(True, linestyle='--', alpha=0.6)
-        self.lines_sync_F = [ax.plot([], [], color=colors[i], label=f"F{labels[i]}")[0] for i in range(3)]
-        ax.legend(loc='upper left', fontsize=8, ncol=3)
-        # (0,1) F_sync TORQUE
-        ax = self.axs[0, 1]
-        ax.set_title("F_sync — TORQUE (Nm)", fontsize=10, fontweight='bold')
-        ax.set_ylabel("Nm"); ax.grid(True, linestyle='--', alpha=0.6)
-        self.lines_sync_T = [ax.plot([], [], color=colors[i], label=f"T{labels[i]}")[0] for i in range(3)]
-        ax.legend(loc='upper left', fontsize=8, ncol=3)
-
-        # (1,0) Total published FORCE + limits
-        ax = self.axs[1, 0]
-        ax.set_title("Published TOTAL — FORCE (N)", fontsize=10, fontweight='bold')
+        ax.set_title("Published FORCE (N)", fontsize=10, fontweight='bold')
         ax.set_ylabel("N"); ax.grid(True, linestyle='--', alpha=0.6)
         ax.axhline(self.MAX_FORCE, color='k', linestyle='--', linewidth=1.0, alpha=0.6, label='\u00b1max')
         ax.axhline(-self.MAX_FORCE, color='k', linestyle='--', linewidth=1.0, alpha=0.6)
         self.lines_tot_F = [ax.plot([], [], color=colors[i], label=f"F{labels[i]}")[0] for i in range(3)]
         ax.legend(loc='upper left', fontsize=8, ncol=4)
-        # (1,1) Total published TORQUE + limits
-        ax = self.axs[1, 1]
-        ax.set_title("Published TOTAL — TORQUE (Nm)", fontsize=10, fontweight='bold')
+        # (0,1) Total published TORQUE + limits
+        ax = self.axs[0, 1]
+        ax.set_title("Published TORQUE (Nm)", fontsize=10, fontweight='bold')
         ax.set_ylabel("Nm"); ax.grid(True, linestyle='--', alpha=0.6)
         ax.axhline(self.MAX_TORQUE, color='k', linestyle='--', linewidth=1.0, alpha=0.6, label='\u00b1max')
         ax.axhline(-self.MAX_TORQUE, color='k', linestyle='--', linewidth=1.0, alpha=0.6)
         self.lines_tot_T = [ax.plot([], [], color=colors[i], label=f"T{labels[i]}")[0] for i in range(3)]
         ax.legend(loc='upper left', fontsize=8, ncol=4)
 
-        # (2,0) Blending authority α
-        ax = self.axs[2, 0]
+        # (1,0) Blending authority α
+        ax = self.axs[1, 0]
         ax.set_title("Blending authority \u03b1 (0=user, 1=policy)", fontsize=10, fontweight='bold')
         ax.set_ylabel("\u03b1"); ax.set_ylim(-0.05, 1.05)
         ax.axhline(0.5, color='#888', linestyle=':', linewidth=0.8)
         ax.grid(True, linestyle='--', alpha=0.6)
         self.line_alpha, = ax.plot([], [], color='#ff7f0e', linewidth=1.5, label='\u03b1')
         ax.legend(loc='upper left', fontsize=8)
-        # (2,1) Blended-action share (user % vs policy %)
-        ax = self.axs[2, 1]
+        # (1,1) Blended-action share (user % vs policy %)
+        ax = self.axs[1, 1]
         ax.set_title("Blend share: (1-\u03b1)\u00b7v_user  vs  \u03b1\u00b7v_policy", fontsize=10, fontweight='bold')
         ax.set_ylabel("%"); ax.set_ylim(-5, 105)
         ax.grid(True, linestyle='--', alpha=0.6)
@@ -371,16 +355,16 @@ class HapticForceManagerCB(Node):
         self.line_policy_pct, = ax.plot([], [], color='#ff7f0e', linewidth=1.4, label='policy %')
         ax.legend(loc='upper left', fontsize=8, ncol=2)
 
-        # (3,0) Node frequency
-        ax = self.axs[3, 0]
+        # (2,0) Node frequency
+        ax = self.axs[2, 0]
         ax.set_title("Force Manager Frequency (Hz)", fontsize=10, fontweight='bold')
         ax.set_ylabel("Hz"); ax.set_xlabel("Time (s)"); ax.set_ylim(0, 180)
         ax.grid(True, linestyle='--', alpha=0.6)
         ax.axhline(150, color='g', linestyle='--', linewidth=1.0, alpha=0.7, label='target 150Hz')
         self.line_freq, = ax.plot([], [], color='#9467bd', linewidth=1.5, label='HFM freq')
         ax.legend(loc='upper left', fontsize=8)
-        # (3,1) empty
-        self.axs[3, 1].axis('off')
+        # (2,1) empty
+        self.axs[2, 1].axis('off')
 
         self.fig.tight_layout()
         plt.show(block=False)
@@ -391,8 +375,6 @@ class HapticForceManagerCB(Node):
             if len(self.t_data) == 0:
                 return
             t_list = list(self.t_data)
-            sF = [list(self.sync_F[i]) for i in range(3)]
-            sT = [list(self.sync_T[i]) for i in range(3)]
             tF = [list(self.tot_F[i]) for i in range(3)]
             tT = [list(self.tot_T[i]) for i in range(3)]
             alpha_list = list(self.alpha_data)
@@ -402,27 +384,24 @@ class HapticForceManagerCB(Node):
 
         win = (t_list[-1] - self.plot_window_sec, t_list[-1])
         for i in range(3):
-            self.lines_sync_F[i].set_data(t_list, sF[i])
-            self.lines_sync_T[i].set_data(t_list, sT[i])
             self.lines_tot_F[i].set_data(t_list, tF[i])
             self.lines_tot_T[i].set_data(t_list, tT[i])
-        for r in range(2):
-            for c in range(2):
-                self.axs[r, c].set_xlim(*win)
-                self.axs[r, c].relim()
-                self.axs[r, c].autoscale_view(scalex=False, scaley=True)
+        for c in range(2):
+            self.axs[0, c].set_xlim(*win)
+            self.axs[0, c].relim()
+            self.axs[0, c].autoscale_view(scalex=False, scaley=True)
 
         n = min(len(t_list), len(alpha_list))
         self.line_alpha.set_data(t_list[:n], alpha_list[:n])
-        self.axs[2, 0].set_xlim(*win)
+        self.axs[1, 0].set_xlim(*win)
         n2 = min(len(t_list), len(upct_list), len(ppct_list))
         self.line_user_pct.set_data(t_list[:n2], upct_list[:n2])
         self.line_policy_pct.set_data(t_list[:n2], ppct_list[:n2])
-        self.axs[2, 1].set_xlim(*win)
+        self.axs[1, 1].set_xlim(*win)
 
         nf = min(len(t_list), len(freq_list))
         self.line_freq.set_data(t_list[:nf], freq_list[:nf])
-        self.axs[3, 0].set_xlim(*win)
+        self.axs[2, 0].set_xlim(*win)
 
         self.fig.canvas.draw_idle()
         self.fig.canvas.flush_events()
@@ -1015,8 +994,6 @@ class HapticForceManagerCB(Node):
         with self.plot_lock:
             self.t_data.append(t)
             for i in range(3):
-                self.sync_F[i].append(f_sync[i])
-                self.sync_T[i].append(f_sync[i + 3])
                 self.tot_F[i].append(f_total[i])
                 self.tot_T[i].append(f_total[i + 3])
             self.alpha_data.append(self._last_blend_alpha)
