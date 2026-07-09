@@ -838,16 +838,17 @@ class HapticForceManagerFull(Node):
             -pi_blend[3], -pi_blend[4],  pi_blend[5],
         ])
 
-        # Velocity-field tracking force: drive the handle velocity toward v_field.
-        # Intrinsically damped via the −v_handle term, so it cannot run away.
-        dv = v_field - self.vel_haption
+        # FEED-FORWARD guidance (UNIFIED with the joystick JF/JFB): the magnitude is
+        # shaped from the policy field v_field ONLY -- the former -v_handle velocity-
+        # feedback term is removed (it is a virtual damper whose coefficient exceeds
+        # the 150 Hz device passivity limit). Direction from v_field, magnitude
+        # tanh-saturated at MAX_GUIDE_*, then linearly gain-scaled. F_guide still
+        # vanishes at the goal because pi_blend -> 0 there (so no separate F_fixture
+        # is needed for terminal settling; the sync tether holds the final pose).
         F_guide_raw = np.zeros(6)
-        F_guide_raw[0:3] = self.D_guide_lin * dv[0:3] * gain
-        F_guide_raw[3:6] = self.D_guide_ang * dv[3:6] * gain
-
-        # Saturate (tanh soft-clip) for operator comfort and hard bounding.
-        F_guide_raw[0:3] = self.MAX_GUIDE_FORCE * np.tanh(F_guide_raw[0:3] / self.MAX_GUIDE_FORCE)
-        F_guide_raw[3:6] = self.MAX_GUIDE_TORQUE * np.tanh(F_guide_raw[3:6] / self.MAX_GUIDE_TORQUE)
+        F_guide_raw[0:3] = self.MAX_GUIDE_FORCE * np.tanh(self.D_guide_lin * v_field[0:3] / self.MAX_GUIDE_FORCE)
+        F_guide_raw[3:6] = self.MAX_GUIDE_TORQUE * np.tanh(self.D_guide_ang * v_field[3:6] / self.MAX_GUIDE_TORQUE)
+        F_guide_raw = gain * F_guide_raw
 
         # Temporal smoothing (LPF)
         self.f_guide_filtered = (self.alpha_guide * F_guide_raw
@@ -970,7 +971,6 @@ class HapticForceManagerFull(Node):
         f_sync = self.compute_F_sync()
         f_cbf = self.compute_F_cbf()
         f_guide = self.compute_F_guide()
-        f_fix = self.compute_F_fixture()
         f_vib = self.compute_F_limit_warning()
 
         # Grasp execution takes PRECEDENCE over every other mode (including DEBUG):
@@ -999,42 +999,28 @@ class HapticForceManagerFull(Node):
                 f_total_normal = np.zeros(6)
             f_cbf_s = np.zeros(6)
             f_guide_s = np.zeros(6)
-            f_fix_s = np.zeros(6)
         elif self.DEBUG_ONLY_GUIDE:
-            # Guidance-only mode: F_guide (velocity field, drives from far) +
-            # F_fixture (position spring, holds precisely at the goal).
+            # Guidance-only mode: F_guide (feed-forward velocity field) only.
             self._grasp_start_pos = None  # reset so the next grasp re-anchors
-            f_total_normal = f_guide + f_fix
+            f_total_normal = f_guide
             f_cbf_s = np.zeros(6)
             f_guide_s = f_guide.copy()
-            f_fix_s = f_fix.copy()
         else:
             self._grasp_start_pos = None  # reset for next grasp
-            pos_err = (np.linalg.norm(self.pos_real - self.pos_target)
-                       if (self.pos_real is not None and self.pos_target is not None) else 0.0)
-            ang_err = 0.0
-            if self.rot_real is not None and self.rot_target is not None:
-                ang_err = float(np.linalg.norm(R.from_matrix(
-                    self.rot_real.as_matrix() @ self.rot_target.as_matrix().T).as_rotvec()))
-            divergence = max(pos_err / self.SYNC_FULL_POS_ERR, ang_err / self.SYNC_FULL_ANG_ERR)
-            sync_share = min(self.SYNC_SHARE_AT_FULL * divergence, self.SYNC_SHARE_CAP)
-
-            # Guidance (guide + fix) yields as the sync demand grows (reference
-            # drifting far).
-            guide_gain = float(np.clip(1.0 - sync_share, 0.0, 1.0))
-            # F_CBF DISABLED (per operator request): compute_F_cbf() above is still
-            # called every tick — f_cbf keeps updating (LPF state, telemetry, plot
-            # trace) — but its contribution to the total wrench is zeroed out here.
-            # f_cbf_s = self.CBF_GAIN_BOOST * f_cbf
+            # UNIFIED (fairness): NO adaptive sync-share attenuation and NO
+            # F_fixture. The guidance authority is set entirely by compute_F_guide
+            # (absolute MAX_GUIDE_* saturation × conf×prox gate); the reference-
+            # runaway job is left to the sync tether, the proximity gate, and the
+            # final 10 N/1 Nm cap. F_CBF stays DISABLED (compute_F_cbf still runs
+            # every tick for telemetry/plots only).
             f_cbf_s = np.zeros(6)
-            f_guide_s = guide_gain * f_guide
-            f_fix_s = guide_gain * f_fix
+            f_guide_s = f_guide
 
-            # Calculate the normal running force (F_sync + guidance; F_cbf excluded).
-            # NOTE: f_vib is intentionally NOT summed here — the one-shot limit
-            # burst is injected AFTER the clutch/grasp branching (see below) so it
-            # is felt live and never captured/frozen by the clutch snapshot.
-            f_total_normal = f_sync + f_cbf_s + f_guide_s + f_fix_s
+            # Normal running wrench (F_sync + guidance; F_cbf excluded). NOTE: f_vib
+            # is intentionally NOT summed here — the one-shot limit burst is injected
+            # AFTER the clutch/grasp branching (see below) so it is felt live and
+            # never captured/frozen by the clutch snapshot.
+            f_total_normal = f_sync + f_cbf_s + f_guide_s
 
             # --- AUTHORITY CAP --------------------------------------------- #
             # Bound the MAGNITUDE only when it is exceeded (does NOT force a fixed
@@ -1128,7 +1114,7 @@ class HapticForceManagerFull(Node):
         # Buffer Data for Plotting (use the SCALED pushers so the % shares reflect
         # what was actually sent after the adaptive-sync attenuation).
         t = time.time() - self.start_time
-        guide_comb = f_guide_s + f_fix_s   # guidance share = viscous guide + position fixture
+        guide_comb = f_guide_s   # guidance share (F_fixture removed)
         components = {'Sync': f_sync, 'CBF': f_cbf_s, 'Guide': guide_comb, 'Limit': f_vib}
 
         # Per-source contribution share (% of summed component magnitudes).
