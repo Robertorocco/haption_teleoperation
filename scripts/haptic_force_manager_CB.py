@@ -261,33 +261,24 @@ class HapticForceManagerCB(Node):
         self.t_data = deque(maxlen=self.buffer_size)
         self.start_time = time.time()
 
-        # Per-component wrench history (Superposition window: no Total here).
-        self.f_data = {
-            'Sync':  {'F': [deque(maxlen=self.buffer_size) for _ in range(3)], 'T': [deque(maxlen=self.buffer_size) for _ in range(3)]},
-            'CBF':   {'F': [deque(maxlen=self.buffer_size) for _ in range(3)], 'T': [deque(maxlen=self.buffer_size) for _ in range(3)]},
-            'Guide': {'F': [deque(maxlen=self.buffer_size) for _ in range(3)], 'T': [deque(maxlen=self.buffer_size) for _ in range(3)]},
-            'Limit': {'F': [deque(maxlen=self.buffer_size) for _ in range(3)], 'T': [deque(maxlen=self.buffer_size) for _ in range(3)]}
-        }
-
-        # Dedicated f_total window: final published wrench + per-source % breakdown.
-        self.ftot_data = {'F': [deque(maxlen=self.buffer_size) for _ in range(3)],
-                          'T': [deque(maxlen=self.buffer_size) for _ in range(3)]}
-        self.pct_force  = {'Sync': deque(maxlen=self.buffer_size),
-                           'CBF':  deque(maxlen=self.buffer_size),
-                           'Guide': deque(maxlen=self.buffer_size)}
-        self.pct_torque = {'Sync': deque(maxlen=self.buffer_size),
-                           'CBF':  deque(maxlen=self.buffer_size),
-                           'Guide': deque(maxlen=self.buffer_size)}
-
-        # Shared-autonomy inference frequency tracker (from goal_probs arrival rate)
-        self._sa_freq_data = deque(maxlen=self.buffer_size)
-        self._sa_last_time = None
-        self._sa_freq_lpf = 0.0
-
-        # Own node frequency tracker (from control_loop call rate)
+        # F_sync wrench (the ONLY applied force in this CB cell).
+        self.sync_F = [deque(maxlen=self.buffer_size) for _ in range(3)]
+        self.sync_T = [deque(maxlen=self.buffer_size) for _ in range(3)]
+        # Final published total wrench (includes clutch-frozen + damping + vib).
+        self.tot_F = [deque(maxlen=self.buffer_size) for _ in range(3)]
+        self.tot_T = [deque(maxlen=self.buffer_size) for _ in range(3)]
+        # Blending authority alpha + share (from /shared_autonomy/blend_debug).
+        self.alpha_data = deque(maxlen=self.buffer_size)
+        self.user_pct_data = deque(maxlen=self.buffer_size)
+        self.policy_pct_data = deque(maxlen=self.buffer_size)
+        # Own node frequency tracker.
         self._own_freq_data = deque(maxlen=self.buffer_size)
         self._own_last_time = None
         self._own_freq_lpf = 0.0
+        # Blend-debug state (from /shared_autonomy/blend_debug callback).
+        self._last_blend_alpha = 0.0
+        self._last_blend_user_pct = 0.0
+        self._last_blend_policy_pct = 0.0
         self.create_subscription(Float64MultiArray, '/arm_right/cartesian_reference', self.target_cb, 10)
         self.create_subscription(Float64MultiArray, '/qp_debug/ee_real', self.real_cb, 10)
         self.create_subscription(Twist, 'virtuose/velocity', self.vel_cb, 10)
@@ -301,6 +292,8 @@ class HapticForceManagerCB(Node):
         self.create_subscription(String, '/shared_autonomy/goal_names', self.goal_names_cb, 10)
         self.create_subscription(Float64MultiArray, '/shared_autonomy/goal_probabilities', self.goal_probs_cb, 10)
         self.create_subscription(Float64MultiArray, '/shared_autonomy/user_policy', self.user_policy_cb, 10)
+        # Blending telemetry: [alpha, v_user(6), v_policy(6), v_blend(6)] = 19 floats.
+        self.create_subscription(Float64MultiArray, '/shared_autonomy/blend_debug', self.blend_debug_cb, 10)
         # Active goal pose + confidence for the position virtual fixture
         self.create_subscription(Float64MultiArray, '/shared_autonomy/active_goal_pose', self.goal_pose_cb, 10)
         # Grasp-execution flag: when True, output strong pure F_sync (track the EE)
@@ -323,184 +316,136 @@ class HapticForceManagerCB(Node):
     # PLOT SETUP & UPDATE
     # =========================
     def setup_plot(self):
-        """Initializes the live Matplotlib windows."""
+        """Live plot for CB: F_sync wrench, total published wrench, blending α + share, frequency."""
         plt.ion()
-        self.fig, self.axs = plt.subplots(4, 2, figsize=(12, 9))
-        self.fig.canvas.manager.set_window_title('Haptic Force Superposition')
-        
-        self.lines = {}
-        categories = ['Sync', 'CBF', 'Guide', 'Limit']
         colors = ['r', 'g', 'b']
         labels = ['X', 'Y', 'Z']
-        
-        for row, cat in enumerate(categories):
-            self.lines[cat] = {'F': [], 'T': []}
-            
-            # Left Column (Forces)
-            ax_f = self.axs[row, 0]
-            ax_f.set_title(f"{cat} Wrench - FORCE (N)", fontsize=10, pad=3)
-            ax_f.set_ylabel("Force (N)")
-            ax_f.grid(True, linestyle='--', alpha=0.6)
-            for i in range(3):
-                line, = ax_f.plot([], [], color=colors[i], label=f"F{labels[i]}")
-                self.lines[cat]['F'].append(line)
-            ax_f.legend(loc='upper left', fontsize=8)
 
-            # Right Column (Torques)
-            ax_t = self.axs[row, 1]
-            ax_t.set_title(f"{cat} Wrench - TORQUE (Nm)", fontsize=10, pad=3)
-            ax_t.set_ylabel("Torque (Nm)")
-            ax_t.grid(True, linestyle='--', alpha=0.6)
-            for i in range(3):
-                line, = ax_t.plot([], [], color=colors[i], label=f"T{labels[i]}")
-                self.lines[cat]['T'].append(line)
-            ax_t.legend(loc='upper left', fontsize=8)
+        self.fig, self.axs = plt.subplots(4, 2, figsize=(12, 10))
+        self.fig.canvas.manager.set_window_title('CB: Clutch Guided-Blending (F_sync only)')
 
-        # Format X-axis for the bottom row only
-        for col in range(2):
-            self.axs[3, col].set_xlabel("Time (s)")
-            
-        self.fig.tight_layout()
-
-        # ========================================================
-        # --- F_total Window (final published wrench + % breakdown) ---
-        # ========================================================
-        self.fig_tot, self.axs_tot = plt.subplots(5, 1, figsize=(9, 12))
-        self.fig_tot.canvas.manager.set_window_title('Total Wrench (published to device)')
-        colors = ['r', 'g', 'b']
-        labels = ['X', 'Y', 'Z']
-        src_colors = {'Sync': '#1f77b4', 'CBF': '#d62728', 'Guide': '#2ca02c'}
-
-        # Subplot 0: f_total FORCE components + ±MAX_TOTAL_FORCE dashed
-        ax = self.axs_tot[0]
-        ax.set_title("f_total — FORCE components (N)", fontsize=10, fontweight='bold')
-        ax.set_ylabel("Force (N)")
-        ax.grid(True, linestyle='--', alpha=0.6)
-        self.lines_ftot_F = [ax.plot([], [], color=colors[i], label=f"F{labels[i]}")[0] for i in range(3)]
-        ax.axhline( self.MAX_TOTAL_FORCE, color='k', linestyle='--', linewidth=1.0, alpha=0.7, label='±max')
-        ax.axhline(-self.MAX_TOTAL_FORCE, color='k', linestyle='--', linewidth=1.0, alpha=0.7)
-        ax.legend(loc='upper left', fontsize=8, ncol=4)
-
-        # Subplot 1: f_total TORQUE components + ±MAX_TOTAL_TORQUE dashed
-        ax = self.axs_tot[1]
-        ax.set_title("f_total — TORQUE components (Nm)", fontsize=10, fontweight='bold')
-        ax.set_ylabel("Torque (Nm)")
-        ax.grid(True, linestyle='--', alpha=0.6)
-        self.lines_ftot_T = [ax.plot([], [], color=colors[i], label=f"T{labels[i]}")[0] for i in range(3)]
-        ax.axhline( self.MAX_TOTAL_TORQUE, color='k', linestyle='--', linewidth=1.0, alpha=0.7, label='±max')
-        ax.axhline(-self.MAX_TOTAL_TORQUE, color='k', linestyle='--', linewidth=1.0, alpha=0.7)
-        ax.legend(loc='upper left', fontsize=8, ncol=4)
-
-        # Subplot 2: % of FORCE magnitude from each source
-        ax = self.axs_tot[2]
-        ax.set_title("Force contribution share (%)", fontsize=10, fontweight='bold')
-        ax.set_ylabel("%")
-        ax.set_ylim(0, 100)
-        ax.grid(True, linestyle='--', alpha=0.6)
-        self.lines_pctF = {k: ax.plot([], [], color=src_colors[k], label=k)[0]
-                           for k in ['Sync', 'CBF', 'Guide']}
+        # (0,0) F_sync FORCE
+        ax = self.axs[0, 0]
+        ax.set_title("F_sync — FORCE (N)", fontsize=10, fontweight='bold')
+        ax.set_ylabel("N"); ax.grid(True, linestyle='--', alpha=0.6)
+        self.lines_sync_F = [ax.plot([], [], color=colors[i], label=f"F{labels[i]}")[0] for i in range(3)]
+        ax.legend(loc='upper left', fontsize=8, ncol=3)
+        # (0,1) F_sync TORQUE
+        ax = self.axs[0, 1]
+        ax.set_title("F_sync — TORQUE (Nm)", fontsize=10, fontweight='bold')
+        ax.set_ylabel("Nm"); ax.grid(True, linestyle='--', alpha=0.6)
+        self.lines_sync_T = [ax.plot([], [], color=colors[i], label=f"T{labels[i]}")[0] for i in range(3)]
         ax.legend(loc='upper left', fontsize=8, ncol=3)
 
-        # Subplot 3: % of TORQUE magnitude from each source
-        ax = self.axs_tot[3]
-        ax.set_title("Torque contribution share (%)", fontsize=10, fontweight='bold')
-        ax.set_ylabel("%")
-        ax.set_xlabel("Time (s)")
-        ax.set_ylim(0, 100)
-        ax.grid(True, linestyle='--', alpha=0.6)
-        self.lines_pctT = {k: ax.plot([], [], color=src_colors[k], label=k)[0]
-                           for k in ['Sync', 'CBF', 'Guide']}
-        ax.legend(loc='upper left', fontsize=8, ncol=3)
+        # (1,0) Total published FORCE + limits
+        ax = self.axs[1, 0]
+        ax.set_title("Published TOTAL — FORCE (N)", fontsize=10, fontweight='bold')
+        ax.set_ylabel("N"); ax.grid(True, linestyle='--', alpha=0.6)
+        ax.axhline(self.MAX_FORCE, color='k', linestyle='--', linewidth=1.0, alpha=0.6, label='\u00b1max')
+        ax.axhline(-self.MAX_FORCE, color='k', linestyle='--', linewidth=1.0, alpha=0.6)
+        self.lines_tot_F = [ax.plot([], [], color=colors[i], label=f"F{labels[i]}")[0] for i in range(3)]
+        ax.legend(loc='upper left', fontsize=8, ncol=4)
+        # (1,1) Total published TORQUE + limits
+        ax = self.axs[1, 1]
+        ax.set_title("Published TOTAL — TORQUE (Nm)", fontsize=10, fontweight='bold')
+        ax.set_ylabel("Nm"); ax.grid(True, linestyle='--', alpha=0.6)
+        ax.axhline(self.MAX_TORQUE, color='k', linestyle='--', linewidth=1.0, alpha=0.6, label='\u00b1max')
+        ax.axhline(-self.MAX_TORQUE, color='k', linestyle='--', linewidth=1.0, alpha=0.6)
+        self.lines_tot_T = [ax.plot([], [], color=colors[i], label=f"T{labels[i]}")[0] for i in range(3)]
+        ax.legend(loc='upper left', fontsize=8, ncol=4)
 
-        # Subplot 4: Haptic Force Manager own frequency
-        ax = self.axs_tot[4]
-        ax.set_title("Haptic Force Manager Frequency (Hz)", fontsize=10, fontweight='bold')
-        ax.set_ylabel("Hz")
-        ax.set_xlabel("Time (s)")
-        ax.set_ylim(0, 180)
+        # (2,0) Blending authority α
+        ax = self.axs[2, 0]
+        ax.set_title("Blending authority \u03b1 (0=user, 1=policy)", fontsize=10, fontweight='bold')
+        ax.set_ylabel("\u03b1"); ax.set_ylim(-0.05, 1.05)
+        ax.axhline(0.5, color='#888', linestyle=':', linewidth=0.8)
+        ax.grid(True, linestyle='--', alpha=0.6)
+        self.line_alpha, = ax.plot([], [], color='#ff7f0e', linewidth=1.5, label='\u03b1')
+        ax.legend(loc='upper left', fontsize=8)
+        # (2,1) Blended-action share (user % vs policy %)
+        ax = self.axs[2, 1]
+        ax.set_title("Blend share: (1-\u03b1)\u00b7v_user  vs  \u03b1\u00b7v_policy", fontsize=10, fontweight='bold')
+        ax.set_ylabel("%"); ax.set_ylim(-5, 105)
+        ax.grid(True, linestyle='--', alpha=0.6)
+        self.line_user_pct, = ax.plot([], [], color='#1f77b4', linewidth=1.4, label='user %')
+        self.line_policy_pct, = ax.plot([], [], color='#ff7f0e', linewidth=1.4, label='policy %')
+        ax.legend(loc='upper left', fontsize=8, ncol=2)
+
+        # (3,0) Node frequency
+        ax = self.axs[3, 0]
+        ax.set_title("Force Manager Frequency (Hz)", fontsize=10, fontweight='bold')
+        ax.set_ylabel("Hz"); ax.set_xlabel("Time (s)"); ax.set_ylim(0, 180)
         ax.grid(True, linestyle='--', alpha=0.6)
         ax.axhline(150, color='g', linestyle='--', linewidth=1.0, alpha=0.7, label='target 150Hz')
-        self.line_sa_freq, = ax.plot([], [], color='#9467bd', linewidth=1.5, label='HFM freq')
+        self.line_freq, = ax.plot([], [], color='#9467bd', linewidth=1.5, label='HFM freq')
         ax.legend(loc='upper left', fontsize=8)
+        # (3,1) empty
+        self.axs[3, 1].axis('off')
 
-        self.fig_tot.tight_layout()
+        self.fig.tight_layout()
         plt.show(block=False)
 
-
     def update_plot(self):
-        """Safely captures a synchronized data snapshot via thread lock and updates the Matplotlib UI."""
-        # 1. Snapshot the data inside the lock
+        """Snapshot buffers under the lock and refresh the Matplotlib UI."""
         with self.plot_lock:
             if len(self.t_data) == 0:
                 return
             t_list = list(self.t_data)
-            f_lists = {
-                cat: {
-                    'F': [list(self.f_data[cat]['F'][i]) for i in range(3)],
-                    'T': [list(self.f_data[cat]['T'][i]) for i in range(3)]
-                } for cat in ['Sync', 'CBF', 'Guide', 'Limit']
-            }
-            ftot_F = [list(self.ftot_data['F'][i]) for i in range(3)]
-            ftot_T = [list(self.ftot_data['T'][i]) for i in range(3)]
-            pctF = {k: list(self.pct_force[k]) for k in ['Sync', 'CBF', 'Guide']}
-            pctT = {k: list(self.pct_torque[k]) for k in ['Sync', 'CBF', 'Guide']}
+            sF = [list(self.sync_F[i]) for i in range(3)]
+            sT = [list(self.sync_T[i]) for i in range(3)]
+            tF = [list(self.tot_F[i]) for i in range(3)]
+            tT = [list(self.tot_T[i]) for i in range(3)]
+            alpha_list = list(self.alpha_data)
+            upct_list = list(self.user_pct_data)
+            ppct_list = list(self.policy_pct_data)
+            freq_list = list(self._own_freq_data)
 
-        # 2. Update Matplotlib outside the lock to prevent stalling the ROS 2 loop
-        current_t = t_list[-1]
-        win = (current_t - self.plot_window_sec, current_t)
-
-        # --- Superposition window (Sync / CBF / Guide / Limit) ---
-        for row, cat in enumerate(['Sync', 'CBF', 'Guide', 'Limit']):
-            for i in range(3):
-                self.lines[cat]['F'][i].set_data(t_list, f_lists[cat]['F'][i])
-            self.axs[row, 0].set_xlim(*win)
-            self.axs[row, 0].relim()
-            self.axs[row, 0].autoscale_view(scalex=False, scaley=True)
-
-            for i in range(3):
-                self.lines[cat]['T'][i].set_data(t_list, f_lists[cat]['T'][i])
-            self.axs[row, 1].set_xlim(*win)
-            self.axs[row, 1].relim()
-            self.axs[row, 1].autoscale_view(scalex=False, scaley=True)
-
-        # --- F_total window ---
+        win = (t_list[-1] - self.plot_window_sec, t_list[-1])
         for i in range(3):
-            self.lines_ftot_F[i].set_data(t_list, ftot_F[i])
-            self.lines_ftot_T[i].set_data(t_list, ftot_T[i])
-        for k in ['Sync', 'CBF', 'Guide']:
-            self.lines_pctF[k].set_data(t_list, pctF[k])
-            self.lines_pctT[k].set_data(t_list, pctT[k])
+            self.lines_sync_F[i].set_data(t_list, sF[i])
+            self.lines_sync_T[i].set_data(t_list, sT[i])
+            self.lines_tot_F[i].set_data(t_list, tF[i])
+            self.lines_tot_T[i].set_data(t_list, tT[i])
+        for r in range(2):
+            for c in range(2):
+                self.axs[r, c].set_xlim(*win)
+                self.axs[r, c].relim()
+                self.axs[r, c].autoscale_view(scalex=False, scaley=True)
 
-        # Force components: y-range pinned a little beyond the cap for context
-        self.axs_tot[0].set_xlim(*win)
-        self.axs_tot[0].set_ylim(-self.MAX_TOTAL_FORCE * 1.4, self.MAX_TOTAL_FORCE * 1.4)
-        self.axs_tot[1].set_xlim(*win)
-        self.axs_tot[1].set_ylim(-self.MAX_TOTAL_TORQUE * 1.4, self.MAX_TOTAL_TORQUE * 1.4)
-        self.axs_tot[2].set_xlim(*win)
-        self.axs_tot[3].set_xlim(*win)
+        n = min(len(t_list), len(alpha_list))
+        self.line_alpha.set_data(t_list[:n], alpha_list[:n])
+        self.axs[2, 0].set_xlim(*win)
+        n2 = min(len(t_list), len(upct_list), len(ppct_list))
+        self.line_user_pct.set_data(t_list[:n2], upct_list[:n2])
+        self.line_policy_pct.set_data(t_list[:n2], ppct_list[:n2])
+        self.axs[2, 1].set_xlim(*win)
 
-        # Freq subplot (own node frequency)
-        with self.plot_lock:
-            own_freq_list = list(self._own_freq_data)
-        if own_freq_list:
-            # Trim to the minimum length of both arrays to avoid numpy broadcast
-            # mismatch (t_data and _own_freq_data are pushed in the same loop tick
-            # but under a lock that update_plot may snapshot between the two appends).
-            n = min(len(t_list), len(own_freq_list))
-            self.line_sa_freq.set_data(t_list[:n], own_freq_list[:n])
-        self.axs_tot[4].set_xlim(*win)
+        nf = min(len(t_list), len(freq_list))
+        self.line_freq.set_data(t_list[:nf], freq_list[:nf])
+        self.axs[3, 0].set_xlim(*win)
 
-        self.fig_tot.canvas.draw_idle()
-
-        # Flush events once at the very end to update all windows simultaneously
+        self.fig.canvas.draw_idle()
         self.fig.canvas.flush_events()
 
     # =========================
     # CALLBACKS
     # =========================
+    def blend_debug_cb(self, msg):
+        """Process /shared_autonomy/blend_debug: [alpha, v_user(6), v_policy(6), v_blend(6)]."""
+        if len(msg.data) < 13:
+            return
+        a = float(msg.data[0])
+        vu = np.linalg.norm(msg.data[1:7])
+        vp = np.linalg.norm(msg.data[7:13])
+        u_weight = (1.0 - a) * vu
+        p_weight = a * vp
+        total = u_weight + p_weight
+        self._last_blend_alpha = a
+        self._last_blend_user_pct = 100.0 * u_weight / total if total > 1e-9 else 0.0
+        self._last_blend_policy_pct = 100.0 * p_weight / total if total > 1e-9 else 0.0
+
     def haption_pose_cb(self, msg):
         """Updates the real Cartesian orientation of the Virtuose handle."""
-        # Assuming the orientation is a quaternion [x, y, z, w]
         q = msg.pose.orientation
         self.rot_haption = R.from_quat([q.x, q.y, q.z, q.w])
         
@@ -1065,40 +1010,18 @@ class HapticForceManagerCB(Node):
         msg.torque.x, msg.torque.y, msg.torque.z = float(f_total[3]), float(f_total[4]), float(f_total[5])
         self.force_pub.publish(msg)
 
-        # Buffer Data for Plotting (use the SCALED pushers so the % shares reflect
-        # what was actually sent after the adaptive-sync attenuation).
+        # Buffer Data for Plotting (CB: only F_sync is applied; track total + blend).
         t = time.time() - self.start_time
-        guide_comb = f_guide_s + f_fix_s   # guidance share = viscous guide + position fixture
-        components = {'Sync': f_sync, 'CBF': f_cbf_s, 'Guide': guide_comb, 'Limit': f_vib}
-
-        # Per-source contribution share (% of summed component magnitudes).
-        nF = {'Sync': np.linalg.norm(f_sync[0:3]),
-              'CBF':  np.linalg.norm(f_cbf[0:3]),
-              'Guide': np.linalg.norm(guide_comb[0:3])}
-        nT = {'Sync': np.linalg.norm(f_sync[3:6]),
-              'CBF':  np.linalg.norm(f_cbf[3:6]),
-              'Guide': np.linalg.norm(guide_comb[3:6])}
-        sF = sum(nF.values())
-        sT = sum(nT.values())
-
-        # Lock the buffer modification to prevent matplotlib from reading a partially updated structure
         with self.plot_lock:
             self.t_data.append(t)
-            # Per-component wrench (Superposition window)
-            for cat, force_vec in components.items():
-                for i in range(3):
-                    self.f_data[cat]['F'][i].append(force_vec[i])
-                    self.f_data[cat]['T'][i].append(force_vec[i + 3])
-            # Final published total wrench (F_total window)
             for i in range(3):
-                self.ftot_data['F'][i].append(f_total[i])
-                self.ftot_data['T'][i].append(f_total[i + 3])
-            # Contribution shares (%)
-            for k in ['Sync', 'CBF', 'Guide']:
-                self.pct_force[k].append(100.0 * nF[k] / sF if sF > 1e-9 else 0.0)
-                self.pct_torque[k].append(100.0 * nT[k] / sT if sT > 1e-9 else 0.0)
-            # SA inference frequency (unchanged — still tracked from goal_probs)
-            self._sa_freq_data.append(self._sa_freq_lpf)
+                self.sync_F[i].append(f_sync[i])
+                self.sync_T[i].append(f_sync[i + 3])
+                self.tot_F[i].append(f_total[i])
+                self.tot_T[i].append(f_total[i + 3])
+            self.alpha_data.append(self._last_blend_alpha)
+            self.user_pct_data.append(self._last_blend_user_pct)
+            self.policy_pct_data.append(self._last_blend_policy_pct)
             # Own node frequency
             now = time.time()
             if self._own_last_time is not None:
