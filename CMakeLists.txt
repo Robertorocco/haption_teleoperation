@@ -97,6 +97,7 @@ install(PROGRAMS
   # C=CLUTCH / J=JOYSTICK (control mode), F=ASSIST_FEEDBACK, B=ASSIST_BLENDING.
   scripts/haptic_force_manager_C.py
   scripts/haptic_force_manager_CF.py
+  scripts/haptic_force_manager_CB.py
   scripts/haptic_force_manager_CFB.py
   scripts/haptic_force_manager_J.py
   scripts/haptic_force_manager_JB.py
