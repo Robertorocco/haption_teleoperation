@@ -9,7 +9,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 import time
 from collections import deque
-from geometry_msgs.msg import PoseStamped #
+from geometry_msgs.msg import Pose  # server publishes geometry_msgs/Pose on virtuose/pose
 import matplotlib.pyplot as plt
 import matplotlib
 
@@ -197,9 +197,9 @@ class HapticForceManager(Node):
         self._vib_clutch_prev = False   # previous clutch state (for cycle edge detect)
 
         # --- Tunable Force Parameters ---
-        self.Kp_sync = 10.0#15.0  
+        self.Kp_sync = 30.0      # N/m    [UNIFIED across all clutch cells: same sync spring everywhere]
         self.Kd_sync = 0.0  #if global damping is added, set this to 0 to avoid overdamping
-        self.Kp_sync_ang = 0.3   # Nm/rad — orientation sync spring (handle -> real EE orientation)
+        self.Kp_sync_ang = 0.9   # Nm/rad [UNIFIED: orientation sync spring (handle -> real EE orientation)]
 
         # --- Adaptive sync authority (anti reference-runaway) ---
         # When the cartesian REFERENCE drifts far from the REAL EE (the robot can't
@@ -242,8 +242,8 @@ class HapticForceManager(Node):
         # is scaled down proportionally — so the relative contribution proportions
         # are preserved, but the autonomy can never overpower the operator. Tune
         # these to set "how much the assistance is allowed to push".
-        self.MAX_TOTAL_FORCE  = 7.2   # N  [+20% again: max appliable assistive force]
-        self.MAX_TOTAL_TORQUE = 0.576 # Nm [+20% again: max appliable assistive torque]
+        self.MAX_TOTAL_FORCE  = 10.0  # N  [UNIFIED cap = device clip, same everywhere]
+        self.MAX_TOTAL_TORQUE = 1.0   # Nm [UNIFIED cap = device clip, same everywhere]
 
         # --- Data Buffers & Synchronization ---
         self.plot_lock = threading.Lock()
@@ -287,7 +287,7 @@ class HapticForceManager(Node):
         self.create_subscription(Float64MultiArray, 'virtuose/articular_position', self.joint_cb, 10)
         #self.create_subscription(Float64MultiArray, '/shared_autonomy/assistive_reference', self.assist_cb, 10)
         self.create_subscription(Bool, 'virtuose/button_right', self.button_cb, 10)
-        self.create_subscription(PoseStamped, 'virtuose/pose', self.haption_pose_cb, 10)
+        self.create_subscription(Pose, 'virtuose/pose', self.haption_pose_cb, 10)
         #Unified Inference State Subscribers
         self.create_subscription(String, '/shared_autonomy/goal_names', self.goal_names_cb, 10)
         self.create_subscription(Float64MultiArray, '/shared_autonomy/goal_probabilities', self.goal_probs_cb, 10)
@@ -491,8 +491,10 @@ class HapticForceManager(Node):
     # =========================
     def haption_pose_cb(self, msg):
         """Updates the real Cartesian orientation of the Virtuose handle."""
-        # Assuming the orientation is a quaternion [x, y, z, w]
-        q = msg.pose.orientation
+        # Server publishes geometry_msgs/Pose (NOT PoseStamped) -> read .orientation
+        # directly. The former PoseStamped subscription silently never matched the
+        # publisher, so rot_haption stayed None and the clutch alignment was dead.
+        q = msg.orientation
         self.rot_haption = R.from_quat([q.x, q.y, q.z, q.w])
         
     def button_cb(self, msg):
@@ -1033,14 +1035,13 @@ class HapticForceManager(Node):
             f_total = f_total_normal
             self.was_clutching_last_frame = False
 
-        # GLOBAL DAMPING + DYNAMIC CBF-AWARE DAMPING ON GUIDANCE.
+        # GLOBAL VISCOUS DAMPING (impedance-device stability).
+        # UNIFIED: CONSTANT 0.7 / 0.1 in all clutch cells (same as C). The former
+        # CBF-aware damp_scale (1.0 -> 2.0 with lambda_cbf_f) was removed so the
+        # damping felt by the operator is identical across every clutch condition.
         if not self.DEBUG_ONLY_GUIDE:
-            Kd_base_lin = 0.7
-            Kd_base_ang = 0.1
-            damp_scale = 1.0 + float(np.clip(self.lambda_cbf_f / 10.0, 0.0, 1.0))  # 1.0 -> 2.0
-            Kd_global_lin = Kd_base_lin * damp_scale
-            Kd_global_ang = Kd_base_ang * damp_scale
-            
+            Kd_global_lin = 0.7
+            Kd_global_ang = 0.1
             f_total[0:3] -= Kd_global_lin * self.vel_haption[0:3]
             f_total[3:6] -= Kd_global_ang * self.vel_haption[3:6]
 

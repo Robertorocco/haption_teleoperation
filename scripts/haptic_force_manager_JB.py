@@ -95,6 +95,9 @@ class HapticForceManagerBlending(Node):
         self.create_subscription(Twist, 'virtuose/velocity', self.vel_cb, 10)
         self.create_subscription(
             Float64MultiArray, cfg.JOYSTICK_HOME_POSE_TOPIC, self.home_pose_cb, 10)
+        # Blending telemetry: [alpha, v_user(6), v_policy(6), v_blend(6)] = 19 floats.
+        self.create_subscription(
+            Float64MultiArray, '/shared_autonomy/blend_debug', self.blend_debug_cb, 10)
 
         # --- Publisher ---
         self.force_pub = self.create_publisher(Wrench, 'virtuose/force_cmd', 10)
@@ -112,6 +115,15 @@ class HapticForceManagerBlending(Node):
         self._freq_data = deque(maxlen=self.buffer_size)
         self._last_time = None
         self._freq_lpf = 0.0
+
+        # --- Blending telemetry (from /shared_autonomy/blend_debug), identical to
+        #     the CB manager so every B=1 cell reports the same alpha + share. ---
+        self.alpha_data = deque(maxlen=self.buffer_size)
+        self.user_pct_data = deque(maxlen=self.buffer_size)
+        self.policy_pct_data = deque(maxlen=self.buffer_size)
+        self._last_blend_alpha = 0.0
+        self._last_blend_user_pct = 0.0
+        self._last_blend_policy_pct = 0.0
 
         self.dt = 1.0 / 150.0
         self.timer = self.create_timer(self.dt, self.control_loop)
@@ -140,6 +152,20 @@ class HapticForceManagerBlending(Node):
         if len(msg.data) >= 7:
             self.home_pos = np.array(msg.data[0:3])
             self.home_rot = R.from_quat(np.array(msg.data[3:7]))
+
+    def blend_debug_cb(self, msg):
+        """Process /shared_autonomy/blend_debug: [alpha, v_user(6), v_policy(6), v_blend(6)]."""
+        if len(msg.data) < 13:
+            return
+        a = float(msg.data[0])
+        vu = np.linalg.norm(msg.data[1:7])
+        vp = np.linalg.norm(msg.data[7:13])
+        u_weight = (1.0 - a) * vu
+        p_weight = a * vp
+        total = u_weight + p_weight
+        self._last_blend_alpha = a
+        self._last_blend_user_pct = 100.0 * u_weight / total if total > 1e-9 else 0.0
+        self._last_blend_policy_pct = 100.0 * p_weight / total if total > 1e-9 else 0.0
 
     # ------------------------------------------------------------------ force
     def compute_spring(self):
@@ -203,6 +229,9 @@ class HapticForceManagerBlending(Node):
                     self._freq_lpf = 0.9 * self._freq_lpf + 0.1 * (1.0 / d)
             self._last_time = now
             self._freq_data.append(self._freq_lpf)
+            self.alpha_data.append(self._last_blend_alpha)
+            self.user_pct_data.append(self._last_blend_user_pct)
+            self.policy_pct_data.append(self._last_blend_policy_pct)
 
     # ------------------------------------------------------------------ plotting
     def setup_plot(self):
@@ -253,6 +282,27 @@ class HapticForceManagerBlending(Node):
         ax.legend(loc='upper left', fontsize=8)
         self.fig2.tight_layout()
 
+        # Window 3: BLENDING telemetry (identical to the CB manager). alpha =
+        # reference-level user<->policy authority; share = how much of the blended
+        # twist magnitude came from the user vs the policy.
+        self.fig3, self.axs3 = plt.subplots(2, 1, figsize=(10, 5))
+        self.fig3.canvas.manager.set_window_title('Blending Telemetry')
+        ax = self.axs3[0]
+        ax.set_title("Blending authority \u03b1 (0=user, 1=policy)", fontsize=10, fontweight='bold')
+        ax.set_ylabel("\u03b1"); ax.set_ylim(-0.05, 1.05)
+        ax.axhline(0.5, color='#888', linestyle=':', linewidth=0.8)
+        ax.grid(True, linestyle='--', alpha=0.6)
+        self.line_alpha, = ax.plot([], [], color='#ff7f0e', linewidth=1.5, label='\u03b1')
+        ax.legend(loc='upper left', fontsize=8)
+        ax = self.axs3[1]
+        ax.set_title("Blend share: (1-\u03b1)\u00b7v_user  vs  \u03b1\u00b7v_policy", fontsize=10, fontweight='bold')
+        ax.set_ylabel("%"); ax.set_xlabel("Time (s)"); ax.set_ylim(-5, 105)
+        ax.grid(True, linestyle='--', alpha=0.6)
+        self.line_user_pct, = ax.plot([], [], color='#1f77b4', linewidth=1.4, label='user %')
+        self.line_policy_pct, = ax.plot([], [], color='#ff7f0e', linewidth=1.4, label='policy %')
+        ax.legend(loc='upper left', fontsize=8, ncol=2)
+        self.fig3.tight_layout()
+
         plt.show(block=False)
 
     def update_plot(self):
@@ -265,6 +315,9 @@ class HapticForceManagerBlending(Node):
             pos_err = list(self.pos_err_data)
             ang_err = list(self.ang_err_data)
             freq = list(self._freq_data)
+            alpha_list = list(self.alpha_data)
+            upct_list = list(self.user_pct_data)
+            ppct_list = list(self.policy_pct_data)
 
         win = (t_list[-1] - self.plot_window_sec, t_list[-1])
         for i in range(3):
@@ -285,8 +338,17 @@ class HapticForceManagerBlending(Node):
         self.line_freq.set_data(t_list[:nf], freq[:nf])
         self.axs2[1].set_xlim(*win)
 
+        na = min(len(t_list), len(alpha_list))
+        self.line_alpha.set_data(t_list[:na], alpha_list[:na])
+        self.axs3[0].set_xlim(*win)
+        ns = min(len(t_list), len(upct_list), len(ppct_list))
+        self.line_user_pct.set_data(t_list[:ns], upct_list[:ns])
+        self.line_policy_pct.set_data(t_list[:ns], ppct_list[:ns])
+        self.axs3[1].set_xlim(*win)
+
         self.fig1.canvas.draw_idle()
         self.fig2.canvas.draw_idle()
+        self.fig3.canvas.draw_idle()
         self.fig1.canvas.flush_events()
 
 

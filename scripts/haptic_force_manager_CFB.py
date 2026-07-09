@@ -9,7 +9,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 import time
 from collections import deque
-from geometry_msgs.msg import PoseStamped #
+from geometry_msgs.msg import Pose  # server publishes geometry_msgs/Pose on virtuose/pose
 import matplotlib.pyplot as plt
 import matplotlib
 
@@ -201,9 +201,9 @@ class HapticForceManagerFull(Node):
         self._vib_clutch_prev = False   # previous clutch state (for cycle edge detect)
 
         # --- Tunable Force Parameters ---
-        self.Kp_sync = 10.0#15.0  
+        self.Kp_sync = 30.0      # N/m    [UNIFIED across all clutch cells: same sync spring everywhere]
         self.Kd_sync = 0.0  #if global damping is added, set this to 0 to avoid overdamping
-        self.Kp_sync_ang = 0.3   # Nm/rad — orientation sync spring (handle -> real EE orientation)
+        self.Kp_sync_ang = 0.9   # Nm/rad [UNIFIED: orientation sync spring (handle -> real EE orientation)]
 
         # --- Adaptive sync authority (anti reference-runaway) ---
         # When the cartesian REFERENCE drifts far from the REAL EE (the robot can't
@@ -246,8 +246,8 @@ class HapticForceManagerFull(Node):
         # is scaled down proportionally — so the relative contribution proportions
         # are preserved, but the autonomy can never overpower the operator. Tune
         # these to set "how much the assistance is allowed to push".
-        self.MAX_TOTAL_FORCE  = 7.2   # N  [+20% again: max appliable assistive force]
-        self.MAX_TOTAL_TORQUE = 0.576 # Nm [+20% again: max appliable assistive torque]
+        self.MAX_TOTAL_FORCE  = 10.0  # N  [UNIFIED cap = device clip, same everywhere]
+        self.MAX_TOTAL_TORQUE = 1.0   # Nm [UNIFIED cap = device clip, same everywhere]
 
         # --- Data Buffers & Synchronization ---
         self.plot_lock = threading.Lock()
@@ -283,6 +283,16 @@ class HapticForceManagerFull(Node):
         self._own_freq_data = deque(maxlen=self.buffer_size)
         self._own_last_time = None
         self._own_freq_lpf = 0.0
+
+        # --- Blending telemetry (from /shared_autonomy/blend_debug), identical to
+        #     the CB manager so every B=1 cell reports the same alpha + share. ---
+        self.alpha_data = deque(maxlen=self.buffer_size)
+        self.user_pct_data = deque(maxlen=self.buffer_size)
+        self.policy_pct_data = deque(maxlen=self.buffer_size)
+        self._last_blend_alpha = 0.0
+        self._last_blend_user_pct = 0.0
+        self._last_blend_policy_pct = 0.0
+
         self.create_subscription(Float64MultiArray, '/arm_right/cartesian_reference', self.target_cb, 10)
         self.create_subscription(Float64MultiArray, '/qp_debug/ee_real', self.real_cb, 10)
         self.create_subscription(Twist, 'virtuose/velocity', self.vel_cb, 10)
@@ -291,7 +301,7 @@ class HapticForceManagerFull(Node):
         self.create_subscription(Float64MultiArray, 'virtuose/articular_position', self.joint_cb, 10)
         #self.create_subscription(Float64MultiArray, '/shared_autonomy/assistive_reference', self.assist_cb, 10)
         self.create_subscription(Bool, 'virtuose/button_right', self.button_cb, 10)
-        self.create_subscription(PoseStamped, 'virtuose/pose', self.haption_pose_cb, 10)
+        self.create_subscription(Pose, 'virtuose/pose', self.haption_pose_cb, 10)
         #Unified Inference State Subscribers
         self.create_subscription(String, '/shared_autonomy/goal_names', self.goal_names_cb, 10)
         self.create_subscription(Float64MultiArray, '/shared_autonomy/goal_probabilities', self.goal_probs_cb, 10)
@@ -304,6 +314,8 @@ class HapticForceManagerFull(Node):
         self.active_arm = 'right'
         self.create_subscription(String, '/shared_autonomy/active_arm', self.active_arm_cb, 10)
         self.create_subscription(Float64MultiArray, '/arm_left/cartesian_reference', self.target_cb_left, 10)
+        # Blending telemetry: [alpha, v_user(6), v_policy(6), v_blend(6)] = 19 floats.
+        self.create_subscription(Float64MultiArray, '/shared_autonomy/blend_debug', self.blend_debug_cb, 10)
         
         self.force_pub = self.create_publisher(Wrench, 'virtuose/force_cmd', 10)
 
@@ -419,6 +431,26 @@ class HapticForceManagerFull(Node):
         ax.legend(loc='upper left', fontsize=8)
 
         self.fig_tot.tight_layout()
+
+        # --- Window 3: BLENDING telemetry (identical to the CB manager) ---------
+        self.fig_bl, self.axs_bl = plt.subplots(2, 1, figsize=(10, 5))
+        self.fig_bl.canvas.manager.set_window_title('Blending Telemetry')
+        ax = self.axs_bl[0]
+        ax.set_title("Blending authority \u03b1 (0=user, 1=policy)", fontsize=10, fontweight='bold')
+        ax.set_ylabel("\u03b1"); ax.set_ylim(-0.05, 1.05)
+        ax.axhline(0.5, color='#888', linestyle=':', linewidth=0.8)
+        ax.grid(True, linestyle='--', alpha=0.6)
+        self.line_alpha, = ax.plot([], [], color='#ff7f0e', linewidth=1.5, label='\u03b1')
+        ax.legend(loc='upper left', fontsize=8)
+        ax = self.axs_bl[1]
+        ax.set_title("Blend share: (1-\u03b1)\u00b7v_user  vs  \u03b1\u00b7v_policy", fontsize=10, fontweight='bold')
+        ax.set_ylabel("%"); ax.set_xlabel("Time (s)"); ax.set_ylim(-5, 105)
+        ax.grid(True, linestyle='--', alpha=0.6)
+        self.line_user_pct, = ax.plot([], [], color='#1f77b4', linewidth=1.4, label='user %')
+        self.line_policy_pct, = ax.plot([], [], color='#ff7f0e', linewidth=1.4, label='policy %')
+        ax.legend(loc='upper left', fontsize=8, ncol=2)
+        self.fig_bl.tight_layout()
+
         plt.show(block=False)
 
 
@@ -439,6 +471,9 @@ class HapticForceManagerFull(Node):
             ftot_T = [list(self.ftot_data['T'][i]) for i in range(3)]
             pctF = {k: list(self.pct_force[k]) for k in ['Sync', 'CBF', 'Guide']}
             pctT = {k: list(self.pct_torque[k]) for k in ['Sync', 'CBF', 'Guide']}
+            alpha_list = list(self.alpha_data)
+            upct_list = list(self.user_pct_data)
+            ppct_list = list(self.policy_pct_data)
 
         # 2. Update Matplotlib outside the lock to prevent stalling the ROS 2 loop
         current_t = t_list[-1]
@@ -487,6 +522,16 @@ class HapticForceManagerFull(Node):
 
         self.fig_tot.canvas.draw_idle()
 
+        # --- Blending window ---
+        na = min(len(t_list), len(alpha_list))
+        self.line_alpha.set_data(t_list[:na], alpha_list[:na])
+        self.axs_bl[0].set_xlim(*win)
+        ns = min(len(t_list), len(upct_list), len(ppct_list))
+        self.line_user_pct.set_data(t_list[:ns], upct_list[:ns])
+        self.line_policy_pct.set_data(t_list[:ns], ppct_list[:ns])
+        self.axs_bl[1].set_xlim(*win)
+        self.fig_bl.canvas.draw_idle()
+
         # Flush events once at the very end to update all windows simultaneously
         self.fig.canvas.flush_events()
 
@@ -495,8 +540,10 @@ class HapticForceManagerFull(Node):
     # =========================
     def haption_pose_cb(self, msg):
         """Updates the real Cartesian orientation of the Virtuose handle."""
-        # Assuming the orientation is a quaternion [x, y, z, w]
-        q = msg.pose.orientation
+        # Server publishes geometry_msgs/Pose (NOT PoseStamped) -> read .orientation
+        # directly. The former PoseStamped subscription silently never matched the
+        # publisher, so rot_haption stayed None and the clutch alignment was dead.
+        q = msg.orientation
         self.rot_haption = R.from_quat([q.x, q.y, q.z, q.w])
         
     def button_cb(self, msg):
@@ -529,6 +576,20 @@ class HapticForceManagerFull(Node):
     def grasp_active_cb(self, msg):
         """Tracks whether the shared-autonomy node is autonomously driving a grasp."""
         self.grasp_active = bool(msg.data)
+
+    def blend_debug_cb(self, msg):
+        """Process /shared_autonomy/blend_debug: [alpha, v_user(6), v_policy(6), v_blend(6)]."""
+        if len(msg.data) < 13:
+            return
+        a = float(msg.data[0])
+        vu = np.linalg.norm(msg.data[1:7])
+        vp = np.linalg.norm(msg.data[7:13])
+        u_weight = (1.0 - a) * vu
+        p_weight = a * vp
+        total = u_weight + p_weight
+        self._last_blend_alpha = a
+        self._last_blend_user_pct = 100.0 * u_weight / total if total > 1e-9 else 0.0
+        self._last_blend_policy_pct = 100.0 * p_weight / total if total > 1e-9 else 0.0
 
     def active_arm_cb(self, msg):
         """Switches which arm's EE data is used for force computation."""
@@ -1037,14 +1098,13 @@ class HapticForceManagerFull(Node):
             f_total = f_total_normal
             self.was_clutching_last_frame = False
 
-        # GLOBAL DAMPING + DYNAMIC CBF-AWARE DAMPING ON GUIDANCE.
+        # GLOBAL VISCOUS DAMPING (impedance-device stability).
+        # UNIFIED: CONSTANT 0.7 / 0.1 in all clutch cells (same as C). The former
+        # CBF-aware damp_scale (1.0 -> 2.0 with lambda_cbf_f) was removed so the
+        # damping felt by the operator is identical across every clutch condition.
         if not self.DEBUG_ONLY_GUIDE:
-            Kd_base_lin = 0.7
-            Kd_base_ang = 0.1
-            damp_scale = 1.0 + float(np.clip(self.lambda_cbf_f / 10.0, 0.0, 1.0))  # 1.0 -> 2.0
-            Kd_global_lin = Kd_base_lin * damp_scale
-            Kd_global_ang = Kd_base_ang * damp_scale
-            
+            Kd_global_lin = 0.7
+            Kd_global_ang = 0.1
             f_total[0:3] -= Kd_global_lin * self.vel_haption[0:3]
             f_total[3:6] -= Kd_global_ang * self.vel_haption[3:6]
 
@@ -1107,6 +1167,10 @@ class HapticForceManagerFull(Node):
                     self._own_freq_lpf = 0.9 * self._own_freq_lpf + 0.1 * (1.0 / dt_own)
             self._own_last_time = now
             self._own_freq_data.append(self._own_freq_lpf)
+            # Blending telemetry
+            self.alpha_data.append(self._last_blend_alpha)
+            self.user_pct_data.append(self._last_blend_user_pct)
+            self.policy_pct_data.append(self._last_blend_policy_pct)
 
 def main(args=None):
     """Initializes ROS, spins the node on a daemon thread, and drives Matplotlib updates safely on the main thread."""

@@ -39,7 +39,7 @@ Removed vs the tutorial (this is a NO-GUIDANCE baseline):
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Wrench, Twist
+from geometry_msgs.msg import Wrench, Twist, Pose
 from std_msgs.msg import Bool, Float64MultiArray, String
 import threading
 import numpy as np
@@ -94,10 +94,15 @@ class HapticForceManagerNoGuidance(Node):
         self.GRASP_FOLLOW_KP = 30.0     # N/m   position tether toward the current EE
         self.GRASP_FOLLOW_KD = 160.0    # Ns/m  velocity-following (direction/speed of travel)
 
-        # --- Clutching (freeze wrench at 50% on press; NO alignment guidance) ---
+        # --- Clutching (freeze wrench at 50% on press + orientation alignment) ---
         self.is_clutching = False
         self.was_clutching_last_frame = False
         self.f_clutch_frozen = np.zeros(6)
+        # Clutch orientation-alignment torque: UNIFIED across all clutch cells and
+        # treated as a SYNC effect (help the operator re-align the handle to the EE
+        # reference while clutching), so it is present in the baseline too.
+        self.rot_haption = None
+        self.K_align = 10.0  # Nm/rad — clutch orientation-alignment stiffness
 
         # --- Global viscous damping (impedance-device stability, same as tutorial) ---
         self.Kd_global_lin = 0.7   # Ns/m
@@ -165,6 +170,8 @@ class HapticForceManagerNoGuidance(Node):
         self.create_subscription(String, '/shared_autonomy/active_arm', self.active_arm_cb, 10)
         # Haption joint encoders for the joint-limit clutch-advice vibration.
         self.create_subscription(Float64MultiArray, 'virtuose/articular_position', self.joint_cb, 10)
+        # Handle orientation for the clutch alignment torque (same as CF/CB/CFB).
+        self.create_subscription(Pose, 'virtuose/pose', self.haption_pose_cb, 10)
 
         self.force_pub = self.create_publisher(Wrench, 'virtuose/force_cmd', 10)
 
@@ -274,6 +281,11 @@ class HapticForceManagerNoGuidance(Node):
     # =========================
     # CALLBACKS
     # =========================
+    def haption_pose_cb(self, msg):
+        """Handle orientation (geometry_msgs/Pose) for the clutch alignment torque."""
+        q = msg.orientation
+        self.rot_haption = R.from_quat([q.x, q.y, q.z, q.w])
+
     def button_cb(self, msg):
         """Updates the clutching state from the Virtuose button."""
         self.is_clutching = msg.data
@@ -441,6 +453,24 @@ class HapticForceManagerNoGuidance(Node):
                 self.f_clutch_frozen = f_total_normal / 2.0
                 self.was_clutching_last_frame = True
             f_total = self.f_clutch_frozen.copy()
+
+            # Clutch orientation-alignment torque (UNIFIED with CF/CB/CFB, treated
+            # as a sync effect): pull the HANDLE orientation toward the target
+            # orientation, faded to zero near a Haption joint limit.
+            if self.rot_haption is not None and self.rot_target is not None:
+                error_rot_matrix = self.rot_target.as_matrix() @ self.rot_haption.as_matrix().T
+                error_rot_vec = R.from_matrix(error_rot_matrix).as_rotvec()
+                tau_align_base = self.K_align * error_rot_vec
+                tau_align_haption = np.array([
+                    -tau_align_base[0], -tau_align_base[1], tau_align_base[2]])
+                dist_to_min = self.joint_pos - self.joint_min
+                dist_to_max = self.joint_max - self.joint_pos
+                min_margin = np.min(np.concatenate([dist_to_min, dist_to_max]))
+                fade_margin = 0.35
+                if min_margin < fade_margin:
+                    scale = max(0.0, min_margin / fade_margin)
+                    tau_align_haption *= scale
+                f_total[3:6] += tau_align_haption
         else:
             f_total = f_total_normal
             self.was_clutching_last_frame = False

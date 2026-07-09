@@ -153,6 +153,9 @@ class HapticForceManagerJFB(Node):
         self.create_subscription(Float64MultiArray, '/arm_right/cartesian_reference', self.target_cb, 10)
         self.create_subscription(Float64MultiArray, '/arm_left/cartesian_reference', self.target_cb_left, 10)
         self.create_subscription(String, '/shared_autonomy/active_arm', self.active_arm_cb, 10)
+        # Blending telemetry: [alpha, v_user(6), v_policy(6), v_blend(6)] = 19 floats.
+        self.create_subscription(
+            Float64MultiArray, '/shared_autonomy/blend_debug', self.blend_debug_cb, 10)
 
         # --- Publisher ---
         self.force_pub = self.create_publisher(Wrench, 'virtuose/force_cmd', 10)
@@ -167,6 +170,15 @@ class HapticForceManagerJFB(Node):
         self.fg_data = [deque(maxlen=self.buffer_size) for _ in range(6)]  # guide wrench
         self.pos_err_data = deque(maxlen=self.buffer_size)  # ||home_pos - handle_pos|| (deadzone plot)
         self.ang_err_data = deque(maxlen=self.buffer_size)  # geodesic home<->handle    (deadzone plot)
+
+        # --- Blending telemetry (from /shared_autonomy/blend_debug), identical to
+        #     the CB manager so every B=1 cell reports the same alpha + share. ---
+        self.alpha_data = deque(maxlen=self.buffer_size)
+        self.user_pct_data = deque(maxlen=self.buffer_size)
+        self.policy_pct_data = deque(maxlen=self.buffer_size)
+        self._last_blend_alpha = 0.0
+        self._last_blend_user_pct = 0.0
+        self._last_blend_policy_pct = 0.0
 
         self.dt = 1.0 / 150.0
         self.timer = self.create_timer(self.dt, self.control_loop)
@@ -232,6 +244,20 @@ class HapticForceManagerJFB(Node):
             self.active_arm = msg.data
             self.get_logger().info(f"[HFM-JFB] Active arm switched to {msg.data.upper()}")
 
+    def blend_debug_cb(self, msg):
+        """Process /shared_autonomy/blend_debug: [alpha, v_user(6), v_policy(6), v_blend(6)]."""
+        if len(msg.data) < 13:
+            return
+        a = float(msg.data[0])
+        vu = np.linalg.norm(msg.data[1:7])
+        vp = np.linalg.norm(msg.data[7:13])
+        u_weight = (1.0 - a) * vu
+        p_weight = a * vp
+        total = u_weight + p_weight
+        self._last_blend_alpha = a
+        self._last_blend_user_pct = 100.0 * u_weight / total if total > 1e-9 else 0.0
+        self._last_blend_policy_pct = 100.0 * p_weight / total if total > 1e-9 else 0.0
+
     # ------------------------------------------------------------------ helpers
     def _smoothstep(self, p, lo, hi):
         """C1-continuous ramp from 0 at p=lo to 1 at p=hi."""
@@ -271,7 +297,7 @@ class HapticForceManagerJFB(Node):
           * gain applied AFTER the tanh (linear 'fraction of the exit force'), so
             gain=1 exits the deadband and gain<1 only biases inside it;
           * confidence gate uses b_max (active-goal belief) not the entropy measure;
-          * proximity gate ramps over [GUIDE_PROX_NEAR, GUIDE_PROX_FAR] = [0.10, 0.30] m.
+          * proximity gate ramps over [GUIDE_PROX_NEAR, GUIDE_PROX_FAR] = [0.10, 0.60] m.
         """
         n_goals = len(self.goal_names) if self.goal_names else 0
         n_policies = len(self.user_policies)
@@ -292,7 +318,7 @@ class HapticForceManagerJFB(Node):
 
         # Proximity gate: distance from the (blended) REFERENCE to the active goal.
         # Full at/below NEAR, dead at/beyond FAR (smoothstep between). Same formula
-        # as CFB, only the FAR threshold is tightened (1.0 -> 0.30 m).
+        # as CFB (now unified to the same [0.10, 0.60] m margins).
         if self.fix_goal_pos is not None and self.pos_target is not None:
             d_goal = float(np.linalg.norm(self.fix_goal_pos - self.pos_target))
             prox = np.clip(
@@ -372,6 +398,9 @@ class HapticForceManagerJFB(Node):
                 self.fg_data[i].append(f_guide[i])
             self.pos_err_data.append(pos_err)
             self.ang_err_data.append(ang_err)
+            self.alpha_data.append(self._last_blend_alpha)
+            self.user_pct_data.append(self._last_blend_user_pct)
+            self.policy_pct_data.append(self._last_blend_policy_pct)
 
     # ------------------------------------------------------------------ plotting
     def setup_plot(self):
@@ -415,6 +444,25 @@ class HapticForceManagerJFB(Node):
         ax.legend(loc='upper left', fontsize=8, ncol=3)
         self.fig_sh.tight_layout()
 
+        # --- Window 3: BLENDING telemetry (identical to the CB manager) ---------
+        self.fig_bl, self.axs_bl = plt.subplots(2, 1, figsize=(10, 5))
+        self.fig_bl.canvas.manager.set_window_title('JFB: Blending telemetry')
+        ax = self.axs_bl[0]
+        ax.set_title("Blending authority \u03b1 (0=user, 1=policy)", fontsize=10, fontweight='bold')
+        ax.set_ylabel("\u03b1"); ax.set_ylim(-0.05, 1.05)
+        ax.axhline(0.5, color='#888', linestyle=':', linewidth=0.8)
+        ax.grid(True, linestyle='--', alpha=0.6)
+        self.line_alpha, = ax.plot([], [], color='#ff7f0e', linewidth=1.5, label='\u03b1')
+        ax.legend(loc='upper left', fontsize=8)
+        ax = self.axs_bl[1]
+        ax.set_title("Blend share: (1-\u03b1)\u00b7v_user  vs  \u03b1\u00b7v_policy", fontsize=10, fontweight='bold')
+        ax.set_ylabel("%"); ax.set_xlabel("Time (s)"); ax.set_ylim(-5, 105)
+        ax.grid(True, linestyle='--', alpha=0.6)
+        self.line_user_pct, = ax.plot([], [], color='#1f77b4', linewidth=1.4, label='user %')
+        self.line_policy_pct, = ax.plot([], [], color='#ff7f0e', linewidth=1.4, label='policy %')
+        ax.legend(loc='upper left', fontsize=8, ncol=2)
+        self.fig_bl.tight_layout()
+
         plt.show(block=False)
 
     def update_plot(self):
@@ -426,6 +474,9 @@ class HapticForceManagerJFB(Node):
             fg = [list(self.fg_data[i]) for i in range(6)]
             pos_err = list(self.pos_err_data)
             ang_err = list(self.ang_err_data)
+            alpha_list = list(self.alpha_data)
+            upct_list = list(self.user_pct_data)
+            ppct_list = list(self.policy_pct_data)
 
         n = min([len(t)] + [len(x) for x in fh] + [len(x) for x in fg]
                 + [len(pos_err), len(ang_err)])
@@ -459,8 +510,18 @@ class HapticForceManagerJFB(Node):
         for ax in self.axs_sh:
             ax.set_xlim(*win)
 
+        # Blending window.
+        na = min(len(t), len(alpha_list))
+        self.line_alpha.set_data(t[:na], alpha_list[:na])
+        self.axs_bl[0].set_xlim(*win)
+        ns = min(len(t), len(upct_list), len(ppct_list))
+        self.line_user_pct.set_data(t[:ns], upct_list[:ns])
+        self.line_policy_pct.set_data(t[:ns], ppct_list[:ns])
+        self.axs_bl[1].set_xlim(*win)
+
         self.fig_dz.canvas.draw_idle()
         self.fig_sh.canvas.draw_idle()
+        self.fig_bl.canvas.draw_idle()
         self.fig_dz.canvas.flush_events()
 
 
