@@ -33,7 +33,7 @@ haption_teleoperation/
     ├── haptic_force_manager_CB.py   CLUTCH guided-bld   (F=0,B=1): reference blending only, F_sync tether (copy of CFB, guidance deleted)
     ├── haptic_force_manager_CFB.py  CLUTCH full-guid    (F=1,B=1): VF forces (same weights as F=1,B=0) + reference blending
     ├── haptic_force_manager_J.py    JOYSTICK sync-only  (F=0,B=0): centering spring + orientation-sync + vibration cue
-    ├── haptic_force_manager_JF.py   JOYSTICK guided-fb  (F=1,B=0): centering spring + F_guide, no blending (TO IMPLEMENT)
+    ├── haptic_force_manager_JF.py   JOYSTICK guided-fb  (F=1,B=0): centering spring + F_guide, no blending (copy of JFB, guard flipped to B=0)
     ├── haptic_force_manager_JB.py   JOYSTICK guided-bld (F=0,B=1): centering spring
     ├── haptic_force_manager_JFB.py  JOYSTICK full-guid  (F=1,B=1): centering spring + F_guide (overlapped), guide calibrated to the deadzone-exit force
     └── haption_plotter.py / workspace_debug_visualizer.py   debug visualization
@@ -48,7 +48,7 @@ The strategy is selected by the three orthogonal flags in `triago_control/qp_con
 - **CONTROL_MODE** picks the teleop node: `teleop_triago_clutch.py` (position control) vs `teleop_triago_joystick.py` (velocity control).
 - **ASSIST_FEEDBACK / ASSIST_BLENDING** pick the force manager (and whether `main_shared_autonomy` owns `/arm_*/cartesian_reference`).
 
-**Force-manager naming convention.** Every force manager is `haptic_force_manager_<CELL>`, where `<CELL>` encodes the active study condition as letters: **C** = CLUTCH or **J** = JOYSTICK (the control mode, always first), then **F** if `ASSIST_FEEDBACK` is on, then **B** if `ASSIST_BLENDING` is on. The no-assist baseline is just the mode letter. The eight cells are `C / CF / CB / CFB` (clutch) and `J / JF / JB / JFB` (joystick). `CB` (clutch + blending-only) and `JF` (joystick + feedback-only) are the two off-diagonal cells that complete the full 2×2×2 factorial for the paper — each pairs a control mode with its **non-native** assist channel (clutch is a position/Virtual-Fixture framework not meant to run on blending alone; the velocity joystick was conceived as the auto-blending solution), so they are conceptually unusual but included for a complete study comparison. `CB` is implemented (a copy of `haptic_force_manager_CFB` with the guidance channel deleted from the applied wrench); `JF` is still **to implement**. The old `_tutorial` suffix was dropped in this rename, and the legacy/demo scripts (`haptic_force_manager_battery`, `teleop_demo_integrator`, `teleop_triago`) were removed from the package.
+**Force-manager naming convention.** Every force manager is `haptic_force_manager_<CELL>`, where `<CELL>` encodes the active study condition as letters: **C** = CLUTCH or **J** = JOYSTICK (the control mode, always first), then **F** if `ASSIST_FEEDBACK` is on, then **B** if `ASSIST_BLENDING` is on. The no-assist baseline is just the mode letter. The eight cells are `C / CF / CB / CFB` (clutch) and `J / JF / JB / JFB` (joystick). `CB` (clutch + blending-only) and `JF` (joystick + feedback-only) are the two off-diagonal cells that complete the full 2×2×2 factorial for the paper — each pairs a control mode with its **non-native** assist channel (clutch is a position/Virtual-Fixture framework not meant to run on blending alone; the velocity joystick was conceived as the auto-blending solution), so they are conceptually unusual but included for a complete study comparison. Both off-diagonal cells are now implemented: `CB` is a copy of `haptic_force_manager_CFB` with the guidance channel deleted from the applied wrench; `JF` is a copy of `haptic_force_manager_JFB` with the startup guard flipped to `(JOYSTICK, F=True, B=False)` — the rendered wrench (`F_home` + `F_guide` + vibration cue) is **unchanged** from JFB because blending is applied at the reference level by `main_shared_autonomy`, never on the handle, so "removing the blending action" from the force manager is purely the guard flip (with `ASSIST_BLENDING=False`, `main_shared_autonomy` no longer owns `/arm_*/cartesian_reference`). The old `_tutorial` suffix was dropped in this rename, and the legacy/demo scripts (`haptic_force_manager_battery`, `teleop_demo_integrator`, `teleop_triago`) were removed from the package.
 
 The subsections below describe the currently-implemented cells. `cfg.BLENDING` is a backward-compat alias for `ASSIST_BLENDING`.
 
@@ -122,6 +122,12 @@ Both channels active on the spring-centered joystick teleop (`teleop_triago_joys
 - **Still → suspend blending:** like the clutch cell, when the handle sits inside the joystick deadband (`v_user≈0`) `main_shared_autonomy` forces `alpha=0`, so the gripper never moves on zero user twist (see `triago_control` §5.2 — the `_user_still` gate now covers both control modes).
 - **Plots** (two windows): (1) a **deadzone-condition** plot (like `JB`): `‖pos−home‖` and the angular gap vs the linear/angular deadband lines; (2) a **guidance-share** window with two subplots — the per-axis (X/Y/Z) **share of the FORCE** and **share of the TORQUE** contributed by `F_guide` as a percentage `|F_guide_axis| / (|F_guide_axis| + |F_home_axis|)` (the home share is `100% −` this). Lets the operator read *where* the guidance is doing the work.
 - Stability note: this cell intentionally re-introduces the force→handle→twist→robot loop the pure joystick avoided; it stays bounded because `F_guide` is feed-forward (no velocity feedback) and, with `GUIDE_K=0.55`, biases without ever clearing the deadband on its own.
+
+### 3.6 JOYSTICK · Guided feedback (`JOYSTICK, F=1, B=0`, `haptic_force_manager_JF.py`)
+
+The feedback-only cell of the velocity column: assistive **feedback** (channel F) ON, **blending** (channel B) OFF. It is a copy of the JFB manager (§3.5) with the startup guard flipped to `(JOYSTICK, F=True, B=False)`. The wrench on the handle is **identical to JFB** — `F_home` (centering spring) + `F_guide` (belief-weighted feed-forward velocity-field guidance, calibrated to the deadzone-exit force via `GUIDE_K=0.55`) + the out-of-deadzone vibration cue — because blending is applied at the **reference level** by `main_shared_autonomy`, never on the handle. The only difference from JFB is `ASSIST_BLENDING=False`: `main_shared_autonomy` does **not** own `/arm_*/cartesian_reference`, so the joystick teleop drives the raw (un-blended) reference. The operator feels the guidance biasing the handle toward the inferred goal, but every bit of robot motion still comes from their own twist (a conceptually unusual pairing — velocity control was conceived as the auto-blending solution — included for a complete 2×2×2 study).
+
+**Plots** (two windows, reworked from JFB for this cell): (1) **contributions** — the magnitude each channel puts on the handle, `‖F_home‖` (homing) vs `‖F_guide‖` (assistance) as separate lines, for force and torque, with **dashed maxima** (guidance saturation `MAX_GUIDE_*` and the device clip `MAX_FORCE`/`MAX_TORQUE`); (2) **feedback share** — the fraction of the total wrench that is homing vs assistance, `‖F_x‖/(‖F_home‖+‖F_guide‖)·100` (the two sum to 100%), for force and torque separately.
 
 ## 4. C++ Node: virtuose_server_node
 
@@ -250,6 +256,9 @@ ros2 run haption_teleoperation haptic_force_manager_CF.py
 ros2 run haption_teleoperation teleop_triago_clutch.py
 ros2 run haption_teleoperation haptic_force_manager_CFB.py
 #     (also run main_shared_autonomy.py on the robot side — it owns the blend)
+#   JOYSTICK, guided feedback (F=1, B=0):
+ros2 run haption_teleoperation teleop_triago_joystick.py
+ros2 run haption_teleoperation haptic_force_manager_JF.py
 #   JOYSTICK, guided blending (F=0, B=1):
 ros2 run haption_teleoperation teleop_triago_joystick.py
 ros2 run haption_teleoperation haptic_force_manager_JB.py
