@@ -118,15 +118,14 @@ class HapticForceManagerJFB(Node):
         self.D_guide_ang = 30.0    # Nm per (rad/s) of policy speed (feed-forward shaping)
         self.alpha_guide = 0.15    # LPF on the guidance wrench (C0 continuity)
         self.f_guide_filtered = np.zeros(6)
-        # gain = confidence(b_max) x proximity(ref->goal):
-        # Loosened vs the original (0.60/0.90, 0.30 m) so the assistance engages
-        # EARLIER / FURTHER from the goal: it starts ramping at moderate belief and
-        # up to ~0.60 m out, instead of only near-certainty within 0.30 m. Still
-        # tighter than the clutch CF/CFB (0.05/0.50, 1.00 m) so far-field belief
-        # noise doesn't produce erratic guidance. Kept identical to JF (joystick
-        # feedback channel matched across the two cells).
-        self.GUIDE_CONF_LO = 0.35   # b_max below this -> guidance dead
-        self.GUIDE_CONF_HI = 0.65   # b_max at/above this -> full confidence gate
+        # gain = confidence(b_max) x proximity(ref->goal).
+        # UNIFIED across ALL guidance cells (JF / JFB / CF / CFB): the task, belief
+        # function and policy are identical for both teleop modes, so the guidance
+        # activation margins MUST match everywhere:
+        #   proximity : full <= 0.10 m, dead > 0.60 m
+        #   confidence: dead < 0.30,   full >= 0.90
+        self.GUIDE_CONF_LO = 0.30   # b_max below this -> guidance dead
+        self.GUIDE_CONF_HI = 0.90   # b_max at/above this -> full confidence gate
         self.GUIDE_PROX_NEAR = 0.10  # m: ref->goal distance at/below this -> full proximity gate
         self.GUIDE_PROX_FAR  = 0.60  # m: at/beyond this -> guidance dead
 
