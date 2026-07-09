@@ -248,6 +248,10 @@ class HapticForceManagerCB(Node):
         # top-grasp approach that first moved down then lifts back up).
         self.GRASP_FOLLOW_KP = 30.0    # N/m   position tether toward where the arm is now
         self.GRASP_FOLLOW_KD = 160.0   # Ns/m  velocity-following (feels direction/speed of travel)
+        # Grasp vibration cue (REPLACES the follow force): constant 0.07 Nm buzz on
+        # the torque axes for the WHOLE autonomous grasp. No force is impressed.
+        self.GRASP_VIB_AMP = 0.07
+        self.grasp_vib_toggle = 1.0
         self.K_cbf_force = 2.0   
         self.K_cbf_torque = 0.1  
         self.MAX_FORCE = 10.0 
@@ -858,23 +862,10 @@ class HapticForceManagerCB(Node):
         # was an `elif` after DEBUG_ONLY_GUIDE, so in the active DEBUG mode the
         # handle felt NOTHING during a grasp; now it always follows.)
         if self.grasp_active:
-            if self.pos_real is not None:
-                if self._grasp_start_pos is None:
-                    self._grasp_start_pos = self.pos_real.copy()
-                # Gentle position tether toward where the arm is now, PLUS a
-                # velocity-following term so the operator feels the instantaneous
-                # direction & speed of the autonomous motion. The velocity term is
-                # what makes the LIFT clearly felt (the +Z EE velocity pulls the
-                # handle up) even when the cumulative Z displacement is small.
-                err = self.pos_real - self._grasp_start_pos
-                F_follow = self.GRASP_FOLLOW_KP * err + self.GRASP_FOLLOW_KD * self.vel_real
-                F_haption = np.zeros(6)
-                F_haption[0] = -F_follow[0]
-                F_haption[1] = -F_follow[1]
-                F_haption[2] =  F_follow[2]
-                f_total_normal = F_haption
-            else:
-                f_total_normal = np.zeros(6)
+            # Grasp in progress: impress NO force (the old EE-follow pull is
+            # removed). A constant 0.07 Nm vibration cue is added below instead.
+            self._grasp_start_pos = None
+            f_total_normal = np.zeros(6)
             f_cbf_s = np.zeros(6)
             f_guide_s = np.zeros(6)
             f_fix_s = np.zeros(6)
@@ -972,7 +963,7 @@ class HapticForceManagerCB(Node):
         # UNIFIED: CONSTANT 0.7 / 0.1 in all clutch cells (same as C). The former
         # CBF-aware damp_scale (1.0 -> 2.0 with lambda_cbf_f) was removed so the
         # damping felt by the operator is identical across every clutch condition.
-        if not self.DEBUG_ONLY_GUIDE:
+        if not self.DEBUG_ONLY_GUIDE and not self.grasp_active:
             Kd_global_lin = 0.7
             Kd_global_ang = 0.1
             f_total[0:3] -= Kd_global_lin * self.vel_haption[0:3]
@@ -983,7 +974,16 @@ class HapticForceManagerCB(Node):
         # whatever wrench the branch produced — normal, clutch-frozen or grasp —
         # so the one-shot burst is always felt live and toggles every frame).
         # ========================================================
-        f_total[3:6] += f_vib[3:6]
+        if self.grasp_active:
+            # Grasp cue: constant 0.07 Nm square-wave buzz on the torque axes for
+            # the whole grasp (replaces the removed EE-follow force).
+            self.grasp_vib_toggle *= -1.0
+            gb = self.GRASP_VIB_AMP * self.grasp_vib_toggle
+            f_total[3] += gb
+            f_total[4] += gb
+            f_total[5] += gb
+        else:
+            f_total[3:6] += f_vib[3:6]
 
         # ========================================================
         # CLIPPING & PUBLISHING

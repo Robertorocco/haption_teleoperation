@@ -38,7 +38,7 @@ from scipy.spatial.transform import Rotation as R
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Wrench, Twist, Pose
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, Bool
 
 import matplotlib
 matplotlib.use('TkAgg')
@@ -87,6 +87,11 @@ class HapticForceManagerBlending(Node):
         self.VIB_AMP = 0.05           # Nm  constant torque amplitude while outside the deadband
         self.vib_toggle = 1.0         # per-frame sign toggle (~75 Hz square wave)
 
+        # --- Grasp-execution vibration cue (UNIFIED with clutch cells) ---
+        self.grasp_active = False
+        self.GRASP_VIB_AMP = 0.07    # Nm  constant buzz during autonomous grasp
+        self.grasp_vib_toggle = 1.0
+
         # --- Subscribers ---
         # NOTE: virtuose_server_node publishes virtuose/pose as geometry_msgs/Pose
         # (NOT PoseStamped) -- subscribing with the wrong type silently receives
@@ -98,6 +103,8 @@ class HapticForceManagerBlending(Node):
         # Blending telemetry: [alpha, v_user(6), v_policy(6), v_blend(6)] = 19 floats.
         self.create_subscription(
             Float64MultiArray, '/shared_autonomy/blend_debug', self.blend_debug_cb, 10)
+        # Grasp-execution flag: vibrate during autonomous grasp.
+        self.create_subscription(Bool, '/shared_autonomy/grasp_active', self.grasp_active_cb, 10)
 
         # --- Publisher ---
         self.force_pub = self.create_publisher(Wrench, 'virtuose/force_cmd', 10)
@@ -153,6 +160,10 @@ class HapticForceManagerBlending(Node):
             self.home_pos = np.array(msg.data[0:3])
             self.home_rot = R.from_quat(np.array(msg.data[3:7]))
 
+    def grasp_active_cb(self, msg):
+        """Tracks whether the shared-autonomy node is autonomously driving a grasp."""
+        self.grasp_active = bool(msg.data)
+
     def blend_debug_cb(self, msg):
         """Process /shared_autonomy/blend_debug: [alpha, v_user(6), v_policy(6), v_blend(6)]."""
         if len(msg.data) < 13:
@@ -200,6 +211,14 @@ class HapticForceManagerBlending(Node):
                 f[3] += buzz
                 f[4] += buzz
                 f[5] += buzz
+
+        # --- Grasp vibration cue (0.07 Nm buzz during autonomous grasp) ---
+        if self.grasp_active:
+            self.grasp_vib_toggle *= -1.0
+            gb = self.GRASP_VIB_AMP * self.grasp_vib_toggle
+            f[3] += gb
+            f[4] += gb
+            f[5] += gb
 
         f[0:3] = np.clip(f[0:3], -self.MAX_FORCE, self.MAX_FORCE)
         f[3:6] = np.clip(f[3:6], -self.MAX_TORQUE, self.MAX_TORQUE)

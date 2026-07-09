@@ -93,6 +93,11 @@ class HapticForceManagerNoGuidance(Node):
         self._grasp_start_pos = None
         self.GRASP_FOLLOW_KP = 30.0     # N/m   position tether toward the current EE
         self.GRASP_FOLLOW_KD = 160.0    # Ns/m  velocity-following (direction/speed of travel)
+        # Grasp vibration cue (REPLACES the follow force): a constant 0.07 Nm
+        # square-wave buzz on the torque axes rendered for the WHOLE autonomous
+        # grasp. No force is impressed during the grasp — only this cue.
+        self.GRASP_VIB_AMP = 0.07
+        self.grasp_vib_toggle = 1.0
 
         # --- Clutching (freeze wrench at 50% on press + orientation alignment) ---
         self.is_clutching = False
@@ -441,14 +446,10 @@ class HapticForceManagerNoGuidance(Node):
         # operator feels the grasp/lift/abort. If the grasp machine is not running,
         # grasp_active stays False and this branch is never entered.
         if self.grasp_active:
-            if self.pos_real is not None:
-                if self._grasp_start_pos is None:
-                    self._grasp_start_pos = self.pos_real.copy()
-                err = self.pos_real - self._grasp_start_pos
-                F_follow = self.GRASP_FOLLOW_KP * err + self.GRASP_FOLLOW_KD * self.vel_real
-                f_total_normal = np.array([-F_follow[0], -F_follow[1], F_follow[2], 0.0, 0.0, 0.0])
-            else:
-                f_total_normal = np.zeros(6)
+            # Grasp in progress: impress NO force (the old EE-follow pull is
+            # removed). A constant 0.07 Nm vibration cue is added below instead.
+            self._grasp_start_pos = None
+            f_total_normal = np.zeros(6)
         else:
             self._grasp_start_pos = None   # reset so the next grasp re-anchors
             f_total_normal = f_sync.copy()
@@ -482,16 +483,27 @@ class HapticForceManagerNoGuidance(Node):
             f_total = f_total_normal
             self.was_clutching_last_frame = False
 
-        # Global viscous damping (impedance-device stability), same as the tutorial.
-        f_total[0:3] -= self.Kd_global_lin * self.vel_haption[0:3]
-        f_total[3:6] -= self.Kd_global_ang * self.vel_haption[3:6]
+        # Global viscous damping (impedance-device stability). Skipped during a
+        # grasp so the handle is free apart from the vibration cue below.
+        if not self.grasp_active:
+            f_total[0:3] -= self.Kd_global_lin * self.vel_haption[0:3]
+            f_total[3:6] -= self.Kd_global_ang * self.vel_haption[3:6]
 
         # Joint-limit "clutch advice" vibration (IDENTICAL to Mode A): a ONE-SHOT
         # 1 s burst fired when a Haption joint nears a limit, re-armed only by a
         # full clutch cycle. Injected last so it rides on top of the possibly
         # clutch-frozen wrench and toggles every frame.
         f_vib = self.compute_F_limit_warning()
-        f_total[3:6] += f_vib[3:6]
+        if self.grasp_active:
+            # Grasp cue: constant 0.07 Nm square-wave buzz on the torque axes for
+            # the whole grasp (replaces the removed EE-follow force).
+            self.grasp_vib_toggle *= -1.0
+            gb = self.GRASP_VIB_AMP * self.grasp_vib_toggle
+            f_total[3] += gb
+            f_total[4] += gb
+            f_total[5] += gb
+        else:
+            f_total[3:6] += f_vib[3:6]
 
         # Device safety clip.
         f_total[0:3] = np.clip(f_total[0:3], -self.MAX_FORCE, self.MAX_FORCE)

@@ -56,7 +56,7 @@ from scipy.spatial.transform import Rotation as R
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Wrench, Twist, Pose
-from std_msgs.msg import Float64MultiArray, String
+from std_msgs.msg import Float64MultiArray, String, Bool
 
 import matplotlib
 matplotlib.use('TkAgg')
@@ -140,6 +140,11 @@ class HapticForceManagerJF(Node):
         self.VIB_AMP = 0.05           # Nm  constant torque amplitude while outside the deadband
         self.vib_toggle = 1.0         # per-frame sign toggle (~75 Hz square wave)
 
+        # --- Grasp-execution vibration cue (UNIFIED with clutch cells) ---
+        self.grasp_active = False
+        self.GRASP_VIB_AMP = 0.07    # Nm  constant buzz during autonomous grasp
+        self.grasp_vib_toggle = 1.0
+
         # --- Subscribers ---
         # NOTE: virtuose_server_node publishes virtuose/pose as geometry_msgs/Pose.
         self.create_subscription(Pose, 'virtuose/pose', self.handle_pose_cb, 10)
@@ -157,6 +162,8 @@ class HapticForceManagerJF(Node):
         self.create_subscription(Float64MultiArray, '/arm_right/cartesian_reference', self.target_cb, 10)
         self.create_subscription(Float64MultiArray, '/arm_left/cartesian_reference', self.target_cb_left, 10)
         self.create_subscription(String, '/shared_autonomy/active_arm', self.active_arm_cb, 10)
+        # Grasp-execution flag: vibrate during autonomous grasp.
+        self.create_subscription(Bool, '/shared_autonomy/grasp_active', self.grasp_active_cb, 10)
 
         # --- Publisher ---
         self.force_pub = self.create_publisher(Wrench, 'virtuose/force_cmd', 10)
@@ -232,6 +239,10 @@ class HapticForceManagerJF(Node):
         if msg.data in ('right', 'left') and msg.data != self.active_arm:
             self.active_arm = msg.data
             self.get_logger().info(f"[HFM-JF] Active arm switched to {msg.data.upper()}")
+
+    def grasp_active_cb(self, msg):
+        """Tracks whether the shared-autonomy node is autonomously driving a grasp."""
+        self.grasp_active = bool(msg.data)
 
     # ------------------------------------------------------------------ helpers
     def _smoothstep(self, p, lo, hi):
@@ -334,6 +345,14 @@ class HapticForceManagerJF(Node):
                 f_total[3] += buzz
                 f_total[4] += buzz
                 f_total[5] += buzz
+
+        # --- Grasp vibration cue (0.07 Nm buzz during autonomous grasp) ---
+        if self.grasp_active:
+            self.grasp_vib_toggle *= -1.0
+            gb = self.GRASP_VIB_AMP * self.grasp_vib_toggle
+            f_total[3] += gb
+            f_total[4] += gb
+            f_total[5] += gb
 
         f_total[0:3] = np.clip(f_total[0:3], -self.MAX_FORCE, self.MAX_FORCE)
         f_total[3:6] = np.clip(f_total[3:6], -self.MAX_TORQUE, self.MAX_TORQUE)
