@@ -1,26 +1,5 @@
 #!/usr/bin/env python3
-"""
-Workspace Debug Visualizer — 4 independent windows
-=======================================================
-
-Window 1 – Haption device in its native frame
-    Origin  : Haption base
-    X axis  : → toward the operator
-    Z axis  : ↑ up
-
-Window 2 – Haption device in Rotated frame (180° around Z)
-    Origin  : Haption base
-    X axis  : → away from operator (negative space)
-    Z axis  : ↑ up
-
-Window 3 – TIAGo end-effector in TIAGo base frame
-    Origin  : TIAGo footprint centre
-    X axis  : → robot forward
-    Z axis  : ↑ up
-
-Window 4 – Unified workspace expressed in TIAGo base frame
-    Both workspaces are drawn; Haption is mapped into TIAGo frame.
-"""
+"""Debug visualizer: Haption vs TRIAGo workspaces in native, rotated, unified and bridge-mapped views."""
 
 import rclpy
 from rclpy.node import Node
@@ -32,42 +11,35 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Workspace constants  (edit here if limits change)
-# ─────────────────────────────────────────────────────────────────────────────
+# TRIAGo EE workspace bounds (base frame).
 TIAGO_MIN = np.array([0.100, -0.996,  0.200])
 TIAGO_MAX = np.array([0.987,  0.567,  1.772])
 
-# Measured Haption limits  (Haption base frame, X → user, Z ↑)
+# Measured Haption workspace limits (Haption base frame, X toward user, Z up).
 HAPTION_MIN    = np.array([0.192, -0.562, -0.352])
 HAPTION_MAX    = np.array([0.738,  0.490,  0.424])
 HAPTION_CENTER = np.array([0.46475608, -0.03577431,  0.03573696])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 class WorkspaceVisualizer(Node):
-
+    # Draws six 3D windows comparing the device and robot workspaces and mappings.
     def __init__(self):
         super().__init__('workspace_visualizer')
 
-        # --- live state ---
         self.tiago_pos   = (TIAGO_MIN + TIAGO_MAX) / 2.0
         self.tiago_rot   = np.eye(3)
         self.haption_pos = HAPTION_CENTER.copy()
         self.haption_rot = np.eye(3)
 
-        # Bridge Constants
+        # Isotropic center-to-center bridge mapping constants.
         self.center_tiago_bridge = np.array([0.544, -0.215, 0.986])
         self.center_haption_bridge = np.array([0.4647, -0.0357, 0.0357])
-        self.K = 1.0  # Isotropic scale factor
+        self.K = 1.0  # isotropic scale factor
 
-        
-        # ------------------------------
-        # --- subscribers ---
         self.create_subscription(
             Float64MultiArray, '/qp_debug/ee_real', self._tiago_cb, 10)
         self.create_subscription(
-            Pose, 'virtuose/pose', self._haption_cb, 10)   # raw hardware pose
+            Pose, 'virtuose/pose', self._haption_cb, 10)
 
         # --- figures ---
         plt.ion()
@@ -146,7 +118,7 @@ class WorkspaceVisualizer(Node):
     def haption_to_tiago(h_pos,
                          h_min=HAPTION_MIN, h_max=HAPTION_MAX,
                          t_min=TIAGO_MIN,   t_max=TIAGO_MAX):
-        """Map one point from Native Haption frame → TIAGo frame for unified display."""
+        """Maps one point from the native Haption frame into the TRIAGo frame for unified display."""
         h_range = h_max - h_min
         t_range = t_max - t_min
 
@@ -159,20 +131,14 @@ class WorkspaceVisualizer(Node):
         return np.array([t_x, t_y, t_z])
 
     def map_haption_to_tiago_bridge(self, h_pos):
-        """
-        Applies the exact math from haption_bridge_VIRTMECH.py 
-        (Forward mapping: Haption -> TIAGo)
-        """
-        # Haption displacement from its center, scaled by K
+        """Isotropic bridge mapping: center-to-center delta, K-scaled, 180-deg Z-flipped (Haption -> TRIAGo)."""
         delta_h = (h_pos - self.center_haption_bridge) * self.K
-        
-        # Apply to TIAGo center, flipping X and Y (180 deg rot around Z)
+
         t_x = self.center_tiago_bridge[0] - delta_h[0]
         t_y = self.center_tiago_bridge[1] - delta_h[1]
         t_z = self.center_tiago_bridge[2] + delta_h[2]
-        
+
         return np.array([t_x, t_y, t_z])
-    # -----------------------------------------
 
     # ── Drawing helpers ────────────────────────────────────────────────────
     @staticmethod

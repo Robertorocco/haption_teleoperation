@@ -1,50 +1,5 @@
 #!/usr/bin/env python3
-"""Haptic Force Manager -- JOYSTICK GUIDED FEEDBACK (JF: Feedback only, no Blending).
-
-The guided-feedback cell of the velocity-control column: ONLY the assistive
-FEEDBACK channel (F) is active on the spring-centered joystick; reference-level
-blending (channel B) is OFF. It is a copy of the JFB (full-guidance) manager with
-the study guard flipped to (JOYSTICK, feedback=True, blending=False).
-
-Because blending is performed at the REFERENCE level by main_shared_autonomy (NOT
-by the force manager), the wrench rendered on the handle is IDENTICAL to JFB:
-the SUPERPOSITION of
-
-  1. F_home  -- the restorative centering spring toward the (dynamic) home pose
-                (identical to the JB manager), and
-  2. F_guide -- the belief-weighted velocity-field guidance force (feed-forward),
-                calibrated so it saturates at the DEADZONE-EXIT force.
-
-The only functional difference vs JFB is that ASSIST_BLENDING=False, so
-main_shared_autonomy does NOT own /arm_*/cartesian_reference -- the joystick teleop
-drives the raw (un-blended) reference, and the operator feels the guidance forces
-on the handle without any autonomous reference arbitration. The guidance therefore
-BIASES the handle toward the inferred goal (a "preferred direction") but every bit
-of robot motion still comes from the operator's own twist.
-
-Design of the F_guide / F_home overlap (unchanged from JFB):
-  The guidance saturates at the DEADZONE-EXIT force -- the force that, against the
-  centering spring, displaces the handle exactly to the edge of the joystick
-  deadband:
-        F_exit_lin = KP_LIN * DEADBAND_LIN ,   Tau_exit_ang = KP_ANG * DEADBAND_ANG
-  MAX_GUIDE_{FORCE,TORQUE} = GUIDE_K * F_exit, and the guidance is scaled LINEARLY
-  by  gain = confidence(b_max) x proximity(ref->goal). With GUIDE_K < 1 (currently
-  0.55) the guidance is a pure BIAS -- it can no longer clear the deadband on its
-  own, even at gain=1, so the operator always drives.
-  F_guide is FEED-FORWARD (built from v_field only, no -handle_vel term): CFB's
-  velocity-field self-damping is a virtual damper too strong for the 150 Hz device
-  passivity limit; handle damping comes from the centering spring's KD + friction.
-
-Final wrench (Haption base frame): F_home + F_guide, clipped to +/- MAX_FORCE /
-MAX_TORQUE, published on virtuose/force_cmd.
-
-Plots (two windows, per the JF plan):
-  1. CONTRIBUTIONS -- homing (F_home) vs assistance (F_guide) magnitude on the
-     handle (force and torque), each as its OWN line, with dashed lines for the
-     maxima (guidance saturation MAX_GUIDE_* and the device clip MAX_FORCE/TORQUE).
-  2. FEEDBACK SHARE -- what fraction of the total wrench is homing vs assistance
-     (% of |F_home|+|F_guide|), for force and torque separately.
-"""
+"""JOYSTICK guided feedback (F=1, B=0): same handle wrench as JFB, but the reference is never blended."""
 
 import threading
 import time
@@ -62,95 +17,74 @@ import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 
-# Single source of truth for the joystick home pose, spring gains, deadbands and
-# the experiment-condition selector.
+# Cross-package condition selector + joystick home pose, spring gains and deadbands.
 import triago_control.qp_controller.config as cfg
 
 
 class HapticForceManagerJF(Node):
+    # Feedback-only joystick manager: F_home + F_guide bias; robot motion comes solely from the user twist.
     def __init__(self):
         super().__init__('haptic_force_manager_jf')
 
-        # Fail loudly if launched under the wrong study condition. This is the
-        # JOYSTICK "Guided feedback" manager: assistive feedback (channel F) ON,
-        # reference blending (channel B) OFF. The handle renders the centering
-        # spring + the belief-weighted guidance force, but the reference is NOT
-        # blended (main_shared_autonomy does not own /arm_*/cartesian_reference).
+        # Hard-error at startup unless config.py selects the JOYSTICK guided-feedback cell.
         cfg.validate_condition('haptic_force_manager_JF',
                                control_mode=cfg.JOYSTICK, feedback=True, blending=False)
 
-        # --- Home pose (Haption base frame) -- neutral until teleop publishes ---
+        # Home pose (Haption base frame), neutral until the teleop broadcasts the live home.
         self.home_pos = np.array(cfg.JOYSTICK_NEUTRAL_POSITION_M, dtype=float)
         self.home_rot = R.from_quat(cfg.JOYSTICK_NEUTRAL_ORIENTATION_XYZW)  # xyzw
 
-        # --- Live handle state (Haption base frame) ---
         self.handle_pos = None
         self.handle_rot = None
         self.handle_vel = np.zeros(6)
 
-        # --- Home centering-spring gains (same as JB) ---
+        # Spring gains, unified across all joystick cells.
         self.KP_LIN = cfg.JOYSTICK_SPRING_KP_LIN
         self.KD_LIN = cfg.JOYSTICK_SPRING_KD_LIN
         self.KP_ANG = cfg.JOYSTICK_SPRING_KP_ANG
         self.KD_ANG = cfg.JOYSTICK_SPRING_KD_ANG
 
-        # --- Device safety clip ---
+        # Device safety clip and unified authority cap (currently equal).
         self.MAX_FORCE = 10.0
         self.MAX_TORQUE = 1.0
-        # Authority cap (UNIFIED across all 8 cells; currently == the device clip):
-        # one knob for the max assistance magnitude, applied proportionally.
         self.MAX_TOTAL_FORCE = 10.0
         self.MAX_TOTAL_TORQUE = 1.0
 
-        # --- Guidance (F_guide) inference inputs (from main_shared_autonomy) ---
+        # Guidance inference inputs from shared autonomy.
         self.goal_names = []
         self.goal_probs = []
         self.user_policies = []
         self.fix_goal_pos = None      # active goal position (base frame)
         self.fix_confidence = 0.0     # b_max: active-goal belief (0 during grasp exec)
-        self.pos_target = None        # the reference the QP tracks
+        self.pos_target = None        # the reference the QP tracks (raw, un-blended here)
         self.active_arm = 'right'
 
-        # --- Guidance tuning, DEFINED RELATIVE TO THE HOME SPRING ---------------
-        # Saturation = deadzone-exit force x GUIDE_K. GUIDE_K < 1 -> the guidance
-        # BIASES the handle toward the goal but does NOT clear the deadband on its
-        # own (even at gain=1); the operator feels a preferred direction yet still
-        # drives.
+        # Guidance saturation = GUIDE_K x deadzone-exit force; GUIDE_K < 1 makes it a pure
+        # bias that can never clear the deadband alone -- the operator always initiates motion.
         self.GUIDE_K = 0.55
-        self.MAX_GUIDE_FORCE  = self.GUIDE_K * self.KP_LIN * cfg.JOYSTICK_DEADBAND_LIN   # ~2.85 N
-        self.MAX_GUIDE_TORQUE = self.GUIDE_K * self.KP_ANG * cfg.JOYSTICK_DEADBAND_ANG   # ~0.21 Nm
-        # FEED-FORWARD magnitude-shaping gains (policy speed -> force), NOT velocity
-        # feedback: F_guide is built from v_field ONLY (no -handle_vel term), so
-        # these are not virtual dampers and don't threaten device passivity.
-        self.D_guide_lin = 400.0   # N per (m/s) of policy speed (feed-forward shaping)
-        self.D_guide_ang = 30.0    # Nm per (rad/s) of policy speed (feed-forward shaping)
+        self.MAX_GUIDE_FORCE  = self.GUIDE_K * self.KP_LIN * cfg.JOYSTICK_DEADBAND_LIN
+        self.MAX_GUIDE_TORQUE = self.GUIDE_K * self.KP_ANG * cfg.JOYSTICK_DEADBAND_ANG
+        # Feed-forward magnitude-shaping gains (policy speed -> force), not velocity feedback.
+        self.D_guide_lin = 400.0   # N per (m/s)
+        self.D_guide_ang = 30.0    # Nm per (rad/s)
         self.alpha_guide = 0.15    # LPF on the guidance wrench (C0 continuity)
         self.f_guide_filtered = np.zeros(6)
-        # gain = confidence(b_max) x proximity(ref->goal).
-        # UNIFIED across ALL guidance cells (JF / JFB / CF / CFB): the task, belief
-        # function and policy are identical for both teleop modes, so the guidance
-        # activation margins MUST match everywhere:
-        #   proximity : full <= 0.10 m, dead > 0.60 m
-        #   confidence: dead < 0.30,   full >= 0.90
-        self.GUIDE_CONF_LO = 0.30   # b_max below this -> guidance dead
-        self.GUIDE_CONF_HI = 0.90   # b_max at/above this -> full confidence gate
-        self.GUIDE_PROX_NEAR = 0.10  # m: ref->goal distance at/below this -> full proximity gate
-        self.GUIDE_PROX_FAR  = 0.60  # m: at/beyond this -> guidance dead
+        # gain = confidence(b_max) x proximity(ref->goal), unified across all guidance cells.
+        self.GUIDE_CONF_LO = 0.30   # below: guidance dead
+        self.GUIDE_CONF_HI = 0.90   # at/above: full confidence gate
+        self.GUIDE_PROX_NEAR = 0.10  # m: full proximity gate at/below
+        self.GUIDE_PROX_FAR  = 0.60  # m: guidance dead at/beyond
 
-        # --- Out-of-deadzone vibration cue (same as J / JB / JFB) ---
-        # A constant, low-amplitude, zero-mean buzz on the three torque axes,
-        # rendered the WHOLE time the handle sits OUTSIDE the joystick deadband --
-        # i.e. exactly while a non-zero twist is being commanded.
-        self.VIB_AMP = 0.05           # Nm  constant torque amplitude while outside the deadband
-        self.vib_toggle = 1.0         # per-frame sign toggle (~75 Hz square wave)
+        # Out-of-deadzone cue: zero-mean buzz whenever a non-zero twist is being commanded.
+        self.VIB_AMP = 0.05           # Nm
+        self.vib_toggle = 1.0         # sign flip every frame -> ~75 Hz square wave
 
-        # --- Grasp-execution vibration cue (UNIFIED with clutch cells) ---
+        # Autonomous-grasp cue, unified across all 8 cells.
         self.grasp_active = False
-        self.GRASP_VIB_AMP = 0.07    # Nm  constant buzz during autonomous grasp
+        self.GRASP_VIB_AMP = 0.07    # Nm
         self.grasp_vib_toggle = 1.0
 
-        # --- Subscribers ---
-        # NOTE: virtuose_server_node publishes virtuose/pose as geometry_msgs/Pose.
+        # virtuose/pose is geometry_msgs/Pose (not PoseStamped).
         self.create_subscription(Pose, 'virtuose/pose', self.handle_pose_cb, 10)
         self.create_subscription(Twist, 'virtuose/velocity', self.vel_cb, 10)
         self.create_subscription(
@@ -160,19 +94,15 @@ class HapticForceManagerJF(Node):
         self.create_subscription(Float64MultiArray, '/shared_autonomy/goal_probabilities', self.goal_probs_cb, 10)
         self.create_subscription(Float64MultiArray, '/shared_autonomy/user_policy', self.user_policy_cb, 10)
         self.create_subscription(Float64MultiArray, '/shared_autonomy/active_goal_pose', self.goal_pose_cb, 10)
-        # The reference the QP tracks -> proximity distance ref->goal. With B=0 this
-        # is the raw teleop reference (not a blended one), which is still valid for
-        # the proximity gate.
+        # With B=0 this is the raw teleop reference -- still valid for the proximity gate.
         self.create_subscription(Float64MultiArray, '/arm_right/cartesian_reference', self.target_cb, 10)
         self.create_subscription(Float64MultiArray, '/arm_left/cartesian_reference', self.target_cb_left, 10)
         self.create_subscription(String, '/shared_autonomy/active_arm', self.active_arm_cb, 10)
-        # Grasp-execution flag: vibrate during autonomous grasp.
         self.create_subscription(Bool, '/shared_autonomy/grasp_active', self.grasp_active_cb, 10)
 
-        # --- Publisher ---
         self.force_pub = self.create_publisher(Wrench, 'virtuose/force_cmd', 10)
 
-        # --- Plot buffers (home + guide wrench components; norms/share derived) ---
+        # Plot buffers (10 s window at 150 Hz), guarded by a lock shared with the UI thread.
         self.plot_lock = threading.Lock()
         self.plot_window_sec = 10.0
         self.buffer_size = int(150 * self.plot_window_sec)
@@ -194,58 +124,64 @@ class HapticForceManagerJF(Node):
 
     # ------------------------------------------------------------------ callbacks
     def handle_pose_cb(self, msg):
+        """Stores the latest handle pose (Haption base frame)."""
         p = msg.position
         q = msg.orientation
         self.handle_pos = np.array([p.x, p.y, p.z])
         self.handle_rot = R.from_quat([q.x, q.y, q.z, q.w])
 
     def vel_cb(self, msg):
+        """Stores the latest handle 6-DOF spatial velocity."""
         self.handle_vel = np.array([
             msg.linear.x, msg.linear.y, msg.linear.z,
             msg.angular.x, msg.angular.y, msg.angular.z])
 
     def home_pose_cb(self, msg):
-        """Live home pose from teleop_triago_joystick.py: [pos(3), quat_xyzw(4)]."""
+        """Updates the live home pose from the teleop node: [pos(3), quat_xyzw(4)]."""
         if len(msg.data) >= 7:
             self.home_pos = np.array(msg.data[0:3])
             self.home_rot = R.from_quat(np.array(msg.data[3:7]))
 
     def goal_names_cb(self, msg):
+        """Updates the list of active goal names from the inference engine."""
         self.goal_names = msg.data.split(',')
 
     def goal_probs_cb(self, msg):
+        """Updates the array of goal probabilities."""
         self.goal_probs = list(msg.data)
 
     def user_policy_cb(self, msg):
-        """Flattened optimal spatial twists (per goal) evaluated from the reference."""
+        """Updates the flattened per-goal user-frame policy twists."""
         self.user_policies = list(msg.data)
 
     def goal_pose_cb(self, msg):
-        """Active goal pose + confidence: [x,y,z, r,p,y, b_max]. b_max drives the
-        confidence gate; it is 0 during autonomous grasp execution (guidance off)."""
+        """Updates the active goal pose + belief b_max (0 during autonomous grasp execution)."""
         if len(msg.data) >= 7:
             self.fix_goal_pos = np.array(msg.data[0:3])
             self.fix_confidence = float(msg.data[6])
 
     def target_cb(self, msg):
+        """Updates the tracked reference position (right arm)."""
         if self.active_arm != 'right':
             return
         if len(msg.data) >= 3:
             self.pos_target = np.array(msg.data[0:3])
 
     def target_cb_left(self, msg):
+        """Updates the tracked reference position (left arm)."""
         if self.active_arm != 'left':
             return
         if len(msg.data) >= 3:
             self.pos_target = np.array(msg.data[0:3])
 
     def active_arm_cb(self, msg):
+        """Switches which arm's reference is used for the proximity gate."""
         if msg.data in ('right', 'left') and msg.data != self.active_arm:
             self.active_arm = msg.data
             self.get_logger().info(f"[HFM-JF] Active arm switched to {msg.data.upper()}")
 
     def grasp_active_cb(self, msg):
-        """Tracks whether the shared-autonomy node is autonomously driving a grasp."""
+        """Tracks whether shared autonomy is autonomously driving a grasp."""
         self.grasp_active = bool(msg.data)
 
     # ------------------------------------------------------------------ helpers
@@ -258,8 +194,7 @@ class HapticForceManagerJF(Node):
 
     # ------------------------------------------------------------------ forces
     def compute_spring(self):
-        """Restorative spring-damper wrench (Haption base frame) toward home
-        (identical to the JB manager)."""
+        """Spring-damper wrench (Haption base frame) pulling the handle to the home pose."""
         f = np.zeros(6)
         if self.handle_pos is None or self.handle_rot is None:
             return f
@@ -269,19 +204,7 @@ class HapticForceManagerJF(Node):
         return f
 
     def compute_F_guide(self):
-        """Velocity-field guidance (copied from JFB/CFB.compute_F_guide), calibrated
-        to overlap the home spring.
-
-        Structure:
-          1. pi_blend = Sum_k P(k) * pi_k          (belief-weighted policy twist)
-          2. v_field  = map_180Z(pi_blend)         (robot -> Haption frame)
-          3. FEED-FORWARD force F = MAX * tanh(D * v_field / MAX) (direction from
-             the policy field, magnitude saturated at the exit force), tanh-sat, LPF'd.
-
-        gain = confidence(b_max) x proximity(ref->goal), applied AFTER the tanh
-        (linear 'fraction of the exit force'), so gain=1 exits the deadband and
-        gain<1 only biases inside it.
-        """
+        """Feed-forward velocity-field guidance saturated at GUIDE_K x the deadzone-exit force."""
         n_goals = len(self.goal_names) if self.goal_names else 0
         n_policies = len(self.user_policies)
         if (n_goals == 0
@@ -290,16 +213,16 @@ class HapticForceManagerJF(Node):
             self.f_guide_filtered = (1.0 - self.alpha_guide) * self.f_guide_filtered
             return self.f_guide_filtered.copy()
 
+        # pi_blend = sum_k P(k) * pi_k: belief-weighted policy twist (robot frame).
         probs = np.array(self.goal_probs)
         policies = np.array(self.user_policies).reshape(n_goals, 6)
         pi_blend = probs @ policies
 
-        # Confidence gate: the ACTIVE-goal belief b_max. Dead below LO, full at/above HI.
+        # Confidence gate on b_max (max posterior), zero during autonomous grasp execution.
         conf_gate = self._smoothstep(self.fix_confidence,
                                      lo=self.GUIDE_CONF_LO, hi=self.GUIDE_CONF_HI)
 
-        # Proximity gate: distance from the REFERENCE to the active goal.
-        # Full at/below NEAR, dead at/beyond FAR (smoothstep between).
+        # Proximity gate: reference-to-goal distance, silencing guidance while the goal still swings.
         if self.fix_goal_pos is not None and self.pos_target is not None:
             d_goal = float(np.linalg.norm(self.fix_goal_pos - self.pos_target))
             prox = np.clip(
@@ -307,40 +230,35 @@ class HapticForceManagerJF(Node):
                 / max(self.GUIDE_PROX_FAR - self.GUIDE_PROX_NEAR, 1e-6), 0.0, 1.0)
             prox_gate = 3.0 * prox ** 2 - 2.0 * prox ** 3   # smoothstep
         else:
-            prox_gate = 0.0   # no goal / reference info -> no guidance (safe)
+            prox_gate = 0.0   # no goal/reference info -> no guidance
 
         gain = conf_gate * prox_gate
 
-        # Map the policy twist (robot frame) into the Haption frame (180 deg Z-flip),
-        # matching teleop_triago_joystick's frame convention.
+        # Map the policy twist into the Haption frame (180-deg Z-flip, matching the joystick teleop).
         v_field = np.array([
             -pi_blend[0], -pi_blend[1],  pi_blend[2],
             -pi_blend[3], -pi_blend[4],  pi_blend[5],
         ])
 
-        # FEED-FORWARD guidance: shape the magnitude from the (smooth, LPF'd) policy
-        # field v_field ONLY -- do NOT feed the handle velocity back (that virtual
-        # damper is too strong for the 150 Hz device). Direction from v_field,
-        # magnitude saturated at the exit force, then linearly gain-scaled.
+        # Feed-forward: F = MAX*tanh(D*v_field/MAX), gain applied AFTER the tanh so it reads as
+        # a linear fraction of the exit force; no handle-velocity feedback (passivity limit).
         F_dir = np.zeros(6)
         F_dir[0:3] = self.MAX_GUIDE_FORCE * np.tanh(self.D_guide_lin * v_field[0:3] / self.MAX_GUIDE_FORCE)
         F_dir[3:6] = self.MAX_GUIDE_TORQUE * np.tanh(self.D_guide_ang * v_field[3:6] / self.MAX_GUIDE_TORQUE)
         F_guide_raw = gain * F_dir
 
-        # Temporal smoothing (LPF)
         self.f_guide_filtered = (self.alpha_guide * F_guide_raw
                                  + (1.0 - self.alpha_guide) * self.f_guide_filtered)
         return self.f_guide_filtered.copy()
 
     # ------------------------------------------------------------------ loop
     def control_loop(self):
+        """150 Hz: renders F_home + F_guide, adds the cues, caps, clips, publishes, buffers."""
         f_home = self.compute_spring()
         f_guide = self.compute_F_guide()
         f_total = f_home + f_guide
 
-        # --- Authority cap (UNIFIED across all cells) ---
-        # Proportionally bound the assistive wrench magnitude to MAX_TOTAL_*
-        # (currently == the device clip) BEFORE the vibration cues.
+        # Authority cap: proportional rescale before the vibration cues.
         fn = np.linalg.norm(f_total[0:3])
         if fn > self.MAX_TOTAL_FORCE:
             f_total[0:3] *= self.MAX_TOTAL_FORCE / fn
@@ -348,7 +266,7 @@ class HapticForceManagerJF(Node):
         if tn > self.MAX_TOTAL_TORQUE:
             f_total[3:6] *= self.MAX_TOTAL_TORQUE / tn
 
-        # --- Out-of-deadzone vibration cue (same as J / JB / JFB) ---
+        # Out-of-deadzone cue: buzz exactly while a command (user push or guidance bias) is impressed.
         if self.handle_pos is not None and self.handle_rot is not None:
             lin_disp = float(np.linalg.norm(self.home_pos - self.handle_pos))
             ang_disp = float(np.linalg.norm((self.home_rot * self.handle_rot.inv()).as_rotvec()))
@@ -360,7 +278,7 @@ class HapticForceManagerJF(Node):
                 f_total[4] += buzz
                 f_total[5] += buzz
 
-        # --- Grasp vibration cue (0.07 Nm buzz during autonomous grasp) ---
+        # Autonomous-grasp cue.
         if self.grasp_active:
             self.grasp_vib_toggle *= -1.0
             gb = self.GRASP_VIB_AMP * self.grasp_vib_toggle
@@ -385,13 +303,10 @@ class HapticForceManagerJF(Node):
 
     # ------------------------------------------------------------------ plotting
     def setup_plot(self):
+        """Initializes the live plots: homing-vs-assistance contributions and feedback share."""
         plt.ion()
 
-        # --- Window 1: CONTRIBUTIONS -- homing vs assistance magnitude ----------
-        # The magnitude each channel puts on the handle: ||F_home|| (homing spring)
-        # vs ||F_guide|| (assistance), for force and torque separately, each its
-        # OWN line. Dashed lines mark the maxima: the guidance saturation
-        # (MAX_GUIDE_*) and the device clip (MAX_FORCE / MAX_TORQUE).
+        # Contributions: |F_home| vs |F_guide| with dashed maxima (guide saturation, device clip).
         self.fig_c, self.axs_c = plt.subplots(2, 1, figsize=(10, 7))
         self.fig_c.canvas.manager.set_window_title('JF: Homing vs Assistance contributions')
 
@@ -418,11 +333,7 @@ class HapticForceManagerJF(Node):
         ax.legend(loc='upper left', fontsize=8, ncol=2)
         self.fig_c.tight_layout()
 
-        # --- Window 2: FEEDBACK SHARE -- homing vs assistance -------------------
-        # What fraction of the total feedback is homing vs assistance:
-        #   share_home  = ||F_home||  / (||F_home|| + ||F_guide||) * 100
-        #   share_guide = ||F_guide|| / (||F_home|| + ||F_guide||) * 100
-        # (the two sum to 100%), for force and torque separately.
+        # Feedback share: homing vs assistance fraction of the total wrench (sums to 100%).
         self.fig_s, self.axs_s = plt.subplots(2, 1, figsize=(10, 7))
         self.fig_s.canvas.manager.set_window_title('JF: Feedback share (homing vs assistance)')
 
@@ -448,6 +359,7 @@ class HapticForceManagerJF(Node):
         plt.show(block=False)
 
     def update_plot(self):
+        """Snapshots buffers under the lock and refreshes the Matplotlib UI."""
         with self.plot_lock:
             if len(self.t_data) == 0:
                 return
@@ -468,7 +380,7 @@ class HapticForceManagerJF(Node):
         home_T = np.linalg.norm(fh_a[3:6], axis=0)
         guide_T = np.linalg.norm(fg_a[3:6], axis=0)
 
-        # Shares (%). Masked so the 0/0 at rest (both ~0) stays 0 without a warning.
+        # Masked divide keeps the 0/0 at-rest case at 0 without warnings.
         denom_F = home_F + guide_F
         denom_T = home_T + guide_T
         share_home_F = np.divide(100.0 * home_F, denom_F,
@@ -482,7 +394,6 @@ class HapticForceManagerJF(Node):
 
         win = (t[-1] - self.plot_window_sec, t[-1])
 
-        # Contributions window.
         self.l_home_F.set_data(t, home_F)
         self.l_guide_F.set_data(t, guide_F)
         self.l_home_T.set_data(t, home_T)
@@ -492,7 +403,6 @@ class HapticForceManagerJF(Node):
             ax.relim()
             ax.autoscale_view(scalex=False, scaley=True)
 
-        # Share window.
         self.l_share_home_F.set_data(t, share_home_F)
         self.l_share_guide_F.set_data(t, share_guide_F)
         self.l_share_home_T.set_data(t, share_home_T)
@@ -506,6 +416,7 @@ class HapticForceManagerJF(Node):
 
 
 def main(args=None):
+    """Spins ROS on a daemon thread and drives Matplotlib on the main thread."""
     rclpy.init(args=args)
     node = HapticForceManagerJF()
 

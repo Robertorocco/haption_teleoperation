@@ -1,41 +1,5 @@
 #!/usr/bin/env python3
-"""haptic_force_manager_C -- "no-guidance" baseline force feedback.
-
-THIRD feedback strategy (baseline / control condition for the user study). It runs
-alongside the EXISTING clutch teleop node (teleop_triago_clutch.py); no predictive
-assistance is provided and main_shared_autonomy's guidance is NOT used.
-
-The operator teleoperates the TRIAGo hand entirely by hand. The ONLY assistive
-feedback rendered is F_sync -- the spring-damper tether that keeps the Haption
-handle synced with the real EE pose -- computed EXACTLY as in
-haptic_force_manager_CF.py but 30% STRONGER (sync gains x1.3). There is no
-F_guide, no F_fixture, no F_cbf, and no clutch alignment guidance.
-
-To stay CONSISTENT with haptic_force_manager_CF (same rules/features), this
-node keeps everything that is not guidance:
-  * grasp_active EE-FOLLOWING: while the grasp state machine drives the arm
-    autonomously (/shared_autonomy/grasp_active = True) the user input is ignored
-    and the handle is dragged to follow the EE motion (position tether + velocity
-    following) so the operator feels the autonomous grasp/lift/abort -- identical
-    to the tutorial. (If the grasp machine is not running, this branch is simply
-    never entered.)
-  * clutch handling: on clutch press the wrench is frozen at 50% (cognitive
-    grounding) -- but WITHOUT the tutorial's added rotational alignment guidance.
-  * joint-limit "clutch advice" vibration: IDENTICAL to the tutorial (Mode A) --
-    a one-shot 1 s / 0.07 Nm torque buzz fired when a Haption joint enters
-    LIMIT_OUTER of a limit, disarmed after firing and re-armed only by a full
-    clutch cycle. Both are clutch teleoperation methods, so the cue is shared
-    verbatim. (Replaces the earlier CBF-proximity buzz.)
-  * global viscous damping, arm switching, and the 180-deg-Z Haption<->TRIAGo
-    frame map are unchanged.
-  * final MAX_FORCE / MAX_TORQUE device safety clip is unchanged.
-
-Removed vs the tutorial (this is a NO-GUIDANCE baseline):
-  * F_guide (velocity-field guidance), F_fixture (position funnel), F_cbf
-    (collision repulsion) and all their subscriptions/state.
-  * the adaptive sync-share and the MAX_TOTAL assistive authority cap (they only
-    shaped/bounded the guidance pushers, which no longer exist).
-"""
+"""CLUTCH sync-only baseline (F=0, B=0): renders only the F_sync tether, no predictive assistance."""
 
 import rclpy
 from rclpy.node import Node
@@ -49,25 +13,22 @@ from collections import deque
 import matplotlib.pyplot as plt
 import matplotlib
 
-# Single source of truth for the experiment-condition selector (2x3 study).
+# Cross-package condition selector: single source of truth for the 2x2x2 study cell.
 import triago_control.qp_controller.config as cfg
 
-# Set backend to avoid blocking the ROS spin loop
+# TkAgg keeps Matplotlib off the ROS spin thread.
 matplotlib.use('TkAgg')
 
 
 class HapticForceManagerNoGuidance(Node):
+    # Baseline force manager: F_sync tether + unified cues, no guidance/fixture/CBF forces.
     def __init__(self):
-        """Initializes the no-guidance haptic force manager (F_sync tether only)."""
         super().__init__('haptic_force_manager_noguidance')
 
-        # Fail loudly if launched under the wrong study condition. This is the
-        # CLUTCH "Sync only" baseline: NO assistive feedback, NO blending
-        # (F_sync tether is the only rendered force).
+        # Hard-error at startup unless config.py selects the CLUTCH sync-only cell.
         cfg.validate_condition('haptic_force_manager_C',
                                control_mode=cfg.CLUTCH, feedback=False, blending=False)
 
-        # --- State Variables ---
         self.pos_target = None
         self.rot_target = None
         self.pos_real = None
@@ -75,89 +36,61 @@ class HapticForceManagerNoGuidance(Node):
         self.vel_real = np.zeros(3)     # active-arm EE linear velocity (from ee_real)
         self.vel_haption = np.zeros(6)  # handle 6D spatial velocity (Haption frame)
 
-        # --- F_sync gains (DOUBLED for this baseline) ---
-        # Tutorial: Kp_sync = 10.0, Kp_sync_ang = 0.3, Kd_sync = 0.0.
-        # This baseline renders ONLY F_sync, so the tether is made much stronger:
-        # 2x the previous setting of this node (13.0 / 0.39) = 2.6x the tutorial.
-        # Kd stays 0 -> the global damping below supplies the viscous term.
-        self.Kp_sync = 30.0        # N/m     translation sync spring  [×3 tutorial: sync is the only force]
-        self.Kd_sync = 0.0         # Ns/m    (0: global damping supplies the viscous term)
-        self.Kp_sync_ang = 0.9     # Nm/rad  orientation sync spring  [×3 tutorial]
+        # Sync spring gains, unified across all clutch cells (Kd=0: global damper supplies viscosity).
+        self.Kp_sync = 30.0        # N/m
+        self.Kd_sync = 0.0         # Ns/m
+        self.Kp_sync_ang = 0.9     # Nm/rad
 
-        # --- Grasp-execution coupling (identical to the tutorial) ---
-        # While /shared_autonomy/grasp_active = True the SM drives the arm and the
-        # user input is ignored; we render a strong follow wrench so the operator
-        # FEELS the autonomous motion. Position tether toward where the arm is now,
-        # plus a velocity-following term (makes the LIFT clearly felt).
+        # During autonomous grasp no force is impressed; only a vibration cue is rendered.
         self.grasp_active = False
         self._grasp_start_pos = None
-        self.GRASP_FOLLOW_KP = 30.0     # N/m   position tether toward the current EE
-        self.GRASP_FOLLOW_KD = 160.0    # Ns/m  velocity-following (direction/speed of travel)
-        # Grasp vibration cue (REPLACES the follow force): a constant 0.07 Nm
-        # square-wave buzz on the torque axes rendered for the WHOLE autonomous
-        # grasp. No force is impressed during the grasp — only this cue.
-        self.GRASP_VIB_AMP = 0.07
+        self.GRASP_FOLLOW_KP = 30.0     # N/m
+        self.GRASP_FOLLOW_KD = 160.0    # Ns/m
+        self.GRASP_VIB_AMP = 0.07       # Nm constant square-wave buzz during the whole grasp
         self.grasp_vib_toggle = 1.0
 
-        # --- Clutching (freeze wrench at 50% on press + orientation alignment) ---
+        # Clutch press freezes the wrench at 50% (cognitive grounding).
         self.is_clutching = False
         self.was_clutching_last_frame = False
         self.f_clutch_frozen = np.zeros(6)
-        # Clutch orientation-alignment torque: UNIFIED across all clutch cells and
-        # treated as a SYNC effect (help the operator re-align the handle to the EE
-        # reference while clutching), so it is present in the baseline too.
         self.rot_haption = None
-        self.K_align = 10.0  # Nm/rad — clutch orientation-alignment stiffness
-        # DISABLED (bug fix): the alignment error mixes frames — rot_target is in
-        # the robot base frame, rot_haption in the Haption device frame — so the
-        # torque is NON-restorative and drives an unstable limit cycle that
-        # saturates the torque clip ("explosion") on clutch press. It was previously
-        # inert (the PoseStamped subscription never matched the Pose publisher).
-        # Keep OFF until a frame-correct alignment is derived and bench-tested.
+        self.K_align = 10.0  # Nm/rad clutch orientation-alignment stiffness
+        # Disabled: the alignment error mixes robot-base and device frames, making the torque non-restorative.
         self.ENABLE_CLUTCH_ALIGN = False
 
-        # --- Global viscous damping (impedance-device stability, same as tutorial) ---
+        # Global viscous damping (impedance-device stability), unified across clutch cells.
         self.Kd_global_lin = 0.7   # Ns/m
         self.Kd_global_ang = 0.1   # Nms/rad
 
-        # --- Device safety clip (final bound published to the handle) ---
+        # Device safety clip and unified authority cap (currently equal).
         self.MAX_FORCE = 10.0      # N
         self.MAX_TORQUE = 1.0      # Nm
-        # Authority cap (UNIFIED across all 8 cells; currently == the device clip):
-        # one knob for the max assistance magnitude, applied proportionally.
         self.MAX_TOTAL_FORCE = 10.0
         self.MAX_TOTAL_TORQUE = 1.0
 
-        # --- Arm the force is computed for (follows /shared_autonomy/active_arm) ---
+        # Arm the force is computed for (follows shared autonomy's active arm).
         self.active_arm = 'right'
 
-        # --- Articular Limit Variables (Haption joint positions + bounds) ---
+        # Haption joint positions and calibrated limits (for the joint-limit cue).
         self.joint_pos = np.zeros(6)
         self.joint_min = np.array([-0.804283, -1.65038, 0.728283, -3.02431, -1.28196, -2.05398])
         self.joint_max = np.array([0.781944, -0.0654231, 2.49752, 2.82038, 1.04722, 2.09453])
 
-        #  Articular Limit Vibration Tuning Parameters
-        self.LIMIT_OUTER = 0.25       # Radians where vibration starts
-        self.LIMIT_INNER = 0.15       # Radians where vibration hits maximum
-        self.AMP_MIN = 0.05           # Nm torque at the outer boundary
-        self.AMP_MAX = 0.07           # Nm torque at the inner boundary
-        self.vib_toggle = 1.0         # Toggles between 1 and -1 every frame for 75Hz square wave
+        self.LIMIT_OUTER = 0.25       # rad: margin where the cue can fire
+        self.LIMIT_INNER = 0.15       # rad: margin of maximum vibration
+        self.AMP_MIN = 0.05           # Nm
+        self.AMP_MAX = 0.07           # Nm
+        self.vib_toggle = 1.0         # sign flip every frame -> 75 Hz square wave
 
-        # --- Joint-limit "clutch advice" one-shot burst (IDENTICAL to Mode A) ---
-        # When a joint enters LIMIT_OUTER, fire a SINGLE fixed-amplitude buzz that
-        # lasts LIMIT_VIB_DURATION and then goes silent. It will NOT fire again
-        # until the operator completes a full clutch cycle (press -> release), so
-        # the burst is unambiguously interpreted as "you should clutch now". Both
-        # this baseline and Mode A are clutch teleoperation methods, so the cue is
-        # shared verbatim.
-        self.LIMIT_VIB_DURATION = 1.0   # s   burst length
-        self.LIMIT_VIB_AMP = 0.07       # Nm  fixed torque amplitude of the burst
-        self.limit_vib_armed = True     # ready to fire (re-armed by a clutch cycle)
-        self.limit_vib_active = False   # a burst is currently playing
-        self.limit_vib_start_time = 0.0 # wall-clock start of the active burst
-        self._vib_clutch_prev = False   # previous clutch state (for cycle edge detect)
+        # Joint-limit "clutch advice": one-shot burst, re-armed only by a full clutch cycle.
+        self.LIMIT_VIB_DURATION = 1.0   # s
+        self.LIMIT_VIB_AMP = 0.07       # Nm
+        self.limit_vib_armed = True
+        self.limit_vib_active = False
+        self.limit_vib_start_time = 0.0
+        self._vib_clutch_prev = False
 
-        # --- Data Buffers & Synchronization (live plot) ---
+        # Plot buffers (10 s window at 150 Hz), guarded by a lock shared with the UI thread.
         self.plot_lock = threading.Lock()
         self.plot_window_sec = 10.0
         self.buffer_size = int(150 * self.plot_window_sec)
@@ -171,27 +104,19 @@ class HapticForceManagerNoGuidance(Node):
         self._own_freq_lpf = 0.0
         self._own_last_time = None
 
-        # --- Subscriptions (reference + real EE + handle velocity + clutch/arm/grasp) ---
-        # NOTE: NO guidance topics (goal_names/probabilities/user_policy/
-        # active_goal_pose) and NO CBF topics (collision_constraints/lambda_cbf):
-        # this baseline renders only F_sync.
+        # No guidance/CBF subscriptions: this baseline renders only F_sync plus cues.
         self.create_subscription(Float64MultiArray, '/arm_right/cartesian_reference', self.target_cb, 10)
         self.create_subscription(Float64MultiArray, '/arm_left/cartesian_reference', self.target_cb_left, 10)
         self.create_subscription(Float64MultiArray, '/qp_debug/ee_real', self.real_cb, 10)
         self.create_subscription(Twist, 'virtuose/velocity', self.vel_cb, 10)
         self.create_subscription(Bool, 'virtuose/button_right', self.button_cb, 10)
-        # Grasp-execution flag: follow the EE (same as the tutorial) while True.
         self.create_subscription(Bool, '/shared_autonomy/grasp_active', self.grasp_active_cb, 10)
-        # Arm switch: follow the active arm for EE state slicing and reference topic.
         self.create_subscription(String, '/shared_autonomy/active_arm', self.active_arm_cb, 10)
-        # Haption joint encoders for the joint-limit clutch-advice vibration.
         self.create_subscription(Float64MultiArray, 'virtuose/articular_position', self.joint_cb, 10)
-        # Handle orientation for the clutch alignment torque (same as CF/CB/CFB).
         self.create_subscription(Pose, 'virtuose/pose', self.haption_pose_cb, 10)
 
         self.force_pub = self.create_publisher(Wrench, 'virtuose/force_cmd', 10)
 
-        # --- Timer (150 Hz control loop) ---
         self.dt = 1.0 / 150.0
         self.timer = self.create_timer(self.dt, self.control_loop)
 
@@ -204,14 +129,13 @@ class HapticForceManagerNoGuidance(Node):
     # PLOT SETUP & UPDATE
     # =========================
     def setup_plot(self):
-        """Initializes a compact live plot: F_sync, published total, and loop rate."""
+        """Initializes the live plot: F_sync, published total, and loop rate."""
         plt.ion()
         self.fig, self.axs = plt.subplots(3, 2, figsize=(11, 8))
         self.fig.canvas.manager.set_window_title('Haptic Force (NO-GUIDANCE: F_sync only)')
         colors = ['r', 'g', 'b']
         labels = ['X', 'Y', 'Z']
 
-        # [0,0] Sync force, [0,1] Sync torque
         self.lines_sync_F = []
         ax = self.axs[0, 0]
         ax.set_title("F_sync - FORCE (N)", fontsize=10)
@@ -228,7 +152,6 @@ class HapticForceManagerNoGuidance(Node):
             self.lines_sync_T.append(ax.plot([], [], color=colors[i], label=f"T{labels[i]}")[0])
         ax.legend(loc='upper left', fontsize=8, ncol=3)
 
-        # [1,0] Total force, [1,1] Total torque
         self.lines_tot_F = []
         ax = self.axs[1, 0]
         ax.set_title("Published TOTAL - FORCE (N)", fontsize=10)
@@ -249,7 +172,6 @@ class HapticForceManagerNoGuidance(Node):
             self.lines_tot_T.append(ax.plot([], [], color=colors[i], label=f"T{labels[i]}")[0])
         ax.legend(loc='upper left', fontsize=8, ncol=4)
 
-        # [2,0] loop frequency, [2,1] hidden
         ax = self.axs[2, 0]
         ax.set_title("Force Manager Frequency (Hz)", fontsize=10)
         ax.set_ylabel("Hz"); ax.set_xlabel("Time (s)")
@@ -298,7 +220,7 @@ class HapticForceManagerNoGuidance(Node):
     # CALLBACKS
     # =========================
     def haption_pose_cb(self, msg):
-        """Handle orientation (geometry_msgs/Pose) for the clutch alignment torque."""
+        """Stores the handle orientation (geometry_msgs/Pose) for the clutch alignment torque."""
         q = msg.orientation
         self.rot_haption = R.from_quat([q.x, q.y, q.z, q.w])
 
@@ -307,7 +229,7 @@ class HapticForceManagerNoGuidance(Node):
         self.is_clutching = msg.data
 
     def grasp_active_cb(self, msg):
-        """Tracks whether the shared-autonomy node is autonomously driving a grasp."""
+        """Tracks whether shared autonomy is autonomously driving a grasp."""
         self.grasp_active = bool(msg.data)
 
     def active_arm_cb(self, msg):
@@ -317,7 +239,7 @@ class HapticForceManagerNoGuidance(Node):
             self.get_logger().info(f"[FORCE MGR] Active arm switched to {msg.data.upper()}")
 
     def joint_cb(self, msg):
-        """Updates the current 6-DoF joint positions directly from the Haption encoders."""
+        """Updates the 6-DoF Haption joint positions from the encoders."""
         if len(msg.data) >= 6:
             self.joint_pos = np.array(msg.data[0:6])
 
@@ -351,7 +273,7 @@ class HapticForceManagerNoGuidance(Node):
             self.rot_real = R.from_euler('xyz', rpy, degrees=False)
 
     def vel_cb(self, msg):
-        """Updates the current 6D spatial velocity of the handle (raw, unfiltered)."""
+        """Updates the handle's raw 6D spatial velocity."""
         self.vel_haption = np.array([
             msg.linear.x, msg.linear.y, msg.linear.z,
             msg.angular.x, msg.angular.y, msg.angular.z
@@ -361,23 +283,18 @@ class HapticForceManagerNoGuidance(Node):
     # FORCE COMPONENT (F_sync only)
     # =========================
     def compute_F_sync(self):
-        """3D+3D spring tether keeping the handle synced with the real EE pose.
-
-        Identical formulation to haptic_force_manager_CF.compute_F_sync (the
-        180-deg-Z Haption<->TRIAGo frame map on both the position spring and the
-        orientation spring), only with the 30%-boosted gains set in __init__.
-        """
+        """Spring tether (position + orientation) keeping the handle synced with the real EE pose."""
         F_sync = np.zeros(6)
         if self.pos_target is None or self.pos_real is None:
             return F_sync
 
-        # Position spring (TRIAGo frame) -> Haption frame (negate X, negate Y, keep Z).
+        # Position spring in TRIAGo frame, mapped to Haption frame (negate X, Y).
         error_pos_tiago = self.pos_real - self.pos_target
         F_spring_tiago = self.Kp_sync * error_pos_tiago
         F_spring_haption = np.array([-F_spring_tiago[0], -F_spring_tiago[1], F_spring_tiago[2]])
         F_sync[0:3] = F_spring_haption - (self.Kd_sync * self.vel_haption[0:3])
 
-        # Orientation spring: R_err = R_real * R_target^T, mapped to the Haption frame.
+        # Orientation spring: R_err = R_real * R_target^T, same frame flip on the torque.
         if self.rot_real is not None and self.rot_target is not None:
             err_rot = R.from_matrix(
                 self.rot_real.as_matrix() @ self.rot_target.as_matrix().T).as_rotvec()
@@ -389,23 +306,11 @@ class HapticForceManagerNoGuidance(Node):
         return F_sync
 
     def compute_F_limit_warning(self):
-        """Joint-limit "clutch advice" vibration: a ONE-SHOT 1 s torque burst.
-
-        IDENTICAL to haptic_force_manager_CF.compute_F_limit_warning (Mode A):
-          * Trigger — the moment any Haption joint enters LIMIT_OUTER of a limit,
-            AND the burst is currently armed, a single fixed-amplitude
-            (LIMIT_VIB_AMP) 75 Hz square-wave buzz is started on the three torque
-            axes.
-          * Duration — the buzz always plays for its full LIMIT_VIB_DURATION
-            (1 s), even if the operator starts clutching partway through.
-          * Latch — once fired the burst is DISARMED and cannot fire again until
-            the operator completes a full clutch cycle (button press -> release).
-            The operator is meant to read the buzz as "clutch now to re-center".
-        """
+        """One-shot 1 s torque burst when a device joint nears a limit; re-armed by a full clutch cycle."""
         F_vib = np.zeros(6)
         now = time.time()
 
-        # Re-arm on a COMPLETED clutch cycle (press -> release = falling edge).
+        # Re-arm on a completed clutch cycle (press -> release).
         if self._vib_clutch_prev and not self.is_clutching:
             self.limit_vib_armed = True
         self._vib_clutch_prev = self.is_clutching
@@ -415,16 +320,15 @@ class HapticForceManagerNoGuidance(Node):
         dist_to_max = self.joint_max - self.joint_pos
         min_margin = float(np.min(np.concatenate([dist_to_min, dist_to_max])))
 
-        # Trigger a fresh one-shot burst (only if armed and not already playing).
+        # Fire only if armed and not already playing.
         if (min_margin <= self.LIMIT_OUTER
                 and self.limit_vib_armed
                 and not self.limit_vib_active):
             self.limit_vib_active = True
             self.limit_vib_start_time = now
-            self.limit_vib_armed = False   # stay silent until the next clutch cycle
+            self.limit_vib_armed = False
 
-        # Emit the burst for its fixed duration, then stop (let it finish even if
-        # the user is already clutching).
+        # The burst always plays its full duration, even if the operator clutches midway.
         if self.limit_vib_active:
             if (now - self.limit_vib_start_time) <= self.LIMIT_VIB_DURATION:
                 self.vib_toggle *= -1.0
@@ -441,25 +345,18 @@ class HapticForceManagerNoGuidance(Node):
     # MAIN LOOP
     # =========================
     def control_loop(self):
-        """Renders F_sync only (or the grasp-follow wrench during autonomous grasp),
-        applies clutch-freeze + global damping, clips, publishes, and buffers."""
+        """150 Hz: renders F_sync (or the grasp cue), applies clutch freeze + damping, clips, publishes."""
         f_sync = self.compute_F_sync()
 
-        # Grasp execution takes precedence (same rule as the tutorial): while the
-        # autonomy drives the arm, drag the handle to FOLLOW the EE motion so the
-        # operator feels the grasp/lift/abort. If the grasp machine is not running,
-        # grasp_active stays False and this branch is never entered.
         if self.grasp_active:
-            # Grasp in progress: impress NO force (the old EE-follow pull is
-            # removed). A constant 0.07 Nm vibration cue is added below instead.
+            # Autonomous grasp: no force impressed, only the vibration cue added below.
             self._grasp_start_pos = None
             f_total_normal = np.zeros(6)
         else:
-            self._grasp_start_pos = None   # reset so the next grasp re-anchors
+            self._grasp_start_pos = None
             f_total_normal = f_sync.copy()
 
-        # Authority cap (UNIFIED across all cells): proportionally bound the
-        # assistive wrench magnitude to MAX_TOTAL_* (currently == the device clip).
+        # Authority cap: proportional rescale bounds the assistive wrench to MAX_TOTAL_*.
         fn = np.linalg.norm(f_total_normal[0:3])
         if fn > self.MAX_TOTAL_FORCE:
             f_total_normal[0:3] *= self.MAX_TOTAL_FORCE / fn
@@ -467,17 +364,14 @@ class HapticForceManagerNoGuidance(Node):
         if tn > self.MAX_TOTAL_TORQUE:
             f_total_normal[3:6] *= self.MAX_TOTAL_TORQUE / tn
 
-        # Clutch handling: freeze the wrench at 50% on press (cognitive grounding).
-        # No alignment guidance is added (this is the no-guidance baseline).
+        # Clutch press: freeze the wrench at 50% (cognitive grounding).
         if self.is_clutching:
             if not self.was_clutching_last_frame:
                 self.f_clutch_frozen = f_total_normal / 2.0
                 self.was_clutching_last_frame = True
             f_total = self.f_clutch_frozen.copy()
 
-            # Clutch orientation-alignment torque (UNIFIED with CF/CB/CFB, treated
-            # as a sync effect): pull the HANDLE orientation toward the target
-            # orientation, faded to zero near a Haption joint limit.
+            # Alignment torque toward the target orientation, faded near device joint limits (disabled).
             if self.ENABLE_CLUTCH_ALIGN and self.rot_haption is not None and self.rot_target is not None:
                 error_rot_matrix = self.rot_target.as_matrix() @ self.rot_haption.as_matrix().T
                 error_rot_vec = R.from_matrix(error_rot_matrix).as_rotvec()
@@ -496,20 +390,14 @@ class HapticForceManagerNoGuidance(Node):
             f_total = f_total_normal
             self.was_clutching_last_frame = False
 
-        # Global viscous damping (impedance-device stability). Skipped during a
-        # grasp so the handle is free apart from the vibration cue below.
+        # Global viscous damping; skipped during grasp so only the cue is felt.
         if not self.grasp_active:
             f_total[0:3] -= self.Kd_global_lin * self.vel_haption[0:3]
             f_total[3:6] -= self.Kd_global_ang * self.vel_haption[3:6]
 
-        # Joint-limit "clutch advice" vibration (IDENTICAL to Mode A): a ONE-SHOT
-        # 1 s burst fired when a Haption joint nears a limit, re-armed only by a
-        # full clutch cycle. Injected last so it rides on top of the possibly
-        # clutch-frozen wrench and toggles every frame.
+        # Cues injected last so they ride on top of any frozen wrench and toggle every frame.
         f_vib = self.compute_F_limit_warning()
         if self.grasp_active:
-            # Grasp cue: constant 0.07 Nm square-wave buzz on the torque axes for
-            # the whole grasp (replaces the removed EE-follow force).
             self.grasp_vib_toggle *= -1.0
             gb = self.GRASP_VIB_AMP * self.grasp_vib_toggle
             f_total[3] += gb
@@ -546,7 +434,7 @@ class HapticForceManagerNoGuidance(Node):
 
 
 def main(args=None):
-    """Initializes ROS, spins on a daemon thread, drives Matplotlib on the main thread."""
+    """Spins ROS on a daemon thread and drives Matplotlib on the main thread."""
     rclpy.init(args=args)
     node = HapticForceManagerNoGuidance()
 

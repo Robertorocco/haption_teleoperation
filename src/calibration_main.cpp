@@ -1,3 +1,4 @@
+// Manual joint-limit discovery: device transparent, push each joint to its stops, Ctrl+C prints limits.
 #include <iostream>
 #include <chrono>
 #include <thread>
@@ -56,23 +57,20 @@ int main()
 
     int iter = 0;
 
-    // Run until user presses Ctrl+C
     while (keep_running)
     {
-        // 1. Send zero force to keep the robot completely transparent
+        // Zero force keeps the device fully transparent while the operator explores the limits.
         float null_f[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         virtSetForce(VC, null_f);
 
-        // 2. Read articular (joint) positions
+        // Track the running min/max of each joint position.
         if (virtGetArticularPosition(VC, current_pos) == 0) {
-            // 3. Update min and max limits
             for (int i = 0; i < 6; i++) {
                 if (current_pos[i] < min_pos[i]) min_pos[i] = current_pos[i];
                 if (current_pos[i] > max_pos[i]) max_pos[i] = current_pos[i];
             }
         }
 
-        // 4. Print live feedback occasionally so you know it's working
         if (iter % 200 == 0) {
             cout << "\rTracking... Joint 1: [" << min_pos[0] << " to " << max_pos[0] << "]   " << flush;
         }

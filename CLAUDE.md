@@ -2,6 +2,15 @@
 
 Before doing any work in this repo, read `.kiro/context.md` — it holds the current state of the project (architecture, in-progress work, decisions) and is the primary source of truth for Claude sessions here, alongside README.md for user-facing info.
 
+## Code Comment Style
+
+- Comments are **1 line only**: short, explicative, minimal.
+- No history: no dates, no "previously X now Y", no references to past bugs, tuning steps, commits, or sessions. That belongs in the commit message, not the file.
+- Each method gets exactly 1 explanatory line before/as its docstring.
+- Comment only the non-obvious: hidden invariants, subtle workarounds, hard-to-read formulas, load-bearing observations. Well-named code needs no comment restating what it does.
+- Write for a reader new to the project: comments must convey the fundamental meaning of the architecture, not internal narrative.
+- The platform is **TRIAGo** — use that name in comments even where files/Docker say TIAGO.
+
 It is Claude's responsibility to keep `.kiro/context.md` accurate and up to date as work happens in this repo: update it when architecture changes, features land, or decisions are made, so a new chat can pick up full context from this file alone.
 
 ## Sibling repo: triago_control

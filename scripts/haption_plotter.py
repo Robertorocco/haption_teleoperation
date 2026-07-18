@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Live telemetry plotter for the Haption device: handle pose, velocity, and commanded force."""
 
 import rclpy
 from rclpy.node import Node
@@ -54,14 +55,7 @@ class VirtuosePlotterNode(Node):
 # Helpers
 # =========================================
 def _set_ylim_from_data(ax, *data_lists):
-    """
-    Compute y limits directly from data instead of using relim()/autoscale_view().
-
-    relim() calls get_path() -> recache() -> broadcast_arrays(x, y) on every Line2D
-    child of the axes.  In matplotlib 3.5.x (Ubuntu 22.04 system packages) this can
-    produce a ValueError when the cached x/y arrays are transiently out of sync.
-    Bypassing relim() eliminates that code path entirely.
-    """
+    """Sets y-limits directly from the data (relim() can ValueError on transiently unsynced lines)."""
     all_vals = [v for dl in data_lists for v in dl]
     if not all_vals:
         return

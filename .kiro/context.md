@@ -163,7 +163,9 @@ The task, belief function and policy are the SAME for both teleop modes, so the 
 |---|---|---|
 | `virtuose/pose` | Pose | handle position + quat [x,y,z,w] |
 | `virtuose/velocity` | Twist | 6-DOF spatial velocity (device frame) |
-| `virtuose/button` | Bool | right button (clutch) |
+| `virtuose/button_right` | Bool | right button (clutch) |
+| `virtuose/button_left` | Bool | left button (grasp trigger / double-click arm switch) |
+| `virtuose/deadman` | Bool | dead-man grip sensor (`virtGetDeadMan`) — true only while the operator is physically holding the handle; published only when the API call succeeds (no message that tick otherwise). Distinct from both buttons: it is a passive presence sensor, not an operator-pressed control, and `INDEXING_NONE` (§ below) already requires it internally for indexing — this topic just exposes that same signal to ROS consumers. No subscriber yet in this repo or `triago_control`; intended for a future safety gate (e.g. force-manager nodes freezing/zeroing the wrench when ungripped) or study telemetry (grip-release events during a trial). |
 | `virtuose/articular_position` | Float64MultiArray | 6 joint positions (rad) |
 
 | Subscribed | Type | Content |

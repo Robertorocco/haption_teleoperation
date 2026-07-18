@@ -1,32 +1,5 @@
 #!/usr/bin/env python3
-"""Haptic Force Manager -- JOYSTICK MODE (BLENDING).
-
-In Joystick Mode the handle is a spring-centered joystick: teleop_triago_joystick.py
-reads its DISPLACEMENT from a home pose and maps that to a Cartesian twist. This
-node renders the ONE and ONLY haptic force of that mode -- the restorative
-centering spring that constantly pulls the handle back to its home configuration.
-
-There is deliberately NO F_sync / F_guide / F_fixture / F_cbf, no clutch-align, no
-joint-limit vibration, and no grasp-follow force. Coupling any robot-state-derived
-force back onto the handle is exactly what made the previous BLENDING design
-unstable (the force moved the handle, the handle motion was read as user intent,
-and the loop diverged). The spring targets ONLY the home pose, which is a function
-of the (fixed) neutral position and the gripper's orientation -- never of tracking
-error -- so it cannot form that loop.
-
-Home pose:
-  - Position: fixed, cfg.JOYSTICK_NEUTRAL_POSITION_M = [0.5, -0.03, -0.03].
-  - Orientation: dynamic, tracks the gripper (see teleop_triago_joystick.py), starting
-    from cfg.JOYSTICK_NEUTRAL_ORIENTATION_XYZW = [0.0, 0.7071068, 0.0, 0.7071068].
-  - The live home pose is OWNED and published by teleop_triago_joystick.py on
-    cfg.JOYSTICK_HOME_POSE_TOPIC (single source of truth). This node subscribes to
-    it and falls back to the neutral constants above until the first message.
-
-Force (Haption base frame, spring-damper toward home):
-  F_lin = KP_LIN * (home_pos - handle_pos) - KD_LIN * handle_vel_lin
-  Tau   = KP_ANG * rotvec(home_rot * handle_rot^-1) - KD_ANG * handle_vel_ang
-clipped to +/- MAX_FORCE / MAX_TORQUE and published on virtuose/force_cmd.
-"""
+"""JOYSTICK guided blending (F=0, B=1): centering spring + cues; assistance lives in the reference blend."""
 
 import threading
 import time
@@ -44,76 +17,62 @@ import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 
-# Single source of truth for the joystick home pose + spring gains.
+# Cross-package condition selector + joystick home pose and spring gains.
 import triago_control.qp_controller.config as cfg
 
 
 class HapticForceManagerBlending(Node):
+    # Blending-cell force manager: only the homing spring is rendered; no robot-state-derived force
+    # ever touches the handle (that coupling is the instability joystick mode exists to avoid).
     def __init__(self):
         super().__init__('haptic_force_manager_blending')
 
-        # Fail loudly if launched under the wrong study condition. This is the
-        # JOYSTICK "Guided blending" manager: NO assistive feedback (channel F off),
-        # reference blending ON (channel B). The handle renders only the restorative
-        # centering spring; assistance comes from main_shared_autonomy's alpha blend.
+        # Hard-error at startup unless config.py selects the JOYSTICK guided-blending cell.
         cfg.validate_condition('haptic_force_manager_JB',
                                control_mode=cfg.JOYSTICK, feedback=False, blending=True)
 
-        # --- Home pose (Haption base frame) -- neutral until teleop publishes ---
+        # Home pose (Haption base frame), neutral until the teleop broadcasts the live home.
         self.home_pos = np.array(cfg.JOYSTICK_NEUTRAL_POSITION_M, dtype=float)
         self.home_rot = R.from_quat(cfg.JOYSTICK_NEUTRAL_ORIENTATION_XYZW)  # xyzw
 
-        # --- Live handle state (Haption base frame) ---
         self.handle_pos = None
         self.handle_rot = None
         self.handle_vel = np.zeros(6)
 
-        # --- Spring gains ---
+        # Spring gains, unified across all joystick cells.
         self.KP_LIN = cfg.JOYSTICK_SPRING_KP_LIN
         self.KD_LIN = cfg.JOYSTICK_SPRING_KD_LIN
         self.KP_ANG = cfg.JOYSTICK_SPRING_KP_ANG
         self.KD_ANG = cfg.JOYSTICK_SPRING_KD_ANG
 
-        # --- Global force limits ---
+        # Device safety clip and unified authority cap (currently equal).
         self.MAX_FORCE = 10.0
         self.MAX_TORQUE = 1.0
-        # Authority cap (UNIFIED across all 8 cells; currently == the device clip):
-        # one knob for the max assistance magnitude, applied proportionally.
         self.MAX_TOTAL_FORCE = 10.0
         self.MAX_TOTAL_TORQUE = 1.0
 
-        # --- Out-of-deadzone vibration cue ---
-        # A constant, low-amplitude buzz on the three torque axes rendered the
-        # WHOLE time the handle sits outside the joystick deadband (i.e. exactly
-        # while the teleop is commanding a non-zero twist). It tells the operator
-        # "you are actively driving". Zero-mean + high-frequency, so it does not
-        # bias the displacement the teleop reads back.
-        self.VIB_AMP = 0.05           # Nm  constant torque amplitude while outside the deadband
-        self.vib_toggle = 1.0         # per-frame sign toggle (~75 Hz square wave)
+        # Out-of-deadzone cue: zero-mean buzz whenever a non-zero twist is being commanded.
+        self.VIB_AMP = 0.05           # Nm
+        self.vib_toggle = 1.0         # sign flip every frame -> ~75 Hz square wave
 
-        # --- Grasp-execution vibration cue (UNIFIED with clutch cells) ---
+        # Autonomous-grasp cue, unified across all 8 cells.
         self.grasp_active = False
-        self.GRASP_VIB_AMP = 0.07    # Nm  constant buzz during autonomous grasp
+        self.GRASP_VIB_AMP = 0.07    # Nm
         self.grasp_vib_toggle = 1.0
 
-        # --- Subscribers ---
-        # NOTE: virtuose_server_node publishes virtuose/pose as geometry_msgs/Pose
-        # (NOT PoseStamped) -- subscribing with the wrong type silently receives
-        # nothing, which zeroes the spring (handle_pos stays None).
+        # virtuose/pose is geometry_msgs/Pose (not PoseStamped) -- the wrong type silently receives nothing.
         self.create_subscription(Pose, 'virtuose/pose', self.handle_pose_cb, 10)
         self.create_subscription(Twist, 'virtuose/velocity', self.vel_cb, 10)
         self.create_subscription(
             Float64MultiArray, cfg.JOYSTICK_HOME_POSE_TOPIC, self.home_pose_cb, 10)
-        # Blending telemetry: [alpha, v_user(6), v_policy(6), v_blend(6)] = 19 floats.
+        # Blend telemetry: [alpha, v_user(6), v_policy(6), v_blend(6)] = 19 floats.
         self.create_subscription(
             Float64MultiArray, '/shared_autonomy/blend_debug', self.blend_debug_cb, 10)
-        # Grasp-execution flag: vibrate during autonomous grasp.
         self.create_subscription(Bool, '/shared_autonomy/grasp_active', self.grasp_active_cb, 10)
 
-        # --- Publisher ---
         self.force_pub = self.create_publisher(Wrench, 'virtuose/force_cmd', 10)
 
-        # --- Plot buffers ---
+        # Plot buffers (10 s window at 150 Hz), guarded by a lock shared with the UI thread.
         self.plot_lock = threading.Lock()
         self.plot_window_sec = 10.0
         self.buffer_size = int(150 * self.plot_window_sec)
@@ -127,8 +86,7 @@ class HapticForceManagerBlending(Node):
         self._last_time = None
         self._freq_lpf = 0.0
 
-        # --- Blending telemetry (from /shared_autonomy/blend_debug), identical to
-        #     the CB manager so every B=1 cell reports the same alpha + share. ---
+        # Blend telemetry buffers (alpha + user/policy share), shared design with every B=1 cell.
         self.alpha_data = deque(maxlen=self.buffer_size)
         self.user_pct_data = deque(maxlen=self.buffer_size)
         self.policy_pct_data = deque(maxlen=self.buffer_size)
@@ -148,28 +106,30 @@ class HapticForceManagerBlending(Node):
 
     # ------------------------------------------------------------------ callbacks
     def handle_pose_cb(self, msg):
+        """Stores the latest handle pose (Haption base frame)."""
         p = msg.position
         q = msg.orientation
         self.handle_pos = np.array([p.x, p.y, p.z])
         self.handle_rot = R.from_quat([q.x, q.y, q.z, q.w])
 
     def vel_cb(self, msg):
+        """Stores the latest handle 6-DOF spatial velocity."""
         self.handle_vel = np.array([
             msg.linear.x, msg.linear.y, msg.linear.z,
             msg.angular.x, msg.angular.y, msg.angular.z])
 
     def home_pose_cb(self, msg):
-        """Live home pose from teleop_triago_joystick.py: [pos(3), quat_xyzw(4)]."""
+        """Updates the live home pose from the teleop node: [pos(3), quat_xyzw(4)]."""
         if len(msg.data) >= 7:
             self.home_pos = np.array(msg.data[0:3])
             self.home_rot = R.from_quat(np.array(msg.data[3:7]))
 
     def grasp_active_cb(self, msg):
-        """Tracks whether the shared-autonomy node is autonomously driving a grasp."""
+        """Tracks whether shared autonomy is autonomously driving a grasp."""
         self.grasp_active = bool(msg.data)
 
     def blend_debug_cb(self, msg):
-        """Process /shared_autonomy/blend_debug: [alpha, v_user(6), v_policy(6), v_blend(6)]."""
+        """Processes blend telemetry [alpha, v_user(6), v_policy(6), v_blend(6)] into share percentages."""
         if len(msg.data) < 13:
             return
         a = float(msg.data[0])
@@ -184,26 +144,23 @@ class HapticForceManagerBlending(Node):
 
     # ------------------------------------------------------------------ force
     def compute_spring(self):
-        """Spring-damper wrench (Haption base frame) pulling the handle to home."""
+        """Spring-damper wrench (Haption base frame) pulling the handle to the home pose."""
         f = np.zeros(6)
         if self.handle_pos is None or self.handle_rot is None:
             return f
 
-        # Linear spring toward the home position.
         f[0:3] = self.KP_LIN * (self.home_pos - self.handle_pos) - self.KD_LIN * self.handle_vel[0:3]
 
-        # Angular spring toward the home orientation (both already in the Haption
-        # frame, so no frame mapping is needed here).
+        # Home and handle are both in the Haption frame, so no frame mapping is needed.
         err_rotvec = (self.home_rot * self.handle_rot.inv()).as_rotvec()
         f[3:6] = self.KP_ANG * err_rotvec - self.KD_ANG * self.handle_vel[3:6]
         return f
 
     def control_loop(self):
+        """150 Hz: renders the homing spring, adds the cues, clips, publishes, buffers."""
         f = self.compute_spring()
 
-        # --- Authority cap (UNIFIED across all cells) ---
-        # Proportionally bound the assistive wrench magnitude to MAX_TOTAL_*
-        # (currently == the device clip) BEFORE the vibration cues.
+        # Authority cap: proportional rescale before the vibration cues.
         fn = np.linalg.norm(f[0:3])
         if fn > self.MAX_TOTAL_FORCE:
             f[0:3] *= self.MAX_TOTAL_FORCE / fn
@@ -211,10 +168,7 @@ class HapticForceManagerBlending(Node):
         if tn > self.MAX_TOTAL_TORQUE:
             f[3:6] *= self.MAX_TOTAL_TORQUE / tn
 
-        # --- Out-of-deadzone vibration cue ---
-        # Buzz whenever the handle displacement from home exceeds EITHER the
-        # linear OR the angular deadband (matches the teleop's radial deadband on
-        # each channel, so the buzz starts exactly when a non-zero twist is sent).
+        # Out-of-deadzone cue: buzz exactly while a non-zero twist is being commanded.
         if self.handle_pos is not None and self.handle_rot is not None:
             lin_disp = float(np.linalg.norm(self.home_pos - self.handle_pos))
             ang_disp = float(np.linalg.norm((self.home_rot * self.handle_rot.inv()).as_rotvec()))
@@ -226,7 +180,7 @@ class HapticForceManagerBlending(Node):
                 f[4] += buzz
                 f[5] += buzz
 
-        # --- Grasp vibration cue (0.07 Nm buzz during autonomous grasp) ---
+        # Autonomous-grasp cue.
         if self.grasp_active:
             self.grasp_vib_toggle *= -1.0
             gb = self.GRASP_VIB_AMP * self.grasp_vib_toggle
@@ -242,7 +196,7 @@ class HapticForceManagerBlending(Node):
         msg.torque.x, msg.torque.y, msg.torque.z = float(f[3]), float(f[4]), float(f[5])
         self.force_pub.publish(msg)
 
-        # --- Buffer telemetry ---
+        # Buffer telemetry.
         t = time.time() - self.start_time
         pos_err = (float(np.linalg.norm(self.home_pos - self.handle_pos))
                    if self.handle_pos is not None else 0.0)
@@ -268,11 +222,11 @@ class HapticForceManagerBlending(Node):
 
     # ------------------------------------------------------------------ plotting
     def setup_plot(self):
+        """Initializes the live plots: spring wrench, displacement/loop rate, blend telemetry."""
         plt.ion()
         colors = ['r', 'g', 'b']
         labels = ['X', 'Y', 'Z']
 
-        # Window 1: spring force + torque.
         self.fig1, self.axs1 = plt.subplots(2, 1, figsize=(10, 5))
         self.fig1.canvas.manager.set_window_title('Joystick Restorative Spring')
         ax = self.axs1[0]
@@ -290,7 +244,6 @@ class HapticForceManagerBlending(Node):
         ax.legend(loc='upper left', fontsize=8, ncol=3)
         self.fig1.tight_layout()
 
-        # Window 2: displacement from home + node frequency.
         self.fig2, self.axs2 = plt.subplots(2, 1, figsize=(10, 5))
         self.fig2.canvas.manager.set_window_title('Handle Displacement From Home')
         ax = self.axs2[0]
@@ -315,20 +268,18 @@ class HapticForceManagerBlending(Node):
         ax.legend(loc='upper left', fontsize=8)
         self.fig2.tight_layout()
 
-        # Window 3: BLENDING telemetry (identical to the CB manager). alpha =
-        # reference-level user<->policy authority; share = how much of the blended
-        # twist magnitude came from the user vs the policy.
+        # Blend-telemetry window: authority alpha + user/policy share.
         self.fig3, self.axs3 = plt.subplots(2, 1, figsize=(10, 5))
         self.fig3.canvas.manager.set_window_title('Blending Telemetry')
         ax = self.axs3[0]
-        ax.set_title("Blending authority \u03b1 (0=user, 1=policy)", fontsize=10, fontweight='bold')
-        ax.set_ylabel("\u03b1"); ax.set_ylim(-0.05, 1.05)
+        ax.set_title("Blending authority α (0=user, 1=policy)", fontsize=10, fontweight='bold')
+        ax.set_ylabel("α"); ax.set_ylim(-0.05, 1.05)
         ax.axhline(0.5, color='#888', linestyle=':', linewidth=0.8)
         ax.grid(True, linestyle='--', alpha=0.6)
-        self.line_alpha, = ax.plot([], [], color='#ff7f0e', linewidth=1.5, label='\u03b1')
+        self.line_alpha, = ax.plot([], [], color='#ff7f0e', linewidth=1.5, label='α')
         ax.legend(loc='upper left', fontsize=8)
         ax = self.axs3[1]
-        ax.set_title("Blend share: (1-\u03b1)\u00b7v_user  vs  \u03b1\u00b7v_policy", fontsize=10, fontweight='bold')
+        ax.set_title("Blend share: (1-α)·v_user  vs  α·v_policy", fontsize=10, fontweight='bold')
         ax.set_ylabel("%"); ax.set_xlabel("Time (s)"); ax.set_ylim(-5, 105)
         ax.grid(True, linestyle='--', alpha=0.6)
         self.line_user_pct, = ax.plot([], [], color='#1f77b4', linewidth=1.4, label='user %')
@@ -339,6 +290,7 @@ class HapticForceManagerBlending(Node):
         plt.show(block=False)
 
     def update_plot(self):
+        """Snapshots buffers under the lock and refreshes the Matplotlib UI."""
         with self.plot_lock:
             if len(self.t_data) == 0:
                 return
@@ -386,6 +338,7 @@ class HapticForceManagerBlending(Node):
 
 
 def main(args=None):
+    """Spins ROS on a daemon thread and drives Matplotlib on the main thread."""
     rclpy.init(args=args)
     node = HapticForceManagerBlending()
 

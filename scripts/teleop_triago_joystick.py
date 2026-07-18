@@ -1,55 +1,5 @@
 #!/usr/bin/env python3
-"""teleop_triago_joystick -- Joystick Mode teleoperation for BLENDING.
-
-This is the blending-mode replacement for teleop_triago_clutch.py. The previous
-BLENDING design integrated the raw Haption twist into a pose AND rendered an
-F_sync tether force back onto the handle; that force displaced the handle, the
-displacement was read back as user twist, and the loop went unstable (plus the
-clutch interacted badly with it). Joystick Mode removes that coupling entirely:
-the handle is spring-centered to a FIXED home pose (the spring lives in
-haptic_force_manager_JB.py), and this node reads ONLY the handle's
-DISPLACEMENT from that home and maps it to a pure Cartesian twist. There is no
-pose integration and no clutch here -- releasing the handle recenters it, which
-is a zero command.
-
-Handle mechanics (per axis):
-    displacement d = handle_pose - home_pose        (Haption base frame)
-    v = K * (d with a radial deadband removed)       (magnitude ~ distance)
-    v mapped Haption -> TRIAGo base via the 180-deg-Z flip (negate X, negate Y).
-A displacement inside JOYSTICK_DEADBAND_{LIN,ANG} yields exactly zero twist.
-
-Dynamic home orientation (kinematic-mismatch handling):
-    The gripper may be posed very differently from the handle (e.g. a top-down
-    grasp). So the home ORIENTATION tracks the gripper: per arm, the gripper's
-    orientation is captured ONCE at that arm's first activation (its home then ==
-    neutral), and thereafter the home rotates with the gripper's delta from that
-    reference, with the rotation ANGLE scaled DOWN by JOYSTICK_ROT_HOME_SCALE
-    (gripper 90 deg -> handle ~69 deg) because the Haption's rotational workspace
-    is more restrictive. This scaling applies ONLY here to the home pose, never to
-    the commanded twist. The home POSITION stays fixed. The reference is SAVED /
-    RESTORED across arm switches but is NEVER re-anchored mid-session (in
-    particular not after an autonomous grasp) -- the home is updated every tick,
-    including while suspended during grasp execution, so it stays continuously
-    synchronized with the gripper with no jumps at any state transition.
-
-Ownership: this node is the single source of truth for the live home pose and
-publishes it on cfg.JOYSTICK_HOME_POSE_TOPIC so the force manager renders its
-spring toward the exact same target (no drift between the two nodes).
-
-This node serves BOTH JOYSTICK study cells; ASSIST_BLENDING only switches its
-output topic:
-  - ASSIST_BLENDING=True  (guided blending): publishes the pure user twist on
-    /arm_*/user_cartesian_reference (13-float protocol [pos(3), rpy(3),
-    vel_lin(3), vel_ang(3), task_dim]; the pose slots carry the live EE pose so
-    downstream current_T_user == current_T_EE). main_shared_autonomy then blends
-    it with the policy and is the sole writer of /arm_*/cartesian_reference.
-  - ASSIST_BLENDING=False (sync-only baseline): publishes the pure user twist
-    DIRECTLY on /arm_*/cartesian_reference (main_shared_autonomy does not blend,
-    so the robot follows the raw joystick command). This is the intended,
-    correct routing for that cell -- not a fallback.
-A cfg.validate_condition(control_mode=JOYSTICK) guard at startup rejects a
-CLUTCH-mode launch.
-"""
+"""JOYSTICK-mode teleop: spring-centered handle whose displacement from home is the commanded twist."""
 
 import rclpy
 from rclpy.node import Node
@@ -59,93 +9,60 @@ from std_msgs.msg import Float64MultiArray, Bool, String
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-# Single source of truth for the shared-autonomy blending architecture (also read
-# by triago_control/scripts/qp_arm_teleop/main_shared_autonomy.py and the haptic
-# force manager). See cfg.BLENDING's docstring in config.py.
+# Cross-package condition selector: single source of truth for the 2x2x2 study cell.
 import triago_control.qp_controller.config as cfg
 
-# TRIAGo <-> Haption base-frame map: a pure 180-deg rotation about Z. Applied to a
-# 3-vector this negates X and Y and keeps Z; it is its own inverse and a proper
-# rotation, so it maps both linear vectors and rotation vectors (axial) identically.
+# TRIAGo <-> Haption base-frame map: 180-deg rotation about Z, its own inverse, valid for linear and axial vectors.
 _FRAME_FLIP = np.array([-1.0, -1.0, 1.0])
 
 
 class TeleopJoystick(Node):
+    # Velocity-control input node for all four JOYSTICK study cells.
     def __init__(self):
         super().__init__('teleop_joystick')
 
-        # Fail loudly if launched under the wrong study condition. This joystick
-        # teleop is the velocity-control input for BOTH JOYSTICK conditions
-        # (sync-only and guided-blending), so it only constrains the control mode;
-        # ASSIST_BLENDING merely switches its output topic (see the routing below).
+        # Hard-error at startup if config.py selects a non-JOYSTICK cell.
         cfg.validate_condition('teleop_triago_joystick', control_mode=cfg.JOYSTICK)
 
-        # --- Home pose (Haption base frame) ---
+        # Home pose (Haption base frame): fixed position, orientation rebased live onto the gripper.
         self.home_pos = np.array(cfg.JOYSTICK_NEUTRAL_POSITION_M, dtype=float)
         self.neutral_rot = R.from_quat(cfg.JOYSTICK_NEUTRAL_ORIENTATION_XYZW)  # xyzw
-        self.home_rot = self.neutral_rot  # updated live to track the gripper
+        self.home_rot = self.neutral_rot
 
-        # --- Live handle state (Haption base frame) ---
         self.handle_pos = None
         self.handle_rot = None
-        self.handle_vel = np.zeros(6)   # 6-DOF spatial velocity (for viscous twist damping)
+        self.handle_vel = np.zeros(6)
 
-        # --- Robot EE state (TRIAGo base frame) ---
         self.ee_pos = None
         self.ee_rot = None
-        # PER-ARM gripper reference orientation that maps to the neutral handle quat.
-        # Captured from an arm's gripper the FIRST time that arm becomes active (its
-        # home then == neutral), and SAVED/RESTORED across arm switches -- switching
-        # away keeps the arm's reference in this dict, switching back reuses it so the
-        # arm resumes its own home pose instead of resetting to neutral. It is NEVER
-        # cleared/re-anchored after the first capture (see grasp_active_cb) so the home
-        # stays continuously synced to the gripper through grasp execution.
+        # Per-arm gripper orientation mapped to the neutral handle: captured once at first activation,
+        # saved/restored across arm switches, never re-anchored (keeps home synced through grasps).
         self.grip_ref_rot = {'right': None, 'left': None}
 
-        # --- Authority handover ---
-        # While shared_autonomy drives a grasp autonomously it publishes
-        # grasp_active=True; we stop publishing the user twist. The home orientation
-        # keeps updating every tick against the persistent reference (no re-anchor),
-        # so the handle stays synced to the gripper and never snaps when teleop resumes.
+        # While shared autonomy drives a grasp, twist publishing is suspended (home keeps updating).
         self.grasp_active = False
 
-        # --- Parameters ---
         self.freq = 150.0
         self.dt = 1.0 / self.freq
         self.task_dim = 6.0
 
-        # --- Persistent reference latch (sync-only / direct-drive path only) ---
-        # In the sync-only cell (cfg.BLENDING=False) this node writes
-        # /arm_*/cartesian_reference DIRECTLY. Publishing the LIVE EE pose every
-        # tick would make the reference a FOLLOWER ("your target is wherever you
-        # already are"): with a zero user twist the QP's posture potential field +
-        # soft-CLF slack leak a sub-mm velocity, the EE drifts (notably "toward the
-        # ground"), and because the reference re-anchors on the drifted EE next
-        # tick that drift is never opposed -> it integrates into visible creep.
-        # Fix: integrate the user twist into a PERSISTENT latched SE(3) pose, so a
-        # still handle holds an ABSOLUTE target the CLF actively defends. (This is
-        # exactly what main_shared_autonomy does via T_blend_ref for the blending
-        # cell.) The latch re-anchors to the live EE whenever teleop (re)starts
-        # driving: startup, arm switch, and grasp resume.
+        # Direct-drive latch (blending off): an absolute integrated pose target; publishing the live EE
+        # instead would make the reference a follower and integrate QP micro-drift into visible creep.
         self.ref_pos = None
         self.ref_rot = None
         self._ref_valid = False
-        self.MAX_REF_LEAD_LIN = 0.10   # m       cap on how far the latch may lead the real EE
-        self.MAX_REF_LEAD_ANG = 0.35   # rad (~20 deg) same cap for orientation
+        self.MAX_REF_LEAD_LIN = 0.10   # m    cap on how far the latch may lead the real EE
+        self.MAX_REF_LEAD_ANG = 0.35   # rad  same cap for orientation
 
-        # --- ROS 2 interfaces ---
         self.active_arm = 'right'
-        # Handle Cartesian pose (position + orientation) drives the displacement.
-        # NOTE: virtuose_server_node publishes virtuose/pose as geometry_msgs/Pose
-        # (NOT PoseStamped) -- the wrong type silently receives nothing.
+        # virtuose/pose is geometry_msgs/Pose (not PoseStamped) -- the wrong type silently receives nothing.
         self.create_subscription(Pose, 'virtuose/pose', self.handle_pose_cb, 10)
-        # Handle velocity, for the viscous damping term on the commanded twist.
         self.create_subscription(Twist, 'virtuose/velocity', self.vel_cb, 10)
-        # EE pose: reference orientation + the pose slots of the outgoing message.
         self.create_subscription(Float64MultiArray, '/qp_debug/ee_real', self.ee_cb, 10)
         self.create_subscription(Bool, '/shared_autonomy/grasp_active', self.grasp_active_cb, 10)
         self.create_subscription(String, '/shared_autonomy/active_arm', self.active_arm_cb, 10)
 
+        # Blending on -> publish pure user twist for the blender; blending off -> drive the QP directly.
         _topic_right = ('/arm_right/user_cartesian_reference' if cfg.BLENDING
                         else '/arm_right/cartesian_reference')
         _topic_left = ('/arm_left/user_cartesian_reference' if cfg.BLENDING
@@ -154,7 +71,7 @@ class TeleopJoystick(Node):
         self.cmd_pub_left = self.create_publisher(Float64MultiArray, _topic_left, 10)
         self.cmd_pub = self.cmd_pub_right
 
-        # Live home pose broadcast to the force manager (single source of truth).
+        # This node owns the live home pose; the force manager's spring targets the same broadcast pose.
         self.home_pub = self.create_publisher(Float64MultiArray, cfg.JOYSTICK_HOME_POSE_TOPIC, 10)
 
         self.timer = self.create_timer(self.dt, self.control_loop)
@@ -170,60 +87,48 @@ class TeleopJoystick(Node):
 
     # ------------------------------------------------------------------ callbacks
     def active_arm_cb(self, msg):
-        """Switch which arm the twist is published to (per-arm home saved/restored)."""
+        """Switches the publishing arm; per-arm home reference is restored, never reset to neutral."""
         if msg.data in ('right', 'left') and msg.data != self.active_arm:
             self.active_arm = msg.data
             self.cmd_pub = self.cmd_pub_right if msg.data == 'right' else self.cmd_pub_left
-            # Drop the stale (old-arm) EE so we don't build a bad home/twist for one
-            # tick; the next ee_cb refills it for the new arm. The new arm's grip_ref
-            # is RESTORED from the dict (or captured on that next sample if this is
-            # its first activation) -- never force-reset to neutral.
+            # Drop the stale old-arm EE so no home/twist is built from it for a tick.
             self.ee_pos = None
             self.ee_rot = None
-            self._ref_valid = False   # re-anchor the direct-drive latch to the new arm's EE
+            self._ref_valid = False
             restored = self.grip_ref_rot[self.active_arm] is not None
             self.get_logger().info(
                 f"[JOYSTICK] Arm -> {msg.data.upper()} "
                 f"({'home restored' if restored else 'first activation, home = neutral'}).")
 
     def grasp_active_cb(self, msg):
-        """Suspend twist publishing while the grasp SM drives the arm.
-
-        We DELIBERATELY do NOT re-anchor grip_ref_rot on the falling edge. The
-        home orientation is updated every tick (even while grasp_active, see
-        control_loop) as a scaled DELTA from this arm's persistent reference, so
-        it already tracked the gripper smoothly all the way through the grasp
-        (success, failure, or abort). Resetting the reference here would snap the
-        delta to zero -> home would JUMP back to neutral and the spring would yank
-        the handle. Keeping the reference means the handle stays continuously
-        synchronized with the current gripper orientation across the whole grasp.
-        """
+        """Suspends twist publishing during autonomous grasp; the home reference is never re-anchored."""
         if msg.data and not self.grasp_active:
             self.grasp_active = True
             self.get_logger().info("[JOYSTICK] Grasp exec: teleop suspended.")
         elif not msg.data and self.grasp_active:
             self.grasp_active = False
-            self._ref_valid = False   # re-anchor the direct-drive latch to the post-grasp EE
+            self._ref_valid = False
             self.get_logger().info(
                 "[JOYSTICK] Grasp done: teleop resuming (home stayed synced to the gripper).")
 
     def handle_pose_cb(self, msg):
-        """Latest Haption handle pose (position in m, orientation quat), Haption base frame."""
+        """Stores the latest handle pose (Haption base frame)."""
         p = msg.position
         q = msg.orientation
         self.handle_pos = np.array([p.x, p.y, p.z])
         self.handle_rot = R.from_quat([q.x, q.y, q.z, q.w])
 
     def vel_cb(self, msg):
-        """Latest Haption handle 6-DOF spatial velocity (Haption base frame)."""
+        """Stores the latest handle 6-DOF spatial velocity (Haption base frame)."""
         self.handle_vel = np.array([
             msg.linear.x, msg.linear.y, msg.linear.z,
             msg.angular.x, msg.angular.y, msg.angular.z])
 
     def ee_cb(self, msg):
-        """Active arm's EE pose. Layout: [pos_R(3), vel_R(3), pos_L(3), vel_L(3), rpy_R(3), rpy_L(3)]."""
+        """Stores the active arm's EE pose; captures the per-arm gripper reference on first sample."""
         if len(msg.data) < 18:
             return
+        # ee_real layout: [pos_R(3), vel_R(3), pos_L(3), vel_L(3), rpy_R(3), rpy_L(3)].
         if self.active_arm == 'right':
             self.ee_pos = np.array(msg.data[0:3])
             rpy = np.array(msg.data[12:15])
@@ -238,28 +143,19 @@ class TeleopJoystick(Node):
 
     # ------------------------------------------------------------------ math
     def _update_home_orientation(self):
-        """Rebase the home orientation onto the ACTIVE arm's current gripper orientation.
-
-        home_rot = map(scaled gripper delta) * neutral_rot, where the gripper delta
-        R_grip * R_grip_ref^-1 (TRIAGo base frame, R_grip_ref = this arm's saved
-        reference) has its ANGLE divided by JOYSTICK_ROT_HOME_SCALE and its AXIS
-        mapped into the Haption base frame.
-        """
+        """Rebases home onto the gripper: delta angle compressed by ROT_HOME_SCALE, axis frame-flipped."""
         ref = self.grip_ref_rot[self.active_arm]
         if self.ee_rot is None or ref is None:
             return
-        delta_triago = (self.ee_rot * ref.inv()).as_rotvec()  # base-frame axis*angle
+        delta_triago = (self.ee_rot * ref.inv()).as_rotvec()
+        # Compression fits the gripper's excursion into the Haption's narrower rotational workspace.
         scaled_triago = delta_triago / cfg.JOYSTICK_ROT_HOME_SCALE
-        delta_haption = _FRAME_FLIP * scaled_triago            # map axis to Haption frame
+        delta_haption = _FRAME_FLIP * scaled_triago
         self.home_rot = R.from_rotvec(delta_haption) * self.neutral_rot
 
     @staticmethod
     def _deadband_radial(vec, deadband):
-        """Remove a radial deadband from a vector, continuous at the boundary.
-
-        Returns zero inside the deadband, otherwise the vector shrunk so its
-        magnitude is (||vec|| - deadband) along the same direction.
-        """
+        """Removes a radial deadband, continuous at the boundary (magnitude shrinks by the deadband)."""
         n = float(np.linalg.norm(vec))
         if n <= deadband:
             return np.zeros(3)
@@ -267,35 +163,29 @@ class TeleopJoystick(Node):
 
     @staticmethod
     def _clamp_norm(vec, max_norm):
+        """Clamps a vector's magnitude, preserving direction."""
         n = float(np.linalg.norm(vec))
         if n > max_norm and n > 1e-9:
             return vec * (max_norm / n)
         return vec
 
     def _compute_user_twist(self):
-        """Handle displacement from home -> Cartesian twist in the TRIAGo base frame.
-
-        Twist magnitude is proportional to the displacement past the deadband, minus
-        a viscous damping term (-DAMP * handle_velocity) that smooths quick handle
-        motions. Damping is applied ONLY outside the deadband, so a handle resting or
-        oscillating near home still commands exactly zero (deadband guarantee kept).
-        """
-        # --- Linear: displacement of the handle position from home ---
-        d_lin = self.handle_pos - self.home_pos                       # Haption frame
+        """Maps handle displacement past the deadband to a damped, clamped twist in the TRIAGo frame."""
+        d_lin = self.handle_pos - self.home_pos
         eff_lin = self._deadband_radial(d_lin, cfg.JOYSTICK_DEADBAND_LIN)
         if float(np.linalg.norm(eff_lin)) < 1e-9:
-            v_haption = np.zeros(3)                                    # inside deadband -> zero (no damping)
+            # Damping applies only outside the deadband, so a resting handle commands exactly zero.
+            v_haption = np.zeros(3)
         else:
             v_haption = (cfg.JOYSTICK_K_TRANS * eff_lin
                          - cfg.JOYSTICK_DAMP_LIN * self.handle_vel[0:3])
         v_triago = _FRAME_FLIP * v_haption
         v_triago = self._clamp_norm(v_triago, cfg.JOYSTICK_V_MAX_LIN)
 
-        # --- Angular: rotational displacement of the handle from the home orientation ---
-        delta_rot = (self.handle_rot * self.home_rot.inv()).as_rotvec()  # Haption frame axis*angle
+        delta_rot = (self.handle_rot * self.home_rot.inv()).as_rotvec()
         eff_ang = self._deadband_radial(delta_rot, cfg.JOYSTICK_DEADBAND_ANG)
         if float(np.linalg.norm(eff_ang)) < 1e-9:
-            w_haption = np.zeros(3)                                    # inside deadband -> zero (no damping)
+            w_haption = np.zeros(3)
         else:
             w_haption = (cfg.JOYSTICK_K_ROT * eff_ang
                          - cfg.JOYSTICK_DAMP_ANG * self.handle_vel[3:6])
@@ -305,34 +195,24 @@ class TeleopJoystick(Node):
         return v_triago, w_triago
 
     def _advance_ref_latch(self, v_cmd, w_cmd):
-        """Integrate the user twist into the persistent reference latch (sync-only
-        direct-drive path) and return the latched (pos, rot).
-
-        Re-anchors to the live EE when invalid (startup / arm switch / grasp
-        resume), then advances by the commanded base-frame twist over one tick --
-        same convention as main_shared_autonomy.integrate_twist (world-frame twist,
-        rotation left-multiplied). A still handle (twist=0) holds the latch fixed,
-        giving the CLF an absolute target that opposes drift. The latch's lead over
-        the real EE is bounded (lin + ang) so it can't run away if the arm lags or
-        hits a limit; on release the EE catches up by at most the cap.
-        """
+        """Advances the absolute latched reference by the twist, with a bounded lead over the real EE."""
+        # Re-anchor at the live EE on startup, arm switch, or grasp resume.
         if not self._ref_valid or self.ref_pos is None or self.ref_rot is None:
             self.ref_pos = self.ee_pos.copy()
             self.ref_rot = self.ee_rot
             self._ref_valid = True
 
-        # Advance the latch by the commanded twist (twist=0 -> latch holds fixed).
+        # A still handle (twist=0) holds the latch fixed: an absolute target that opposes drift.
         self.ref_pos = self.ref_pos + v_cmd * self.dt
         if float(np.linalg.norm(w_cmd)) > 1e-9:
             self.ref_rot = R.from_rotvec(w_cmd * self.dt) * self.ref_rot
 
-        # Bound the linear lead of the latch over the real EE.
+        # Lead caps stop the reference running away when the arm lags or hits a constraint.
         lead = self.ref_pos - self.ee_pos
         lead_norm = float(np.linalg.norm(lead))
         if lead_norm > self.MAX_REF_LEAD_LIN:
             self.ref_pos = self.ee_pos + lead * (self.MAX_REF_LEAD_LIN / lead_norm)
 
-        # Bound the angular lead of the latch over the real EE.
         ang_lead = (self.ref_rot * self.ee_rot.inv()).as_rotvec()
         ang_norm = float(np.linalg.norm(ang_lead))
         if ang_norm > self.MAX_REF_LEAD_ANG:
@@ -343,47 +223,41 @@ class TeleopJoystick(Node):
 
     # ------------------------------------------------------------------ loop
     def control_loop(self):
-        # Always keep the force manager's home target fresh (even while suspended),
-        # so the spring recenters the handle onto the current gripper orientation.
+        """150 Hz: refresh the home pose, compute the user twist, publish the 13-float protocol."""
+        # Home is refreshed even while suspended, so the spring tracks the gripper with no jumps.
         if self.ee_rot is not None:
             self._update_home_orientation()
             self._publish_home_pose()
 
         if self.grasp_active:
-            return  # yield authority to the autonomous grasp
+            return
         if self.handle_pos is None or self.handle_rot is None or self.ee_pos is None:
-            return  # need the handle + EE before commanding
+            return
 
         v_cmd, w_cmd = self._compute_user_twist()
 
         if cfg.BLENDING:
-            # Guided-blending cell: publish pure user INTENT on
-            # /arm_*/user_cartesian_reference. The pose slots carry the LIVE EE
-            # pose so downstream current_T_user == current_T_EE (belief + guidance
-            # are EE-anchored), and main_shared_autonomy does its OWN persistent-
-            # latch integration of the blended twist. Byte-identical to before.
+            # Pose slots carry the live EE so downstream user anchor == EE; the blender integrates.
             p_ref = self.ee_pos
             rot_ref = self.ee_rot
         else:
-            # Sync-only cell: this node writes /arm_*/cartesian_reference DIRECTLY,
-            # so it must publish a PERSISTENT LATCHED pose (integrated from the
-            # twist) -- NOT the live EE. Otherwise the reference is a follower and
-            # the arm creeps with the handle at rest (see _advance_ref_latch).
+            # Direct drive: publish the persistent latched pose, not the live EE.
             p_ref, rot_ref = self._advance_ref_latch(v_cmd, w_cmd)
 
         rpy_ref = rot_ref.as_euler('xyz')
+        # Protocol: [pos(3), rpy(3), vel_lin(3), vel_ang(3), task_dim(1)].
         cmd = Float64MultiArray()
         cmd.data = [
-            float(p_ref[0]),  float(p_ref[1]),  float(p_ref[2]),    # 0:3 position
-            float(rpy_ref[0]), float(rpy_ref[1]), float(rpy_ref[2]),  # 3:6 rpy
-            float(v_cmd[0]),  float(v_cmd[1]),  float(v_cmd[2]),    # 6:9 linear twist
-            float(w_cmd[0]),  float(w_cmd[1]),  float(w_cmd[2]),    # 9:12 angular twist
-            float(self.task_dim),                                  # 12: task-dim flag
+            float(p_ref[0]),  float(p_ref[1]),  float(p_ref[2]),
+            float(rpy_ref[0]), float(rpy_ref[1]), float(rpy_ref[2]),
+            float(v_cmd[0]),  float(v_cmd[1]),  float(v_cmd[2]),
+            float(w_cmd[0]),  float(w_cmd[1]),  float(w_cmd[2]),
+            float(self.task_dim),
         ]
         self.cmd_pub.publish(cmd)
 
     def _publish_home_pose(self):
-        """Broadcast the live home pose (Haption base frame) for the force manager."""
+        """Broadcasts the live home pose (Haption base frame) for the force manager's spring."""
         q = self.home_rot.as_quat()  # xyzw
         msg = Float64MultiArray()
         msg.data = [
