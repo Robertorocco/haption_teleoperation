@@ -2,6 +2,8 @@
 
 > **This file is maintained by the AI agent.**
 
+**Branch strategy (from 2026-07-30)**: `virtuose-6d-baseline` is a frozen checkpoint of every value tuned on the physical **Haption Virtuose 6D** (the large desk/floor-mounted device) — diff against it anytime (e.g. `git diff virtuose-6d-baseline -- scripts/teleop_triago_clutch.py`) rather than trusting numbers restated in prose here, which will drift as the retune proceeds. Active development is now shifting to the **Haption Desktop 6D Compact** (smaller workspace, same control API) plus a sim-only human-subject user study, on `main` / `feature/sim-user-study` — device-specific tuning (workspace scaling, deadbands, spring/damping constants, force limits, calibration transforms, range-of-motion assumptions) inherited from the Virtuose 6D should be treated as suspect until re-validated on the Compact, not assumed to transfer. This mirrors the sibling `triago_control` repo's `real-hw` / `feature/sim-user-study` split (checked out in lockstep for the study), but the axis here is the **device model** (Virtuose 6D → Desktop 6D Compact), not real-vs-sim.
+
 ## 0. Maintenance Rules
 
 1. **Always share the pull/rebuild command** with the user immediately after pushing any change to this repo (see §9 for the exact sequence). Never wait to be asked.

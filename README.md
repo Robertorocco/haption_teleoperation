@@ -6,6 +6,11 @@ package [`triago_control`](https://github.com/Robertorocco/triago_control) runs 
 QP-CLF-CBF safety controller and the shared-autonomy inference stack on the robot side.
 The two packages run together and communicate over live ROS 2 topics.
 
+## Branches
+
+- **`virtuose-6d-baseline`** — frozen checkpoint of every gain/parameter as tuned on the physical **Haption Virtuose 6D**. Full commit history back to project start is preserved here; never developed on directly. Diff against it to see exactly what a Desktop 6D Compact retune has changed, e.g. `git diff virtuose-6d-baseline -- scripts/teleop_triago_clutch.py`.
+- **`main`** / **`feature/sim-user-study`** — active development: adapting to the new **Haption Desktop 6D Compact** (smaller footprint, same control API) plus simulation-only work for a human-subject user study. Both point to the same commit as `virtuose-6d-baseline`'s tip and diverge from here forward. Checked out in lockstep with `triago_control`'s branch of the same name for the study.
+
 ## Architecture
 
 ```
