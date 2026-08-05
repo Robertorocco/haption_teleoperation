@@ -38,25 +38,29 @@ class HapticForceManagerJoystickSync(Node):
         self.handle_rot = None
         self.handle_vel = np.zeros(6)
 
-        # Spring gains, unified across all joystick cells.
-        self.KP_LIN = cfg.JOYSTICK_SPRING_KP_LIN
+        # Spring gains, unified across all joystick cells; stiffness is live-tunable for sweeps.
+        self.KP_LIN = float(self.declare_parameter('KP_LIN', cfg.JOYSTICK_SPRING_KP_LIN).value)
         self.KD_LIN = cfg.JOYSTICK_SPRING_KD_LIN
-        self.KP_ANG = cfg.JOYSTICK_SPRING_KP_ANG
+        self.KP_ANG = float(self.declare_parameter('KP_ANG', cfg.JOYSTICK_SPRING_KP_ANG).value)
         self.KD_ANG = cfg.JOYSTICK_SPRING_KD_ANG
+        # Damping is rendered by virtuose_server_node instead: a damper is only passive when the
+        # force is applied in the same tick its velocity was measured, which cannot hold across a
+        # process boundary. Tune it there (ros2 param set /virtuose_server_node damping_lin|_ang).
+        self.ENABLE_SPRING_DAMPING = False
 
         # Device safety clip and unified authority cap (currently equal).
-        self.MAX_FORCE = 10.0
-        self.MAX_TORQUE = 1.0
-        self.MAX_TOTAL_FORCE = 10.0
-        self.MAX_TOTAL_TORQUE = 1.0
+        self.MAX_FORCE = 5.0
+        self.MAX_TORQUE = 0.5
+        self.MAX_TOTAL_FORCE = 5.0
+        self.MAX_TOTAL_TORQUE = 0.5
 
         # Out-of-deadzone cue: zero-mean buzz whenever a non-zero twist is being commanded.
-        self.VIB_AMP = 0.05           # Nm
+        self.VIB_AMP = 0.01     # Nm
         self.vib_toggle = 1.0         # sign flip every frame -> ~75 Hz square wave
 
         # Autonomous-grasp cue, unified across all 8 cells.
         self.grasp_active = False
-        self.GRASP_VIB_AMP = 0.07    # Nm
+        self.GRASP_VIB_AMP = 0.01    # Nm
         self.grasp_vib_toggle = 1.0
 
         # virtuose/pose is geometry_msgs/Pose (not PoseStamped) -- the wrong type silently receives nothing.
@@ -123,15 +127,21 @@ class HapticForceManagerJoystickSync(Node):
         if self.handle_pos is None or self.handle_rot is None:
             return f
 
-        f[0:3] = self.KP_LIN * (self.home_pos - self.handle_pos) - self.KD_LIN * self.handle_vel[0:3]
+        f[0:3] = self.KP_LIN * (self.home_pos - self.handle_pos)
 
         # Home and handle are both in the Haption frame, so no frame mapping is needed.
         err_rotvec = (self.home_rot * self.handle_rot.inv()).as_rotvec()
-        f[3:6] = self.KP_ANG * err_rotvec - self.KD_ANG * self.handle_vel[3:6]
+        f[3:6] = self.KP_ANG * err_rotvec
+
+        if self.ENABLE_SPRING_DAMPING:
+            f[0:3] -= self.KD_LIN * self.handle_vel[0:3]
+            f[3:6] -= self.KD_ANG * self.handle_vel[3:6]
         return f
 
     def control_loop(self):
         """150 Hz: renders the homing spring, adds the cues, clips, publishes, buffers."""
+        self.KP_LIN = float(self.get_parameter('KP_LIN').value)
+        self.KP_ANG = float(self.get_parameter('KP_ANG').value)
         f = self.compute_spring()
 
         # Authority cap: proportional rescale before the vibration cues.

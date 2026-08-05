@@ -37,16 +37,22 @@ class HapticForceManagerNoGuidance(Node):
         self.vel_haption = np.zeros(6)  # handle 6D spatial velocity (Haption frame)
 
         # Sync spring gains, unified across all clutch cells (Kd=0: global damper supplies viscosity).
-        self.Kp_sync = 30.0        # N/m
+        self.Kp_sync = float(self.declare_parameter('Kp_sync', 15.0).value)  # N/m
         self.Kd_sync = 0.0         # Ns/m
-        self.Kp_sync_ang = 0.9     # Nm/rad
+        # Live-tunable so the spring/damping pair can be swept without a rebuild.
+        self.Kp_sync_ang = float(self.declare_parameter('Kp_sync_ang', 0.1).value)  # Nm/rad
+        self._last_err_log_time = 0.0
+        # Both damping channels are rendered by virtuose_server_node: springs are robot-state
+        # derived and tolerate the transport delay, but a damper must react in the same tick
+        # its velocity was measured or it stops being passive.
+        self.ENABLE_GLOBAL_DAMPING_LIN = False
 
         # During autonomous grasp no force is impressed; only a vibration cue is rendered.
         self.grasp_active = False
         self._grasp_start_pos = None
-        self.GRASP_FOLLOW_KP = 30.0     # N/m
-        self.GRASP_FOLLOW_KD = 160.0    # Ns/m
-        self.GRASP_VIB_AMP = 0.07       # Nm constant square-wave buzz during the whole grasp
+        self.GRASP_FOLLOW_KP = 15.0     # N/m
+        self.GRASP_FOLLOW_KD = 80.0     # Ns/m
+        self.GRASP_VIB_AMP = 0.01  # Nm constant square-wave buzz during the whole grasp
         self.grasp_vib_toggle = 1.0
 
         # Clutch press freezes the wrench at 50% (cognitive grounding).
@@ -54,37 +60,53 @@ class HapticForceManagerNoGuidance(Node):
         self.was_clutching_last_frame = False
         self.f_clutch_frozen = np.zeros(6)
         self.rot_haption = None
-        self.K_align = 10.0  # Nm/rad clutch orientation-alignment stiffness
+        self.K_align = 5.0  # Nm/rad clutch orientation-alignment stiffness
         # Disabled: the alignment error mixes robot-base and device frames, making the torque non-restorative.
         self.ENABLE_CLUTCH_ALIGN = False
 
         # Global viscous damping (impedance-device stability), unified across clutch cells.
-        self.Kd_global_lin = 0.7   # Ns/m
-        self.Kd_global_ang = 0.1   # Nms/rad
+        self.Kd_global_lin = 0.35  # Ns/m
+        self.Kd_global_ang = 0.05  # Nms/rad
+        # Caps the velocity fed into Kd_global_ang: a brief low-inertia handle spin
+        # transient (e.g. a button press nudging the wrist gimbal) should not be
+        # amplified into a torque step just because the instantaneous rate is high.
+        self.VEL_DAMP_CLAMP_ANG = 3.0  # rad/s
+        # 1-pole LPF on the angular velocity feeding the damping law: at 150 Hz sampling,
+        # rendering damping from a raw differentiated velocity is only passive up to a
+        # stability margin set by the device's own mechanical damping -- a lighter, less
+        # damped wrist has a lower margin, so the loop itself can sustain the handle's
+        # resonance instead of absorbing it. Filtering above the resonance restores passivity.
+        self._vel_ang_filt = np.zeros(3)
+        self.VEL_FILT_ALPHA_ANG = 0.75  # ~7 Hz cutoff at 150 Hz
+        # Angular damping is rendered by virtuose_server_node instead: a damper is only passive
+        # when the force is applied in the same tick the velocity was measured, which cannot
+        # hold across a process boundary. Tune it there (ros2 param set damping_ang).
+        self.ENABLE_GLOBAL_DAMPING_ANG = False
 
         # Device safety clip and unified authority cap (currently equal).
-        self.MAX_FORCE = 10.0      # N
-        self.MAX_TORQUE = 1.0      # Nm
-        self.MAX_TOTAL_FORCE = 10.0
-        self.MAX_TOTAL_TORQUE = 1.0
+        self.MAX_FORCE = 5.0       # N
+        self.MAX_TORQUE = 0.5      # Nm
+        self.MAX_TOTAL_FORCE = 5.0
+        self.MAX_TOTAL_TORQUE = 0.5
 
         # Arm the force is computed for (follows shared autonomy's active arm).
         self.active_arm = 'right'
 
         # Haption joint positions and calibrated limits (for the joint-limit cue).
         self.joint_pos = np.zeros(6)
-        self.joint_min = np.array([-0.804283, -1.65038, 0.728283, -3.02431, -1.28196, -2.05398])
-        self.joint_max = np.array([0.781944, -0.0654231, 2.49752, 2.82038, 1.04722, 2.09453])
+        self.joint_min = np.array([-0.785282, -1.5709, 0.792704, -2.39339, -1.02312, -2.22872])
+        self.joint_max = np.array([0.784393, -0.00157491, 2.49551, 2.35378, 0.879614, 2.21327])
 
-        self.LIMIT_OUTER = 0.25       # rad: margin where the cue can fire
-        self.LIMIT_INNER = 0.15       # rad: margin of maximum vibration
+        self.LIMIT_OUTER = 0.10       # rad: margin where the cue can fire
+        self.LIMIT_INNER = 0.06       # rad: margin of maximum vibration
         self.AMP_MIN = 0.05           # Nm
         self.AMP_MAX = 0.07           # Nm
         self.vib_toggle = 1.0         # sign flip every frame -> 75 Hz square wave
 
         # Joint-limit "clutch advice": one-shot burst, re-armed only by a full clutch cycle.
         self.LIMIT_VIB_DURATION = 1.0   # s
-        self.LIMIT_VIB_AMP = 0.07       # Nm
+        self.LIMIT_VIB_AMP = 0.01  # Nm
+        self.ENABLE_VIBRATION_CUES = False
         self.limit_vib_armed = True
         self.limit_vib_active = False
         self.limit_vib_start_time = 0.0
@@ -346,6 +368,8 @@ class HapticForceManagerNoGuidance(Node):
     # =========================
     def control_loop(self):
         """150 Hz: renders F_sync (or the grasp cue), applies clutch freeze + damping, clips, publishes."""
+        self.Kp_sync = float(self.get_parameter('Kp_sync').value)
+        self.Kp_sync_ang = float(self.get_parameter('Kp_sync_ang').value)
         f_sync = self.compute_F_sync()
 
         if self.grasp_active:
@@ -392,23 +416,51 @@ class HapticForceManagerNoGuidance(Node):
 
         # Global viscous damping; skipped during grasp so only the cue is felt.
         if not self.grasp_active:
-            f_total[0:3] -= self.Kd_global_lin * self.vel_haption[0:3]
-            f_total[3:6] -= self.Kd_global_ang * self.vel_haption[3:6]
+            if self.ENABLE_GLOBAL_DAMPING_LIN:
+                f_total[0:3] -= self.Kd_global_lin * self.vel_haption[0:3]
+            self._vel_ang_filt = (self.VEL_FILT_ALPHA_ANG * self._vel_ang_filt
+                                  + (1.0 - self.VEL_FILT_ALPHA_ANG) * self.vel_haption[3:6])
+            if self.ENABLE_GLOBAL_DAMPING_ANG:
+                ang_vel = self._vel_ang_filt
+                ang_vel_norm = np.linalg.norm(ang_vel)
+                if ang_vel_norm > self.VEL_DAMP_CLAMP_ANG:
+                    ang_vel = ang_vel * (self.VEL_DAMP_CLAMP_ANG / ang_vel_norm)
+                f_total[3:6] -= self.Kd_global_ang * ang_vel
 
         # Cues injected last so they ride on top of any frozen wrench and toggle every frame.
         f_vib = self.compute_F_limit_warning()
-        if self.grasp_active:
-            self.grasp_vib_toggle *= -1.0
-            gb = self.GRASP_VIB_AMP * self.grasp_vib_toggle
-            f_total[3] += gb
-            f_total[4] += gb
-            f_total[5] += gb
-        else:
-            f_total[3:6] += f_vib[3:6]
+        if self.ENABLE_VIBRATION_CUES:
+            if self.grasp_active:
+                self.grasp_vib_toggle *= -1.0
+                gb = self.GRASP_VIB_AMP * self.grasp_vib_toggle
+                f_total[3] += gb
+                f_total[4] += gb
+                f_total[5] += gb
+            else:
+                f_total[3:6] += f_vib[3:6]
 
         # Device safety clip.
         f_total[0:3] = np.clip(f_total[0:3], -self.MAX_FORCE, self.MAX_FORCE)
         f_total[3:6] = np.clip(f_total[3:6], -self.MAX_TORQUE, self.MAX_TORQUE)
+
+        # Temporary diagnostic: breaks the published torque down by contributor, so a
+        # saturation event can be traced to spring vs damping vs vibration cue.
+        now_log = time.time()
+        if now_log - self._last_err_log_time > 0.5:
+            self._last_err_log_time = now_log
+            vel_ang_deg = np.degrees(np.linalg.norm(self.vel_haption[3:6]))
+            vel_ang_filt_deg = np.degrees(np.linalg.norm(self._vel_ang_filt))
+            sync_tau = float(np.linalg.norm(f_sync[3:6]))
+            damp_tau_raw = float(np.linalg.norm(self.Kd_global_ang * self.vel_haption[3:6]))
+            damp_tau_filt = float(np.linalg.norm(self.Kd_global_ang * self._vel_ang_filt))
+            vib_tau = float(np.linalg.norm(f_vib[3:6]))
+            pub_tau = float(np.linalg.norm(f_total[3:6]))
+            pub_f = float(np.linalg.norm(f_total[0:3]))
+            self.get_logger().info(
+                f"[DBG] vel_ang={vel_ang_deg:.1f} deg/s (filt={vel_ang_filt_deg:.1f})  "
+                f"sync_tau={sync_tau:.3f}  damp_tau={damp_tau_filt:.3f} (raw={damp_tau_raw:.3f})  "
+                f"vib_tau={vib_tau:.3f}  -> PUB_TAU={pub_tau:.3f} Nm  PUB_F={pub_f:.3f} N  "
+                f"clutch={self.is_clutching}")
 
         msg = Wrench()
         msg.force.x, msg.force.y, msg.force.z = float(f_total[0]), float(f_total[1]), float(f_total[2])

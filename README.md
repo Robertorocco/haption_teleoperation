@@ -1,7 +1,7 @@
 # haption_teleoperation
 
 Operator-side half of the TRIAGo shared-autonomy teleoperation system: it drives a
-**Haption Virtuose 6-DOF** haptic device and renders force feedback, while the sibling
+**Haption Desktop 6D Compact** haptic device and renders force feedback, while the sibling
 package [`triago_control`](https://github.com/Robertorocco/triago_control) runs the
 QP-CLF-CBF safety controller and the shared-autonomy inference stack on the robot side.
 The two packages run together and communicate over live ROS 2 topics.

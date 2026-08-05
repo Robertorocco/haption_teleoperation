@@ -4,6 +4,7 @@
 #include <iostream>
 #include <chrono>
 #include <array>
+#include <algorithm>
 #include "VirtuoseAPI.h"
 
 // ROS 2 Libraries
@@ -20,6 +21,10 @@ using namespace std::chrono_literals;
 #define VIRTUOSE_IPADDRESS         ("127.0.0.1#53210")
 #define VIRTUOSE_FREQUENCY         (150) // Hz
 
+// Driver-level safety bound on the total wrench actually sent to the device.
+#define MAX_FORCE_N                (5.0f)
+#define MAX_TORQUE_NM              (0.5f)
+
 // Publishes handle pose/velocity/buttons/joints, applies the commanded wrench each tick.
 class VirtuoseServerNode : public rclcpp::Node {
 public:
@@ -34,6 +39,12 @@ public:
             rclcpp::shutdown();
             return;
         }
+
+        damping_lin_ = this->declare_parameter("damping_lin", damping_lin_);
+        damping_ang_ = this->declare_parameter("damping_ang", damping_ang_);
+        RCLCPP_INFO(this->get_logger(),
+            "Local damping: lin=%.4f Ns/m, ang=%.4f Nms/rad (tune with ros2 param set).",
+            damping_lin_, damping_ang_);
 
         if (debug_mode_) RCLCPP_INFO(this->get_logger(), "Setting up ROS 2 topics...");
 
@@ -76,6 +87,13 @@ private:
 
     // Latest wrench command, applied to the handle every tick.
     float current_force[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Viscous damping computed here rather than in a force-manager node: a damper is only
+    // passive when the force is applied in the same tick the velocity was measured. Crossing
+    // a process boundary adds a jittery 1-2 tick delay, which renders as discrete tugs
+    // instead of continuous viscosity. Live-tunable via ros2 param set.
+    double damping_lin_ = 0.35;   // Ns/m
+    double damping_ang_ = 0.025;  // Nms/rad
 
     rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr pose_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr velocity_pub_;
@@ -125,9 +143,9 @@ private:
     int VirtuoseStateInterface(float *pose, float *velocity, int *button_right, int *button_left){
         virtGetPosition(VC, pose);
         virtGetPhysicalSpeed(VC, velocity);
-        // Button 1 = right (clutch), button 2 = left (grasp trigger / arm switch).
-        virtGetButton(VC, 1, button_right);
-        virtGetButton(VC, 2, button_left);
+        // Device button 1 is the left one, 2 the right; topics keep right = clutch, left = grasp trigger.
+        virtGetButton(VC, 1, button_left);
+        virtGetButton(VC, 2, button_right);
 
         return 0;
     }
@@ -227,7 +245,21 @@ private:
             articular_pub_->publish(art_msg);
         }
 
-        VirtuoseCommandInterface(current_force);
+        // Damping uses the velocity read at the top of THIS tick and is applied before the
+        // tick ends, so no transport delay sits between measurement and reaction.
+        this->get_parameter("damping_lin", damping_lin_);
+        this->get_parameter("damping_ang", damping_ang_);
+        float total_force[6];
+        for (int i = 0; i < 3; i++) {
+            total_force[i]     = current_force[i]     - (float)damping_lin_ * velocity[i];
+            total_force[i + 3] = current_force[i + 3] - (float)damping_ang_ * velocity[i + 3];
+        }
+        for (int i = 0; i < 3; i++) {
+            total_force[i]     = std::max(-MAX_FORCE_N,   std::min(MAX_FORCE_N,   total_force[i]));
+            total_force[i + 3] = std::max(-MAX_TORQUE_NM, std::min(MAX_TORQUE_NM, total_force[i + 3]));
+        }
+
+        VirtuoseCommandInterface(total_force);
     }
 };
 

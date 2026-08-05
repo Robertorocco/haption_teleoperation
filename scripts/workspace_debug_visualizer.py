@@ -16,9 +16,9 @@ TIAGO_MIN = np.array([0.100, -0.996,  0.200])
 TIAGO_MAX = np.array([0.987,  0.567,  1.772])
 
 # Measured Haption workspace limits (Haption base frame, X toward user, Z up).
-HAPTION_MIN    = np.array([0.192, -0.562, -0.352])
-HAPTION_MAX    = np.array([0.738,  0.490,  0.424])
-HAPTION_CENTER = np.array([0.46475608, -0.03577431,  0.03573696])
+HAPTION_MIN    = np.array([0.140, -0.240, -0.180])
+HAPTION_MAX    = np.array([0.360,  0.220,  0.180])
+HAPTION_CENTER = np.array([0.250, -0.010,  0.000])
 
 
 class WorkspaceVisualizer(Node):
@@ -33,7 +33,7 @@ class WorkspaceVisualizer(Node):
 
         # Isotropic center-to-center bridge mapping constants.
         self.center_tiago_bridge = np.array([0.544, -0.215, 0.986])
-        self.center_haption_bridge = np.array([0.4647, -0.0357, 0.0357])
+        self.center_haption_bridge = np.array([0.250, -0.010, 0.000])
         self.K = 1.0  # isotropic scale factor
 
         self.create_subscription(

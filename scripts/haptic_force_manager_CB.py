@@ -46,8 +46,8 @@ class HapticForceManagerCB(Node):
         self.f_cbf_filtered = np.zeros(6)
         self.alpha_cbf = 0.15          # LPF: keep 85% of the old value each tick
 
-        self.MAX_CBF_FORCE = 15.0      # N
-        self.MAX_CBF_TORQUE = 1.0      # Nm
+        self.MAX_CBF_FORCE = 7.5       # N
+        self.MAX_CBF_TORQUE = 0.5      # Nm
 
         # Shared-autonomy inference state (goal names, beliefs, per-goal user policies).
         self.goal_names = []
@@ -55,10 +55,10 @@ class HapticForceManagerCB(Node):
         self.user_policies = []
 
         # F_guide gains (kept for reference; guidance is never applied in this cell).
-        self.D_guide_lin = 33.6   # Ns/m
-        self.D_guide_ang = 0.54   # Nms/rad
-        self.MAX_GUIDE_FORCE  = 4.2   # N
-        self.MAX_GUIDE_TORQUE = 0.10  # Nm
+        self.D_guide_lin = 16.8   # Ns/m
+        self.D_guide_ang = 0.27   # Nms/rad
+        self.MAX_GUIDE_FORCE  = 2.1   # N
+        self.MAX_GUIDE_TORQUE = 0.05  # Nm
 
         # Guidance gates (kept for reference; guidance is never applied in this cell).
         self.GUIDE_PROX_FAR  = 0.60   # m
@@ -76,10 +76,10 @@ class HapticForceManagerCB(Node):
         self.fix_goal_pos = None
         self.fix_goal_rot = None
         self.fix_confidence = 0.0
-        self.K_fix_force  = 38.016    # N/m
-        self.K_fix_torque = 0.2376    # Nm/rad
-        self.MAX_FIX_FORCE  = 5.7024  # N
-        self.MAX_FIX_TORQUE = 0.396   # Nm
+        self.K_fix_force  = 19.008    # N/m
+        self.K_fix_torque = 0.1188    # Nm/rad
+        self.MAX_FIX_FORCE  = 2.8512  # N
+        self.MAX_FIX_TORQUE = 0.198   # Nm
         self.FIX_CONF_LO = 0.55
         self.FIX_CONF_HI = 0.85
         self.alpha_fix = 0.15
@@ -88,45 +88,50 @@ class HapticForceManagerCB(Node):
         self.FIX_TORQUE_NEAR = 0.05        # m
         self.FIX_TORQUE_FAR  = 0.12        # m
         self.FIX_TORQUE_NEAR_BOOST = 0.20
-        self.K_FIX_TORQUE_DAMP = 0.06      # Nms/rad
+        self.K_FIX_TORQUE_DAMP = 0.03      # Nms/rad
 
         # Clutch press freezes the wrench at 50% (cognitive grounding).
         self.is_clutching = False
         self.was_clutching_last_frame = False
         self.f_clutch_frozen = np.zeros(6)
-        self.K_align = 10.0  # Nm/rad clutch orientation-alignment stiffness
+        self.K_align = 5.0  # Nm/rad clutch orientation-alignment stiffness
         # Disabled: the alignment error mixes robot-base and device frames, making the torque non-restorative.
         self.ENABLE_CLUTCH_ALIGN = False
         self.rot_haption = None
 
 
         # Legacy virtual-fixture stiffness values (not used).
-        self.K_guide_force = 90.0   # N/m
-        self.K_guide_torque = 0.3   # Nm/rad
+        self.K_guide_force = 45.0   # N/m
+        self.K_guide_torque = 0.15  # Nm/rad
 
         # Haption joint positions and calibrated limits (for the joint-limit cue).
         self.joint_pos = np.zeros(6)
-        self.joint_min = np.array([-0.804283, -1.65038, 0.728283, -3.02431, -1.28196, -2.05398])
-        self.joint_max = np.array([0.781944, -0.0654231, 2.49752, 2.82038, 1.04722, 2.09453])
+        self.joint_min = np.array([-0.785282, -1.5709, 0.792704, -2.39339, -1.02312, -2.22872])
+        self.joint_max = np.array([0.784393, -0.00157491, 2.49551, 2.35378, 0.879614, 2.21327])
 
-        self.LIMIT_OUTER = 0.25       # rad: margin where the cue can fire
-        self.LIMIT_INNER = 0.15       # rad: margin of maximum vibration
+        self.LIMIT_OUTER = 0.10       # rad: margin where the cue can fire
+        self.LIMIT_INNER = 0.06       # rad: margin of maximum vibration
         self.AMP_MIN = 0.05           # Nm
         self.AMP_MAX = 0.07           # Nm
         self.vib_toggle = 1.0         # sign flip every frame -> 75 Hz square wave
 
         # Joint-limit "clutch advice": one-shot burst, re-armed only by a full clutch cycle.
         self.LIMIT_VIB_DURATION = 1.0   # s
-        self.LIMIT_VIB_AMP = 0.07       # Nm
+        self.LIMIT_VIB_AMP = 0.01  # Nm
         self.limit_vib_armed = True
         self.limit_vib_active = False
         self.limit_vib_start_time = 0.0
         self._vib_clutch_prev = False
 
         # Sync spring gains, unified across all clutch cells (Kd=0: global damper supplies viscosity).
-        self.Kp_sync = 30.0       # N/m
+        # Live-tunable so the spring pair can be swept without a rebuild.
+        self.Kp_sync = float(self.declare_parameter('Kp_sync', 15.0).value)      # N/m
         self.Kd_sync = 0.0
-        self.Kp_sync_ang = 0.9    # Nm/rad
+        self.Kp_sync_ang = float(self.declare_parameter('Kp_sync_ang', 0.1).value)  # Nm/rad
+        # Damping is rendered by virtuose_server_node instead: a damper is only passive when
+        # the force is applied in the same tick the velocity was measured, which cannot hold
+        # across a process boundary. Tune it there (ros2 param set damping_lin/damping_ang).
+        self.ENABLE_GLOBAL_DAMPING = False
 
         # Adaptive sync-share parameters (kept for reference; attenuation is not applied).
         self.SYNC_SHARE_AT_FULL = 0.5
@@ -138,18 +143,18 @@ class HapticForceManagerCB(Node):
         self.grasp_active = False
         self._grasp_start_pos = None
         self.GRASP_SYNC_BOOST = 6.0
-        self.GRASP_FOLLOW_KP = 30.0    # N/m
-        self.GRASP_FOLLOW_KD = 160.0   # Ns/m
-        self.GRASP_VIB_AMP = 0.07      # Nm constant square-wave buzz during the whole grasp
+        self.GRASP_FOLLOW_KP = 15.0    # N/m
+        self.GRASP_FOLLOW_KD = 80.0    # Ns/m
+        self.GRASP_VIB_AMP = 0.01  # Nm constant square-wave buzz during the whole grasp
         self.grasp_vib_toggle = 1.0
-        self.K_cbf_force = 2.0
-        self.K_cbf_torque = 0.1
-        self.MAX_FORCE = 10.0
-        self.MAX_TORQUE = 1.0
+        self.K_cbf_force = 1.0
+        self.K_cbf_torque = 0.05
+        self.MAX_FORCE = 5.0
+        self.MAX_TORQUE = 0.5
 
         # Authority cap: proportional rescale so assistance can never overpower the operator.
-        self.MAX_TOTAL_FORCE  = 10.0  # N
-        self.MAX_TOTAL_TORQUE = 1.0   # Nm
+        self.MAX_TOTAL_FORCE  = 5.0   # N
+        self.MAX_TOTAL_TORQUE = 0.5   # Nm
 
         # Plot buffers (10 s window at 150 Hz), guarded by a lock shared with the UI thread.
         self.plot_lock = threading.Lock()
@@ -525,6 +530,8 @@ class HapticForceManagerCB(Node):
     # =========================
     def control_loop(self):
         """150 Hz: renders F_sync only (blended-reference tether), applies clutch/grasp handling, publishes."""
+        self.Kp_sync = float(self.get_parameter('Kp_sync').value)
+        self.Kp_sync_ang = float(self.get_parameter('Kp_sync_ang').value)
         f_sync = self.compute_F_sync()
         f_cbf = self.compute_F_cbf()
         f_vib = self.compute_F_limit_warning()
@@ -608,9 +615,9 @@ class HapticForceManagerCB(Node):
             self.was_clutching_last_frame = False
 
         # Global viscous damping, constant and unified across all clutch cells.
-        if not self.DEBUG_ONLY_GUIDE and not self.grasp_active:
-            Kd_global_lin = 0.7
-            Kd_global_ang = 0.1
+        if self.ENABLE_GLOBAL_DAMPING and not self.DEBUG_ONLY_GUIDE and not self.grasp_active:
+            Kd_global_lin = 0.35
+            Kd_global_ang = 0.05
             f_total[0:3] -= Kd_global_lin * self.vel_haption[0:3]
             f_total[3:6] -= Kd_global_ang * self.vel_haption[3:6]
 

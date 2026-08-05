@@ -14,7 +14,7 @@
 ## 1. Project Identity
 
 - **Package**: `haption_teleoperation` — ROS 2 Humble, `ament_cmake` (hybrid C++/Python)
-- **Robot**: PAL Robotics TRIAGo++ (bimanual, mobile base) — teleoperated via Haption Virtuose 6D
+- **Robot**: PAL Robotics TRIAGo++ (bimanual, mobile base) — teleoperated via Haption Desktop 6D Compact
 - **Repository**: https://github.com/Robertorocco/haption_teleoperation
 - **Sibling package**: `triago_control` (QP controller + shared autonomy). This package cross-imports `triago_control.qp_controller.config` (`package.xml` depends on `triago_control`) — the **experiment-condition selector** there (full 2×2×2 factorial) (`CONTROL_MODE`, `ASSIST_FEEDBACK`, `ASSIST_BLENDING`; see `triago_control` context.md §5.0) is the single source of truth for which strategy is active (§3). Every teleop/force node calls `cfg.validate_condition(...)` at startup and hard-errors if it does not match the selected cell.
 
@@ -58,14 +58,15 @@ The subsections below describe the currently-implemented cells. `cfg.BLENDING` i
 
 So the 2×2×2 comparison is fair, the shared building blocks use ONE value everywhere:
 
-- **Sync spring (all 4 clutch cells C/CF/CB/CFB):** `Kp_sync = 30 N/m`, `Kp_sync_ang = 0.9 Nm/rad`, `Kd_sync = 0` (global damping supplies the viscous term).
-- **Authority cap (all clutch cells):** the applied wrench is bounded to **10 N / 1 Nm** — equal to the device clip (`MAX_TOTAL_*` in CF/CB/CFB; C just device-clips).
-- **Global viscous damping (all clutch cells):** CONSTANT `Kd_lin = 0.7`, `Kd_ang = 0.1` (the former CBF-aware `damp_scale`, 1.0→2.0 with `lambda_cbf_f`, was removed).
-- **Clutch orientation-alignment torque (all clutch cells):** `K_align = 10 Nm/rad` pulling the handle toward the target orientation while clutching, faded to zero within `0.35 rad` of a joint limit. Treated as a **sync effect**, so it is present in the baseline C too. Reads `virtuose/pose` as `geometry_msgs/Pose` (the earlier `PoseStamped` subscription silently never matched the `Pose` publisher, so this torque was **dead** in CF/CB/CFB until fixed).
+- **Sync spring (all 4 clutch cells C/CF/CB/CFB):** `Kp_sync = 15 N/m`, `Kp_sync_ang = 0.1 Nm/rad`, `Kd_sync = 0` (global damping supplies the viscous term). Both are ROS parameters (`ros2 param set <node> Kp_sync|Kp_sync_ang <value>`), re-read every tick, so they can be swept live without a rebuild; the values above are just the declared defaults.
+- **Authority cap (all clutch cells):** the applied wrench is bounded to **5 N / 0.5 Nm** — equal to the device clip (`MAX_TOTAL_*` in CF/CB/CFB; C just device-clips).
+- **Global viscous damping (all 8 cells):** rendered in `virtuose_server_node.cpp`, not in the force managers — a damper is only passive if the force is applied in the same tick the velocity was measured, which a cross-process (Python force manager ↔ C++ driver) round trip cannot guarantee; computing it locally removes that delay entirely. Parameters `damping_lin = 0.35 Ns/m`, `damping_ang = 0.025 Nm·s/rad` (`ros2 param set /virtuose_server_node damping_lin|damping_ang <value>`), applied to whichever force manager is publishing `virtuose/force_cmd`. Each force manager still carries its old `Kd_global_lin`/`Kd_global_ang` constants and an `ENABLE_GLOBAL_DAMPING` flag (`ENABLE_GLOBAL_DAMPING_LIN`/`_ANG` in C), currently `False` — dead code kept only so the flag can flip back on for comparison; do not enable alongside the driver's damping or it double-applies.
+- **Clutch orientation-alignment torque (all clutch cells):** `K_align = 5 Nm/rad` pulling the handle toward the target orientation while clutching, faded to zero within `0.35 rad` of a joint limit. Treated as a **sync effect**, so it is present in the baseline C too. Reads `virtuose/pose` as `geometry_msgs/Pose` (the earlier `PoseStamped` subscription silently never matched the `Pose` publisher, so this torque was **dead** in CF/CB/CFB until fixed).
 - **F_guide guidance (all F=1 cells CF/CFB/JF/JFB):** identical computation and weights **within** a column (CF≡CFB, JF≡JFB) and the same activation gate **everywhere** (§3.7): `gain = conf_gate(b_max; 0.30, 0.90) × prox_gate(ref→goal; 0.10, 0.60 m)`.
 - **Blending (all B=1 cells CB/CFB/JB/JFB):** performed identically at the reference level by `main_shared_autonomy`; every B=1 force manager now renders the same **blend-telemetry** window (α + user/policy share from `/shared_autonomy/blend_debug`).
-- **Joystick "sync" (all joystick cells J/JF/JB/JFB):** the centering spring `KP_LIN=60, KD_LIN=1.0, KP_ANG=1.5, KD_ANG=0.15`. This is the joystick's **homing** force and is deliberately a different magnitude from the clutch tether — in velocity control the comparison is against the homing action, not against an EE-tracking tether (mandated by the two frameworks).
-- **Known residual asymmetry (accepted, D3):** during autonomous grasp execution the CLUTCH cells drag the handle to follow the EE (`GRASP_FOLLOW_KP=30, KD=160`), but the JOYSTICK cells do **not** subscribe to `grasp_active` and render nothing extra — so the operator physically feels the autonomous grasp only in clutch. Left as-is for now; documented here for the paper.
+- **Vibration amplitude (all 8 cells):** every square-wave cue (clutch `LIMIT_VIB_AMP`/`GRASP_VIB_AMP`, joystick `VIB_AMP`/`GRASP_VIB_AMP`) is a flat `0.01 Nm`, toggled every 150 Hz tick (~75 Hz square wave).
+- **Joystick "sync" (all joystick cells J/JF/JB/JFB):** the centering spring `KP_LIN=30 N/m`, `KP_ANG=0.75 Nm/rad`, both declared as ROS parameters (`ros2 param set <node> KP_LIN|KP_ANG <value>`) re-read every tick for live sweeps; the config values are only the declared defaults. This is the joystick's **homing** force and is deliberately a different magnitude from the clutch tether — in velocity control the comparison is against the homing action, not against an EE-tracking tether (mandated by the two frameworks). Its damping (`KD_LIN`/`KD_ANG`) is gated off behind `ENABLE_SPRING_DAMPING = False` for the same passivity reason as the clutch cells: the driver supplies the viscous term. Note `MAX_GUIDE_FORCE`/`MAX_GUIDE_TORQUE` in JF/JFB are derived from `KP_LIN`/`KP_ANG` **at construction**, so a live stiffness sweep does not rescale the guidance cap — restart the node to re-derive it.
+- **Known residual asymmetry (accepted, D3):** during autonomous grasp execution the CLUTCH cells drag the handle to follow the EE (`GRASP_FOLLOW_KP=15, KD=80`), but the JOYSTICK cells render only the shared `GRASP_VIB_AMP` buzz and no follow force — so the operator physically feels the autonomous grasp's *motion* only in clutch. Left as-is for now; documented here for the paper.
 
 ### 3.1 CLUTCH · Guided feedback — Virtual Fixture (`CLUTCH, F=1, B=0`)
 
@@ -106,15 +107,15 @@ Haption pose ─┐
        renders ONLY the restorative spring toward home → virtuose/force_cmd
 ```
 
-**Home pose** (Haption base frame): position fixed at `JOYSTICK_NEUTRAL_POSITION_M = [0.5, -0.03, -0.03]`; orientation starts from `JOYSTICK_NEUTRAL_ORIENTATION_XYZW` (measured on the device at the operator's comfortable rest orientation) and is **dynamically re-based** to track the gripper's orientation (so "handle at rest" always means "hold current gripper orientation"). The gripper reference that defines this mapping is **per-arm**: captured ONCE the first time each arm becomes active, and saved/restored across arm switches (returning to an arm resumes its own home, not neutral). It is **never re-anchored** after first capture — in particular NOT after an autonomous grasp: the home is recomputed every tick (including while suspended during grasp execution) as a scaled delta from the persistent reference, so it stays continuously synced to the gripper with no jump-to-neutral at any transition. The gripper's rotation away from its reference is scaled DOWN by `JOYSTICK_ROT_HOME_SCALE = 1.3` (gripper 90° → handle ~69°) when building the home orientation — lower scale = tighter (more synchronized) tracking, kept above 1.0 so the handle stays within the Haption's more restrictive rotational workspace. This scaling applies ONLY to the home pose, never to the commanded twist. `teleop_triago_joystick.py` owns and publishes the live home pose so the spring and the twist zero-point stay identical.
+**Home pose** (Haption base frame): position fixed at `JOYSTICK_NEUTRAL_POSITION_M = [0.2624, 0.0103, -0.0729]`; orientation starts from `JOYSTICK_NEUTRAL_ORIENTATION_XYZW` (measured on the device at the operator's comfortable rest orientation) and is **dynamically re-based** to track the gripper's orientation (so "handle at rest" always means "hold current gripper orientation"). The gripper reference that defines this mapping is **per-arm**: captured ONCE the first time each arm becomes active, and saved/restored across arm switches (returning to an arm resumes its own home, not neutral). It is **never re-anchored** after first capture — in particular NOT after an autonomous grasp: the home is recomputed every tick (including while suspended during grasp execution) as a scaled delta from the persistent reference, so it stays continuously synced to the gripper with no jump-to-neutral at any transition. The gripper's rotation away from its reference is scaled DOWN by `JOYSTICK_ROT_HOME_SCALE = 1.3` (gripper 90° → handle ~69°) when building the home orientation — lower scale = tighter (more synchronized) tracking, kept above 1.0 so the handle stays within the Haption's more restrictive rotational workspace. This scaling applies ONLY to the home pose, never to the commanded twist. `teleop_triago_joystick.py` owns and publishes the live home pose so the spring and the twist zero-point stay identical.
 
-**Deadband**: handle displacement below `JOYSTICK_DEADBAND_LIN = 6.91 cm` / `JOYSTICK_DEADBAND_ANG = ~13.37°` yields zero user twist (removed radially, continuous at the boundary). It is intentionally large because the centering spring cannot settle the handle to mm/sub-degree precision — a tighter band would read the residual settle-oscillation as spurious user input. A still handle (zero user twist) makes the arbitration fall back to a gentle autonomous crawl (see triago §5).
+**Deadband**: handle displacement below `JOYSTICK_DEADBAND_LIN = 3.46 cm` / `JOYSTICK_DEADBAND_ANG = ~13.37°` yields zero user twist (removed radially, continuous at the boundary). Each band is floored by the centering spring's settle precision, not by ergonomics: below it, the residual settle-oscillation of a released handle is read as spurious user input. The linear band is also bounded from above by the device workspace (§8) — from the home pose the tightest axis is `+x`, and the band consumes part of that travel before any twist is commanded. A still handle (zero user twist) makes the arbitration fall back to a gentle autonomous crawl (see triago §5).
 
 ### 3.3 CLUTCH · Sync only — No-Guidance Baseline (`CLUTCH, F=0, B=0`, `haptic_force_manager_C.py`)
 
-A control-condition strategy for the user study: **pure manual teleoperation with NO predictive assistance**. Runs the SAME `teleop_triago_clutch.py` as §3.1 (clutch-indexing to `/arm_*/cartesian_reference`, `ASSIST_BLENDING=False`), but pairs it with a stripped force manager whose only goal-directed wrenches are removed: NO `F_guide`, no `F_fixture`, no `F_cbf`, no adaptive sync-share. It renders `F_sync` with the **unified clutch sync spring** (`Kp_sync=30`, `Kp_sync_ang=0.9`, §3.0), so `main_shared_autonomy`'s guidance topics are irrelevant here.
+A control-condition strategy for the user study: **pure manual teleoperation with NO predictive assistance**. Runs the SAME `teleop_triago_clutch.py` as §3.1 (clutch-indexing to `/arm_*/cartesian_reference`, `ASSIST_BLENDING=False`), but pairs it with a stripped force manager whose only goal-directed wrenches are removed: NO `F_guide`, no `F_fixture`, no `F_cbf`, no adaptive sync-share. It renders `F_sync` with the **unified clutch sync spring** (`Kp_sync=15`, `Kp_sync_ang=0.45`, §3.0), so `main_shared_autonomy`'s guidance topics are irrelevant here.
 
-To stay comparable with the other clutch cells it KEEPS the unified non-guidance features (§3.0): the clutch **orientation-alignment torque** (`K_align=10`, now treated as a sync effect and therefore present here too), the `grasp_active` EE-following wrench (feel the autonomous grasp/lift/abort — active only if the grasp state machine is running), the clutch-freeze (50% on press), the constant global viscous damping (`0.7/0.1`), the `10 N/1 Nm` cap = device clip, arm switching, and the 180°-Z frame map.
+To stay comparable with the other clutch cells it KEEPS the unified non-guidance features (§3.0): the clutch **orientation-alignment torque** (`K_align=5`, now treated as a sync effect and therefore present here too), the `grasp_active` EE-following wrench (feel the autonomous grasp/lift/abort — active only if the grasp state machine is running), the clutch-freeze (50% on press), the constant global viscous damping (`0.35/0.05`), the `5 N/0.5 Nm` cap = device clip, arm switching, and the 180°-Z frame map.
 
 ### 3.4 CLUTCH · Full guidance (`CLUTCH, F=1, B=1`, `haptic_force_manager_CFB.py`)
 
@@ -129,11 +130,11 @@ Both assistance channels active on the SAME position-control clutch teleop (`tel
 Both channels active on the spring-centered joystick teleop (`teleop_triago_joystick.py`): the handle renders the **superposition** `F_home (centering spring) + F_guide`, and `main_shared_autonomy` blends the reference (channel B, unchanged from JB).
 
 - **`F_guide` is CFB's velocity field, copied verbatim** (`pi_blend = Σ P(k)·pi_k` → `v_field = map_180Z(pi_blend)` → `F = D·(v_field − handle_vel)`, self-damped, tanh-saturated, LPF'd), with three deliberate retunes so it *overlaps* the home spring rather than using free gains:
-  1. **Calibrated to the home force:** the saturation is a fraction of the **deadzone-exit force** — `MAX_GUIDE_FORCE = GUIDE_K·KP_LIN·DEADBAND_LIN`, `MAX_GUIDE_TORQUE = GUIDE_K·KP_ANG·DEADBAND_ANG`, with **`GUIDE_K = 0.55`** (≈2.28 N / ≈0.19 Nm at the current deadbands). Since `GUIDE_K < 1`, the guidance is a pure **bias**: even at full gain it does NOT clear the deadband on its own — the operator still drives, but feels a clear preferred direction. (`GUIDE_K` was reduced 1.1→0.55 because full-authority guidance felt like fighting forces rather than being gently biased.)
+  1. **Calibrated to the home force:** the saturation is a fraction of the **deadzone-exit force** — `MAX_GUIDE_FORCE = GUIDE_K·KP_LIN·DEADBAND_LIN`, `MAX_GUIDE_TORQUE = GUIDE_K·KP_ANG·DEADBAND_ANG`, with **`GUIDE_K = 0.55`** (≈0.57 N / ≈0.096 Nm at the current deadbands). Since `GUIDE_K < 1`, the guidance is a pure **bias**: even at full gain it does NOT clear the deadband on its own — the operator still drives, but feels a clear preferred direction.
   2. **`gain` applied AFTER the tanh** (linear "fraction of the guidance authority"): the handle is biased toward the goal proportionally to `gain`; going WITH the guidance clears the deadband easily, opposing it means beating spring+guidance.
   - **Out-of-deadzone vibration cue** (same as `J`/`JB`): a constant ±`VIB_AMP=0.05` Nm zero-mean buzz on the torque axes whenever the handle is outside either deadband, so the operator always feels *when* a command is being impressed (their own push or the guidance biasing the handle out).
   3. **`gain = confidence(b_max) × proximity`** (unified across all F=1 cells, §3.7): confidence gate `smoothstep(b_max; 0.30, 0.90)` on the active-goal belief (not the entropy measure); proximity gate over ref→goal distance `[0.10, 0.60] m`. Dead when `b_max<0.30` or `dist>0.60 m`; full when confident and `≤0.10 m`.
-- **F_guide is FEED-FORWARD here, not CFB's velocity field:** it is built from `v_field` ONLY (no `−handle_vel` term). CFB's velocity-field self-damping is a *virtual damper* of coefficient `D_guide`; at the `D` needed to reach the exit force (~400 Ns/m) it is ~100× above what a 150 Hz impedance device renders passively and excited a hard high-frequency limit cycle. Dropping it makes `F_guide` a smooth goal-directed force that only shifts the spring's equilibrium (stable); the handle is damped by the spring's `KD` + device friction. It still vanishes at the goal (`v_field→0`). `D_guide_lin=400`/`D_guide_ang=30` are now feed-forward magnitude-shaping gains (policy speed → force), not dampers.
+- **F_guide is FEED-FORWARD here, not CFB's velocity field:** it is built from `v_field` ONLY (no `−handle_vel` term). CFB's velocity-field self-damping is a *virtual damper* of coefficient `D_guide`; at the `D` needed to reach the exit force (~200 Ns/m) it is ~100× above what a 150 Hz impedance device renders passively and excited a hard high-frequency limit cycle. Dropping it makes `F_guide` a smooth goal-directed force that only shifts the spring's equilibrium (stable); the handle is damped by the spring's `KD` + device friction. It still vanishes at the goal (`v_field→0`). `D_guide_lin=200`/`D_guide_ang=15` are now feed-forward magnitude-shaping gains (policy speed → force), not dampers.
 - **Still → suspend blending:** like the clutch cell, when the handle sits inside the joystick deadband (`v_user≈0`) `main_shared_autonomy` forces `alpha=0`, so the gripper never moves on zero user twist (see `triago_control` §5.2 — the `_user_still` gate now covers both control modes).
 - **Plots** (three windows): (1) a **deadzone-condition** plot (like `JB`): `‖pos−home‖` and the angular gap vs the linear/angular deadband lines; (2) a **guidance-share** window with two subplots — the per-axis (X/Y/Z) **share of the FORCE** and **share of the TORQUE** contributed by `F_guide` as a percentage `|F_guide_axis| / (|F_guide_axis| + |F_home_axis|)` (the home share is `100% −` this); (3) the shared **blend-telemetry** window (§3.0): α and the user/policy share.
 - Stability note: this cell intentionally re-introduces the force→handle→twist→robot loop the pure joystick avoided; it stays bounded because `F_guide` is feed-forward (no velocity feedback) and, with `GUIDE_K=0.55`, biases without ever clearing the deadband on its own.
@@ -160,6 +161,8 @@ The task, belief function and policy are the SAME for both teleop modes, so the 
 
 - **Frequency**: 150 Hz. **Command mode**: `COMMAND_TYPE_IMPEDANCE` (force in, position out). **Indexing**: `INDEXING_NONE` (button held to track).
 - **IP**: `127.0.0.1#53210` via `libtirpc`. Startup: open → configure → power on → 3s relay wait → loop.
+- **Button mapping (Desktop 6D Compact)**: device index 1 is physically the left button, 2 the right — reversed from the Virtuose 6D. `VirtuoseStateInterface` swaps them at the read (`virtGetButton(VC,1,button_left); virtGetButton(VC,2,button_right)`) so the `virtuose/button_right`=clutch / `virtuose/button_left`=grasp-trigger topic contract is unchanged for every downstream consumer.
+- **Local viscous damping**: `damping_lin` (Ns/m) / `damping_ang` (Nm·s/rad) ROS params, defaults `0.35`/`0.025`, tunable live (`ros2 param set /virtuose_server_node damping_lin|damping_ang <value>`). Computed here — not in the force managers — and added to whichever wrench arrives on `virtuose/force_cmd` in the same tick its `velocity` was read, then the total is clipped to `±5N`/`±0.5Nm` before `virtSetForce`. This exists because damping is velocity feedback: it is only passive if applied in the same tick the velocity was measured, which a Python-force-manager round trip over ROS cannot guarantee (renders as discontinuous tugs, not viscosity, worse on the Compact's lower-inertia wrist than it was on the Virtuose 6D).
 
 | Published | Type | Content |
 |---|---|---|
@@ -189,29 +192,27 @@ Both output the same 13-float `Float64MultiArray` protocol: `[pos(3), rpy(3), ve
 The **only** force rendered in Joystick Mode: a spring-damper pulling the handle back to the (dynamic) home pose (§3.2), in the Haption base frame:
 
 ```
-F_lin = KP_LIN·(home_pos − handle_pos) − KD_LIN·handle_vel_lin       (KP_LIN=60 N/m, KD_LIN=1.0)
-Tau   = KP_ANG·rotvec(home_rot · handle_rot⁻¹) − KD_ANG·handle_vel_ang (KP_ANG=1.5 Nm/rad, KD_ANG=0.15)
+F_lin = KP_LIN·(home_pos − handle_pos) − KD_LIN·handle_vel_lin       (KP_LIN=30 N/m, KD_LIN=0.5)
+Tau   = KP_ANG·rotvec(home_rot · handle_rot⁻¹) − KD_ANG·handle_vel_ang (KP_ANG=0.75 Nm/rad, KD_ANG=0.075)
 ```
 
-Clipped to `MAX_FORCE=10N` / `MAX_TORQUE=1Nm`. No `F_guide`/`F_fixture`/`F_sync`/`F_cbf`, no clutch-align, no joint-limit vibration — coupling any robot-state-derived force onto the handle is exactly what destabilized the previous design. The home pose target is subscribed from `/joystick/home_pose` (single source of truth = the joystick teleop), falling back to the config neutral until the first message.
+Clipped to `MAX_FORCE=5N` / `MAX_TORQUE=0.5Nm`. No `F_guide`/`F_fixture`/`F_sync`/`F_cbf`, no clutch-align, no joint-limit vibration — coupling any robot-state-derived force onto the handle is exactly what destabilized the previous design. The home pose target is subscribed from `/joystick/home_pose` (single source of truth = the joystick teleop), falling back to the config neutral until the first message.
 
 ### 6.1 Virtual Fixture superposition (`haptic_force_manager_CF.py`, `cfg.BLENDING=False`)
 
-Multi-layer force superposition, summed and clipped to `MAX_FORCE=10N`/`MAX_TORQUE=1Nm`:
+Multi-layer force superposition, summed and clipped to `MAX_FORCE=5N`/`MAX_TORQUE=0.5Nm`:
 
 | Layer | Symbol | Formula / description |
 |---|---|---|
-| Sync | F_sync | Spring-damper (Kp=30, Kp_ang=0.9, Kd=0) tethering handle to tracking error (unified §3.0) |
+| Sync | F_sync | Spring (Kp=15, Kp_ang=0.1, Kd=0) tethering handle to tracking error (unified §3.0); both gains are live ROS params |
 | CBF | F_cbf | Repulsive force from collision-barrier gradient × λ_cbf, tanh-saturated, LPF (α=0.15) |
-| Guide (Virtual Fixture only) | F_guide | Velocity-field: `F = D·(v_field − v_handle)·confidence`, `v_field = map(pi_blend)`; intrinsically damped (fades as handle reaches v_field, vanishes at goal) |
+| Guide (Virtual Fixture only) | F_guide | Velocity-field: `F = D·(v_field − v_handle)·confidence`, `v_field = map(pi_blend)`; intrinsically damped (fades as handle reaches v_field, vanishes at goal). Unverified on the Desktop 6D Compact — the same `-v_handle` self-damping form was already found to excite a 150Hz-loop limit cycle on JF/JFB (§3.5) and removed there; CF/CFB still use it |
 | Fixture (Virtual Fixture only) | F_fixture | Position+orientation spring toward `active_goal_pose`, gated by belief confidence (`FIX_CONF_LO=0.55 → HI=0.85`); does not weaken near goal (unlike F_guide) |
 | Limit | F_limit | 75 Hz square-wave vibration near Haption joint limits |
-| Clutch align | — | Rotational spring (K=10 Nm/rad) toward target orientation during clutch |
-| Global damping | — | Viscous Kd_lin=0.7, Kd_ang=0.1 |
+| Clutch align | — | Rotational spring (K=5 Nm/rad) toward target orientation during clutch |
+| Global damping | — | Rendered in `virtuose_server_node.cpp`, not here (§3.0): `damping_lin=0.35`, `damping_ang=0.025`, live ROS params on that node. Each force manager's own `ENABLE_GLOBAL_DAMPING` flag is `False` — do not enable, it would double-apply |
 
 **F_guide belief blend**: `pi_blend = Σ_k w(k)·pi_k` (convex combination over goal policies); the guidance is gated by the **unified** `gain = conf_gate(b_max; 0.30, 0.90) × prox_gate(ref→goal; 0.10, 0.60 m)` (§3.7) — the active-goal belief `b_max`, NOT the old normalized-entropy measure.
-
-**Passivity architecture**: Observer integrates `power = −(wrench · twist)`; Controller injects dissipative damping `β·v` when energy < 0, saturated at `MAX_PC_FORCE=5N`/`MAX_PC_TORQUE=0.5Nm` (toggle `ENABLE_PASSIVITY_CONTROL`, currently `False`).
 
 ## 7. Frame Convention (Haption ↔ TRIAGo)
 
@@ -227,16 +228,26 @@ Force feedback (Haption ← TRIAGo) uses the **same** negation (transpose of a 1
 
 ## 8. Haption Device Joint Limits (from `calibration_main.cpp`)
 
+Measured on the Desktop 6D Compact. The wrist is not uniformly wider than the previous device: J4 and J5 are ~19% narrower while J6 is ~7% wider, so the rotational workspace stays the binding constraint that `JOYSTICK_ROT_HOME_SCALE` (§3.2) compensates for.
+
 | Joint | Min (rad) | Max (rad) |
 |---|---|---|
-| J1 | -0.804 | +0.782 |
-| J2 | -1.650 | -0.065 |
-| J3 | +0.728 | +2.498 |
-| J4 | -3.024 | +2.820 |
-| J5 | -1.282 | +1.047 |
-| J6 | -2.054 | +2.095 |
+| J1 | -0.785 | +0.784 |
+| J2 | -1.571 | -0.002 |
+| J3 | +0.793 | +2.496 |
+| J4 | -2.393 | +2.354 |
+| J5 | -1.023 | +0.880 |
+| J6 | -2.229 | +2.213 |
 
 Vibration warning at `LIMIT_OUTER=0.25 rad` from a limit; maximum at `LIMIT_INNER=0.15 rad`.
+
+**Cartesian workspace** (Haption base frame, centre `[0.25, -0.01, 0.00]`, also mirrored in `scripts/workspace_debug_visualizer.py`):
+
+| Axis | Min (m) | Max (m) |
+|---|---|---|
+| x | 0.14 | 0.36 |
+| y | -0.24 | 0.22 |
+| z | -0.18 | 0.18 |
 
 ## 9. Topic Interface
 
