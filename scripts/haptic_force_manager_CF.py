@@ -55,9 +55,9 @@ class HapticForceManager(Node):
         self.user_policies = []
 
         # F_guide: feed-forward velocity field -- policy speed shaped into force, tanh-saturated.
-        self.D_guide_lin = 21.84   # Ns/m  magnitude-shaping gain (translation)
+        self.D_guide_lin = 21.84 * 1.2   # Ns/m  magnitude-shaping gain (translation), +20% position feedback
         self.D_guide_ang = 0.351 * 4.2   # Nms/rad magnitude-shaping gain (rotation)
-        self.MAX_GUIDE_FORCE  = 2.73   # N   guidance force saturation
+        self.MAX_GUIDE_FORCE  = 2.73 * 1.2   # N   guidance force saturation, +20% position feedback
         self.MAX_GUIDE_TORQUE = 0.065 * 4.2  # Nm  guidance torque saturation
 
         # Proximity gate: guidance silenced far from the goal, where the goal manifold still swings.
@@ -215,7 +215,10 @@ class HapticForceManager(Node):
         self.dt = 1.0 / 150.0
         self.timer = self.create_timer(self.dt, self.control_loop)
 
-        self.setup_plot()
+        # Live Matplotlib windows: on by default, disable with -p plot:=false.
+        self.plot_enabled = bool(self.declare_parameter('plot', True).value)
+        if self.plot_enabled:
+            self.setup_plot()
         self.get_logger().info("Haptic Force Manager (tutorial) started.")
 
     # =========================
@@ -803,9 +806,12 @@ def main(args=None):
     spin_thread.start()
 
     try:
-        while rclpy.ok():
-            node.update_plot()
-            plt.pause(0.1)
+        if node.plot_enabled:
+            while rclpy.ok():
+                node.update_plot()
+                plt.pause(0.1)
+        else:
+            spin_thread.join()
     except KeyboardInterrupt:
         pass
     finally:

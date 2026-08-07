@@ -66,10 +66,11 @@ class HapticForceManagerJF(Node):
         # Guidance saturation = GUIDE_K x deadzone-exit force; GUIDE_K < 1 makes it a pure
         # bias that can never clear the deadband alone -- the operator always initiates motion.
         self.GUIDE_K = 0.55
-        self.MAX_GUIDE_FORCE  = self.GUIDE_K * self.KP_LIN * cfg.JOYSTICK_DEADBAND_LIN
+        # Position channel gets an extra 1.2x (+20% position feedback); torque stays at GUIDE_K exactly.
+        self.MAX_GUIDE_FORCE  = self.GUIDE_K * self.KP_LIN * cfg.JOYSTICK_DEADBAND_LIN * 1.2
         self.MAX_GUIDE_TORQUE = self.GUIDE_K * self.KP_ANG * cfg.JOYSTICK_DEADBAND_ANG
         # Feed-forward magnitude-shaping gains (policy speed -> force), not velocity feedback.
-        self.D_guide_lin = 200.0   # N per (m/s)
+        self.D_guide_lin = 200.0 * 1.2   # N per (m/s), +20% position feedback
         self.D_guide_ang = 15.0    # Nm per (rad/s)
         self.alpha_guide = 0.15    # LPF on the guidance wrench (C0 continuity)
         self.f_guide_filtered = np.zeros(6)
@@ -118,7 +119,10 @@ class HapticForceManagerJF(Node):
         self.dt = 1.0 / 150.0
         self.timer = self.create_timer(self.dt, self.control_loop)
 
-        self.setup_plot()
+        # Live Matplotlib windows: on by default, disable with -p plot:=false.
+        self.plot_enabled = bool(self.declare_parameter('plot', True).value)
+        if self.plot_enabled:
+            self.setup_plot()
         self.get_logger().info(
             f"[HFM-JF] Joystick GUIDED-FEEDBACK manager started (F=1, B=0). "
             f"F_home spring KP_LIN={self.KP_LIN}, KP_ANG={self.KP_ANG}; "
@@ -434,9 +438,12 @@ def main(args=None):
     spin_thread.start()
 
     try:
-        while rclpy.ok():
-            node.update_plot()
-            plt.pause(0.1)
+        if node.plot_enabled:
+            while rclpy.ok():
+                node.update_plot()
+                plt.pause(0.1)
+        else:
+            spin_thread.join()
     except KeyboardInterrupt:
         pass
     finally:

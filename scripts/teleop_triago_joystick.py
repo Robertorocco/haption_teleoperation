@@ -54,6 +54,15 @@ class TeleopJoystick(Node):
         self.MAX_REF_LEAD_LIN = 0.10   # m    cap on how far the latch may lead the real EE
         self.MAX_REF_LEAD_ANG = 0.35   # rad  same cap for orientation
 
+        # Safety cap on the raw handle-vs-home rotvec, applied BEFORE the deadband in
+        # _compute_user_twist. as_rotvec() always returns the shortest-path angle (norm
+        # in [0, pi]); as the true relative angle crosses pi it flips to the opposite
+        # direction, which would read as a sudden twist reversal at a large deflection.
+        # The commanded twist already saturates (V_MAX_ANG) well below this cap, so it
+        # only bounds worst-case severity if home drifts far from the handle -- it never
+        # changes behavior in the normal operating range.
+        self.ROT_DELTA_SAFETY_CAP = 1.2  # rad (~69 deg), ~2x the saturation deflection
+
         self.active_arm = 'right'
         # virtuose/pose is geometry_msgs/Pose (not PoseStamped) -- the wrong type silently receives nothing.
         self.create_subscription(Pose, 'virtuose/pose', self.handle_pose_cb, 10)
@@ -183,6 +192,7 @@ class TeleopJoystick(Node):
         v_triago = self._clamp_norm(v_triago, cfg.JOYSTICK_V_MAX_LIN)
 
         delta_rot = (self.handle_rot * self.home_rot.inv()).as_rotvec()
+        delta_rot = self._clamp_norm(delta_rot, self.ROT_DELTA_SAFETY_CAP)
         eff_ang = self._deadband_radial(delta_rot, cfg.JOYSTICK_DEADBAND_ANG)
         if float(np.linalg.norm(eff_ang)) < 1e-9:
             w_haption = np.zeros(3)

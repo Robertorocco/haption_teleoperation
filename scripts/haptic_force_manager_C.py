@@ -142,7 +142,10 @@ class HapticForceManagerNoGuidance(Node):
         self.dt = 1.0 / 150.0
         self.timer = self.create_timer(self.dt, self.control_loop)
 
-        self.setup_plot()
+        # Live Matplotlib windows: on by default, disable with -p plot:=false.
+        self.plot_enabled = bool(self.declare_parameter('plot', True).value)
+        if self.plot_enabled:
+            self.setup_plot()
         self.get_logger().info(
             "Haptic Force Manager (NO-GUIDANCE baseline) started: F_sync only, "
             f"doubled tether (Kp_sync={self.Kp_sync}, Kp_sync_ang={self.Kp_sync_ang}).")
@@ -499,9 +502,12 @@ def main(args=None):
     spin_thread.start()
 
     try:
-        while rclpy.ok():
-            node.update_plot()
-            plt.pause(0.1)
+        if node.plot_enabled:
+            while rclpy.ok():
+                node.update_plot()
+                plt.pause(0.1)
+        else:
+            spin_thread.join()
     except KeyboardInterrupt:
         pass
     finally:

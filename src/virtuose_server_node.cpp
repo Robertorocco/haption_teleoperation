@@ -80,8 +80,8 @@ public:
     }
 
 private:
-    // Set to false to silence periodic debug prints.
-    bool debug_mode_ = true;
+    // Set to true to re-enable periodic debug prints (per-tick force/hardware-state spam).
+    bool debug_mode_ = false;
 
     VirtContext VC = NULL;
 
@@ -152,15 +152,14 @@ private:
 
 
     // Applies the wrench to the handle, logging the Haption error message on failure.
+    // Not gated by debug_mode_: a real API failure is a fault, not verbose tracing.
     int VirtuoseCommandInterface(float *force){
         int result = virtSetForce(VC, force);
 
-        if (debug_mode_) {
-            if (result == -1) {
-                int err_code = virtGetErrorCode(VC);
-                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                    "Virtuose API Error: %s", virtGetErrorMessage(err_code));
-            }
+        if (result == -1) {
+            int err_code = virtGetErrorCode(VC);
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "Virtuose API Error: %s", virtGetErrorMessage(err_code));
         }
         return result;
     }
