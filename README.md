@@ -64,11 +64,54 @@ colcon build --packages-select haption_teleoperation
 source install/setup.bash
 
 ros2 run haption_teleoperation virtuose_server_node
+```
 
-# pick the teleop + force-manager pair matching the condition in config.py, e.g.:
+Then pick the teleop + force-manager pair matching the condition set in `triago_control`'s
+`config.py` (section 1b — `CONTROL_MODE` / `ASSIST_FEEDBACK` / `ASSIST_BLENDING`). Every
+force manager opens live Matplotlib plot windows by default; add `--ros-args -p plot:=false`
+to skip them entirely (headless runs, or to save CPU during an actual study session).
+
+### 🕹️ JOYSTICK
+
+```bash
+# JOYSTICK sync-only (F=0, B=0) — set config to JOYSTICK / False / False
+ros2 run haption_teleoperation teleop_triago_joystick.py
+ros2 run haption_teleoperation haptic_force_manager_J.py --ros-args -p plot:=false
+
+# JOYSTICK guided-blending (F=0, B=1) — set config to JOYSTICK / False / True
+ros2 run haption_teleoperation teleop_triago_joystick.py
+ros2 run haption_teleoperation haptic_force_manager_JB.py --ros-args -p plot:=false
+
+# JOYSTICK guided-feedback (F=1, B=0) — set config to JOYSTICK / True / False
+ros2 run haption_teleoperation teleop_triago_joystick.py
+ros2 run haption_teleoperation haptic_force_manager_JF.py --ros-args -p plot:=false
+
+# JOYSTICK full-guidance (F=1, B=1) — set config to JOYSTICK / True / True
+ros2 run haption_teleoperation teleop_triago_joystick.py
+ros2 run haption_teleoperation haptic_force_manager_JFB.py --ros-args -p plot:=false
+```
+
+### 💢 CLUTCH
+
+```bash
+# CLUTCH sync-only (F=0, B=0) — set config to CLUTCH / False / False
 ros2 run haption_teleoperation teleop_triago_clutch.py
-ros2 run haption_teleoperation haptic_force_manager_C.py
+ros2 run haption_teleoperation haptic_force_manager_C.py --ros-args -p plot:=false
 
+# CLUTCH guided-blending (F=0, B=1) — set config to CLUTCH / False / True
+ros2 run haption_teleoperation teleop_triago_clutch.py
+ros2 run haption_teleoperation haptic_force_manager_CB.py --ros-args -p plot:=false
+
+# CLUTCH guided-feedback (F=1, B=0) — set config to CLUTCH / True / False
+ros2 run haption_teleoperation teleop_triago_clutch.py
+ros2 run haption_teleoperation haptic_force_manager_CF.py --ros-args -p plot:=false
+
+# CLUTCH full-guidance (F=1, B=1) — set config to CLUTCH / True / True
+ros2 run haption_teleoperation teleop_triago_clutch.py
+ros2 run haption_teleoperation haptic_force_manager_CFB.py --ros-args -p plot:=false
+```
+
+```bash
 ros2 run haption_teleoperation virtuose_calibration     # joint-limit discovery
 ros2 run haption_teleoperation haption_plotter.py       # debug plotting
 ```
