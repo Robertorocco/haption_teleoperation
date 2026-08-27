@@ -56,12 +56,12 @@ class HapticForceManagerBlending(Node):
         self.MAX_TOTAL_TORQUE = 0.5
 
         # Out-of-deadzone cue: zero-mean buzz whenever a non-zero twist is being commanded.
-        self.VIB_AMP = 0.01     # Nm
+        self.VIB_AMP = 0.009     # Nm
         self.vib_toggle = 1.0         # sign flip every frame -> ~75 Hz square wave
 
         # Autonomous-grasp cue, unified across all 8 cells.
         self.grasp_active = False
-        self.GRASP_VIB_AMP = 0.01    # Nm
+        self.GRASP_VIB_AMP = 0.009    # Nm
         self.grasp_vib_toggle = 1.0
 
         # virtuose/pose is geometry_msgs/Pose (not PoseStamped) -- the wrong type silently receives nothing.

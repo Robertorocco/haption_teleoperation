@@ -20,6 +20,10 @@ import triago_control.qp_controller.config as cfg
 # TkAgg keeps Matplotlib off the ROS spin thread.
 matplotlib.use('TkAgg')
 
+# TRIAGo <-> Haption base-frame map: 180-deg rotation about Z, its own inverse, valid for
+# linear and axial vectors alike (so it may be applied directly to a rotation vector).
+_FRAME_FLIP = np.array([-1.0, -1.0, 1.0])
+
 class HapticForceManagerCB(Node):
     # Blending-only force manager: shared autonomy blends the reference, the handle feels only F_sync.
     def __init__(self):
@@ -94,9 +98,23 @@ class HapticForceManagerCB(Node):
         self.is_clutching = False
         self.was_clutching_last_frame = False
         self.f_clutch_frozen = np.zeros(6)
-        self.K_align = 5.0  # Nm/rad clutch orientation-alignment stiffness
-        # Disabled: the alignment error mixes robot-base and device frames, making the torque non-restorative.
-        self.ENABLE_CLUTCH_ALIGN = False
+        # Live-tunable so the align stiffness can be swept without a rebuild. Reference points on
+        # this device: clutch sync angular = 0.1 Nm/rad (live-validated), joystick homing spring
+        # = 0.75 Nm/rad, and Kp_sync_ang = 0.9 was measured UNSTABLE -- so keep well under that.
+        self.K_align = float(self.declare_parameter('K_align', 0.3).value)  # Nm/rad
+        # Soft ceiling below the 0.5 Nm device clip: a stiff spring that hard-clips becomes
+        # bang-bang (max torque flipping sign across the target), which self-excites.
+        self.MAX_ALIGN_TORQUE = 0.35  # Nm
+        # Handle<->gripper orientation correspondence, captured once on the first clutch press and
+        # never re-anchored. CLUTCH teleop integrates orientation incrementally and never stores an
+        # absolute handle<->gripper relation, so the convention has to be pinned down explicitly.
+        self._align_ref_real = None
+        self._align_ref_haption = None
+        # True: clutch renders zero linear force + a live torque aligning the handle with the
+        # real gripper, so the operator repositions freely while orientation self-aligns.
+        # False: legacy behaviour, the whole wrench frozen at 50% for the press duration.
+        self.ENABLE_CLUTCH_ALIGN = True
+        self.CLUTCH_ALIGN_FADE_MARGIN = 0.35  # rad: align torque fades out inside this joint-limit margin
         self.rot_haption = None
 
 
@@ -109,19 +127,12 @@ class HapticForceManagerCB(Node):
         self.joint_min = np.array([-0.785282, -1.5709, 0.792704, -2.39339, -1.02312, -2.22872])
         self.joint_max = np.array([0.784393, -0.00157491, 2.49551, 2.35378, 0.879614, 2.21327])
 
-        self.LIMIT_OUTER = 0.10       # rad: margin where the cue can fire
-        self.LIMIT_INNER = 0.06       # rad: margin of maximum vibration
-        self.AMP_MIN = 0.05           # Nm
-        self.AMP_MAX = 0.07           # Nm
+        self.LIMIT_OUTER = 0.10       # rad: margin where the joint-limit cue buzzes
         self.vib_toggle = 1.0         # sign flip every frame -> 75 Hz square wave
 
-        # Joint-limit "clutch advice": one-shot burst, re-armed only by a full clutch cycle.
-        self.LIMIT_VIB_DURATION = 1.0   # s
-        self.LIMIT_VIB_AMP = 0.01  # Nm
-        self.limit_vib_armed = True
-        self.limit_vib_active = False
-        self.limit_vib_start_time = 0.0
-        self._vib_clutch_prev = False
+        # Joint-limit cue: same continuous while-condition-holds pattern as the
+        # joystick out-of-deadzone buzz -- no timer, no re-arm state.
+        self.LIMIT_VIB_AMP = 0.009  # Nm
 
         # Sync spring gains, unified across all clutch cells (Kd=0: global damper supplies viscosity).
         # Live-tunable so the spring pair can be swept without a rebuild.
@@ -145,7 +156,7 @@ class HapticForceManagerCB(Node):
         self.GRASP_SYNC_BOOST = 6.0
         self.GRASP_FOLLOW_KP = 15.0    # N/m
         self.GRASP_FOLLOW_KD = 80.0    # Ns/m
-        self.GRASP_VIB_AMP = 0.01  # Nm constant square-wave buzz during the whole grasp
+        self.GRASP_VIB_AMP = 0.009  # Nm constant square-wave buzz during the whole grasp
         self.grasp_vib_toggle = 1.0
         self.K_cbf_force = 1.0
         self.K_cbf_torque = 0.05
@@ -493,44 +504,67 @@ class HapticForceManagerCB(Node):
     # goal_names: comma-joined goal list; goal_probabilities: aligned simplex; user_policy: n_goals x 6 twists.
 
     def compute_F_limit_warning(self):
-        """One-shot 1 s torque burst when a device joint nears a limit; re-armed by a full clutch cycle."""
+        """Buzzes continuously while a device joint is within LIMIT_OUTER of a bound (same pattern as the joystick out-of-deadzone cue)."""
         F_vib = np.zeros(6)
-        now = time.time()
-
-        # Re-arm on a completed clutch cycle (press -> release).
-        if self._vib_clutch_prev and not self.is_clutching:
-            self.limit_vib_armed = True
-        self._vib_clutch_prev = self.is_clutching
 
         # Closest distance to any of the 12 joint bounds.
         dist_to_min = self.joint_pos - self.joint_min
         dist_to_max = self.joint_max - self.joint_pos
         min_margin = float(np.min(np.concatenate([dist_to_min, dist_to_max])))
 
-        # Fire only if armed and not already playing.
-        if (min_margin <= self.LIMIT_OUTER
-                and self.limit_vib_armed
-                and not self.limit_vib_active):
-            self.limit_vib_active = True
-            self.limit_vib_start_time = now
-            self.limit_vib_armed = False
-
-        # The burst always plays its full duration, even if the operator clutches midway.
-        if self.limit_vib_active:
-            if (now - self.limit_vib_start_time) <= self.LIMIT_VIB_DURATION:
-                self.vib_toggle *= -1.0
-                amp = self.LIMIT_VIB_AMP
-                F_vib[3] = amp * self.vib_toggle
-                F_vib[4] = amp * self.vib_toggle
-                F_vib[5] = amp * self.vib_toggle
-            else:
-                self.limit_vib_active = False
+        if min_margin <= self.LIMIT_OUTER:
+            self.vib_toggle *= -1.0
+            amp = self.LIMIT_VIB_AMP
+            F_vib[3] = amp * self.vib_toggle
+            F_vib[4] = amp * self.vib_toggle
+            F_vib[5] = amp * self.vib_toggle
 
         return F_vib
 
     # =========================
     # MAIN LOOP
     # =========================
+    def _compute_clutch_align_torque(self):
+        """Live torque (Haption frame) aligning the handle with the REAL gripper orientation while clutching."""
+        if self.rot_haption is None or self.rot_real is None:
+            return np.zeros(3)
+
+        # Frame-map the ROTVEC, not the matrix: conjugating a rotation by the 180-deg Z map
+        # flips its axis x/y and leaves the angle intact, so the error stays a true rotation
+        # in one frame. Multiplying differently-framed matrices makes the torque non-restorative.
+        # Capture the correspondence on first use: the two frames' zero orientations are unrelated,
+        # so only DELTAS may be mapped between them. Mapping rot_real absolutely would assume
+        # gripper-identity == handle-identity and aim at a constant-offset (wrong) orientation.
+        if self._align_ref_real is None:
+            self._align_ref_real = self.rot_real
+            self._align_ref_haption = self.rot_haption
+            self.get_logger().info(
+                "[CLUTCH ALIGN] Handle<->gripper orientation correspondence captured "
+                "(current handle pose now means 'matched'; tracks gripper deltas from here).")
+
+        # Same two-anchor structure as the joystick home tracking: frame-map the delta's ROTVEC
+        # (axis flips, angle intact), then apply it onto the captured handle reference.
+        delta_triago = (self.rot_real * self._align_ref_real.inv()).as_rotvec()
+        target_rot_haption = R.from_rotvec(_FRAME_FLIP * delta_triago) * self._align_ref_haption
+        err_rotvec = (target_rot_haption * self.rot_haption.inv()).as_rotvec()
+
+        # tanh on the MAGNITUDE (axis preserved exactly, so the torque stays restorative):
+        # proportional for small errors, smoothly saturating instead of hitting the hard clip.
+        self.K_align = float(self.get_parameter('K_align').value)
+        err_norm = float(np.linalg.norm(err_rotvec))
+        if err_norm < 1e-9:
+            return np.zeros(3)
+        tau_mag = self.MAX_ALIGN_TORQUE * np.tanh(self.K_align * err_norm / self.MAX_ALIGN_TORQUE)
+        tau = tau_mag * (err_rotvec / err_norm)
+
+        # Fade out near a device joint limit so the cue never fights the hardware stop.
+        dist_to_min = self.joint_pos - self.joint_min
+        dist_to_max = self.joint_max - self.joint_pos
+        min_margin = float(np.min(np.concatenate([dist_to_min, dist_to_max])))
+        if min_margin < self.CLUTCH_ALIGN_FADE_MARGIN:
+            tau = tau * max(0.0, min_margin / self.CLUTCH_ALIGN_FADE_MARGIN)
+        return tau
+
     def control_loop(self):
         """150 Hz: renders F_sync only (blended-reference tether), applies clutch/grasp handling, publishes."""
         self.Kp_sync = float(self.get_parameter('Kp_sync').value)
@@ -579,39 +613,18 @@ class HapticForceManagerCB(Node):
         if self.DEBUG_ONLY_GUIDE:
             f_total = f_total_normal.copy()
         elif self.is_clutching:
-            # On the press edge: freeze the wrench at 50% (cognitive grounding).
-            if not self.was_clutching_last_frame:
-                self.f_clutch_frozen = f_total_normal / 2.0
+            if self.ENABLE_CLUTCH_ALIGN:
+                # Clutch = free repositioning: no linear force at all, only a live alignment
+                # torque recomputed every tick against the current gripper orientation.
                 self.was_clutching_last_frame = True
-
-            f_total = self.f_clutch_frozen.copy()
-
-            # Alignment torque toward the frozen target orientation (disabled: frame-mixing).
-            if self.ENABLE_CLUTCH_ALIGN and self.rot_haption is not None and self.rot_target is not None:
-
-                # R_error = R_target * R_haption^T.
-                error_rot_matrix = self.rot_target.as_matrix() @ self.rot_haption.as_matrix().T
-                error_rot_vec = R.from_matrix(error_rot_matrix).as_rotvec()
-
-                tau_align_base = self.K_align * error_rot_vec
-
-                # Map to the Haption frame (180-deg Z-flip).
-                tau_align_haption = np.zeros(3)
-                tau_align_haption[0] = -tau_align_base[0]
-                tau_align_haption[1] = -tau_align_base[1]
-                tau_align_haption[2] =  tau_align_base[2]
-
-                # Fade to zero within 0.35 rad of a device joint limit.
-                dist_to_min = self.joint_pos - self.joint_min
-                dist_to_max = self.joint_max - self.joint_pos
-                min_margin = np.min(np.concatenate([dist_to_min, dist_to_max]))
-
-                fade_margin = 0.35
-                if min_margin < fade_margin:
-                    scale = max(0.0, min_margin / fade_margin)
-                    tau_align_haption *= scale
-
-                f_total[3:6] += tau_align_haption
+                f_total = np.zeros(6)
+                f_total[3:6] = self._compute_clutch_align_torque()
+            else:
+                # On the press edge: freeze the wrench at 50% (cognitive grounding).
+                if not self.was_clutching_last_frame:
+                    self.f_clutch_frozen = f_total_normal / 2.0
+                    self.was_clutching_last_frame = True
+                f_total = self.f_clutch_frozen.copy()
 
         else:
             f_total = f_total_normal

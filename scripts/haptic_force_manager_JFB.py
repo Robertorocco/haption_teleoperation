@@ -66,13 +66,14 @@ class HapticForceManagerJFB(Node):
         # Guidance saturation = GUIDE_K x deadzone-exit force; GUIDE_K < 1 makes it a pure
         # bias that can never clear the deadband alone -- the operator always initiates motion.
         self.GUIDE_K = 0.55
-        # Position channel gets an extra 1.2x (+20% position feedback); torque stays at GUIDE_K exactly.
-        self.MAX_GUIDE_FORCE  = self.GUIDE_K * self.KP_LIN * cfg.JOYSTICK_DEADBAND_LIN * 1.2
-        self.MAX_GUIDE_TORQUE = self.GUIDE_K * self.KP_ANG * cfg.JOYSTICK_DEADBAND_ANG
+        # Position: 1.44x (two +20% passes stacked). Orientation: 1.2x (this pass's +20%, its first
+        # boost). Both relative to GUIDE_K's deadzone-exit-force baseline.
+        self.MAX_GUIDE_FORCE  = self.GUIDE_K * self.KP_LIN * cfg.JOYSTICK_DEADBAND_LIN * 1.44
+        self.MAX_GUIDE_TORQUE = self.GUIDE_K * self.KP_ANG * cfg.JOYSTICK_DEADBAND_ANG * 1.2
         # Feed-forward magnitude-shaping gains (policy speed -> force), not velocity feedback:
         # high values push the tanh into saturation at any meaningful policy speed.
-        self.D_guide_lin = 200.0 * 1.2   # N per (m/s), +20% position feedback
-        self.D_guide_ang = 15.0    # Nm per (rad/s)
+        self.D_guide_lin = 200.0 * 1.44   # N per (m/s)
+        self.D_guide_ang = 15.0 * 1.2     # Nm per (rad/s)
         self.alpha_guide = 0.15    # LPF on the guidance wrench (C0 continuity)
         self.f_guide_filtered = np.zeros(6)
         # gain = confidence(b_max) x proximity(ref->goal), unified across all guidance cells.
@@ -82,12 +83,12 @@ class HapticForceManagerJFB(Node):
         self.GUIDE_PROX_FAR  = 0.60  # m: guidance dead at/beyond
 
         # Out-of-deadzone cue: zero-mean buzz whenever a non-zero twist is being commanded.
-        self.VIB_AMP = 0.01     # Nm
+        self.VIB_AMP = 0.009     # Nm
         self.vib_toggle = 1.0         # sign flip every frame -> ~75 Hz square wave
 
         # Autonomous-grasp cue, unified across all 8 cells.
         self.grasp_active = False
-        self.GRASP_VIB_AMP = 0.01    # Nm
+        self.GRASP_VIB_AMP = 0.009    # Nm
         self.grasp_vib_toggle = 1.0
 
         # virtuose/pose is geometry_msgs/Pose (not PoseStamped).
