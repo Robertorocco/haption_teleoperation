@@ -33,7 +33,7 @@ class HapticForceManagerBlending(Node):
 
         # Home pose (Haption base frame), neutral until the teleop broadcasts the live home.
         self.home_pos = np.array(cfg.JOYSTICK_NEUTRAL_POSITION_M, dtype=float)
-        self.home_rot = R.from_quat(cfg.JOYSTICK_NEUTRAL_ORIENTATION_XYZW)  # xyzw
+        self.home_rot = R.from_quat(cfg.JOYSTICK_NEUTRAL_ORIENTATION_XYZW)
 
         self.handle_pos = None
         self.handle_rot = None
@@ -44,10 +44,29 @@ class HapticForceManagerBlending(Node):
         self.KD_LIN = cfg.JOYSTICK_SPRING_KD_LIN
         self.KP_ANG = float(self.declare_parameter('KP_ANG', cfg.JOYSTICK_SPRING_KP_ANG).value)
         self.KD_ANG = cfg.JOYSTICK_SPRING_KD_ANG
-        # Damping is rendered by virtuose_server_node instead: a damper is only passive when the
-        # force is applied in the same tick its velocity was measured, which cannot hold across a
-        # process boundary. Tune it there (ros2 param set /virtuose_server_node damping_lin|_ang).
+        # Damping is rendered in virtuose_server_node: passivity needs same-tick application of
+        # measured velocity, which a process boundary breaks. Tune it there: ros2 param set damping_lin|_ang.
         self.ENABLE_SPRING_DAMPING = False
+
+        # Startup homing parks the handle at neutral before teleop starts, gained softer than
+        # the operating spring since nobody may be gripping yet; critical here: handle offset maps directly to velocity.
+        self.HOME_POS = np.array(cfg.JOYSTICK_NEUTRAL_POSITION_M, dtype=float)
+        self.HOME_ROT = R.from_quat(cfg.JOYSTICK_NEUTRAL_ORIENTATION_XYZW)
+        self.HOMING_KP_LIN = float(self.declare_parameter('K_home_lin', 20.0).value)  # N/m
+        self.HOMING_KP_ANG = float(self.declare_parameter('K_home_ang', 0.5).value)   # Nm/rad
+        # Soft ceilings far under the device clip, approached through a tanh on the magnitude so
+        # the pull never slams when the handle starts on the far side of the workspace.
+        self.MAX_HOMING_FORCE = 2.0    # N
+        self.MAX_HOMING_TORQUE = 0.15  # Nm
+        self.HOMING_FADE_S = 1.0       # whole wrench fades in over this window: t=0 is never a step
+        self.HOMING_TIMEOUT_S = 5.0    # give up rather than leave teleop frozen forever
+        self._homing_t0 = None
+        self.HOMING_TOL_LIN = 0.02   # m
+        self.HOMING_TOL_ANG = 0.10   # rad
+        self.HOMING_SETTLE_TICKS = 30  # 0.2 s held inside tolerance before the phase latches off
+        self._homing_ticks_in_tol = 0
+        # One-shot: latches when homing ends and never re-arms.
+        self._homing_done = False
 
         # Device safety clip and unified authority cap (currently equal).
         self.MAX_FORCE = 5.0
@@ -75,6 +94,8 @@ class HapticForceManagerBlending(Node):
         self.create_subscription(Bool, '/shared_autonomy/grasp_active', self.grasp_active_cb, 10)
 
         self.force_pub = self.create_publisher(Wrench, 'virtuose/force_cmd', 10)
+        # Gates the teleop node's twist output so the homing motion never reaches the robot.
+        self.homing_pub = self.create_publisher(Bool, 'device/homing_active', 10)
 
         # Plot buffers (10 s window at 150 Hz), guarded by a lock shared with the UI thread.
         self.plot_lock = threading.Lock()
@@ -150,6 +171,58 @@ class HapticForceManagerBlending(Node):
         self._last_blend_policy_pct = 100.0 * p_weight / total if total > 1e-9 else 0.0
 
     # ------------------------------------------------------------------ force
+    @staticmethod
+    def _tanh_cap(vec, max_norm):
+        """Saturates a vector's magnitude smoothly, preserving its direction exactly."""
+        n = float(np.linalg.norm(vec))
+        if n < 1e-9:
+            return np.zeros(3)
+        return (max_norm * np.tanh(n / max_norm)) * (vec / n)
+
+    def _compute_homing_wrench(self):
+        """Gentle startup spring to the neutral handle pose: tanh-capped and faded in from zero."""
+        f = np.zeros(6)
+        if self.handle_pos is None or self.handle_rot is None:
+            return f
+
+        now = time.time()
+        if self._homing_t0 is None:
+            self._homing_t0 = now
+        # Fade in so the handle is never grabbed at full strength on the very first tick.
+        fade = min(1.0, (now - self._homing_t0) / self.HOMING_FADE_S)
+
+        # Target is the FIXED neutral, not the live home, which tracks the gripper.
+        err_pos = self.HOME_POS - self.handle_pos
+        err_rotvec = (self.HOME_ROT * self.handle_rot.inv()).as_rotvec()
+        f[0:3] = fade * self._tanh_cap(self.HOMING_KP_LIN * err_pos, self.MAX_HOMING_FORCE)
+        f[3:6] = fade * self._tanh_cap(self.HOMING_KP_ANG * err_rotvec, self.MAX_HOMING_TORQUE)
+
+        # Settle time, not a bare threshold: the handle must hold the pose, not just cross it.
+        lin_err = float(np.linalg.norm(err_pos))
+        ang_err = float(np.linalg.norm(err_rotvec))
+        if lin_err < self.HOMING_TOL_LIN and ang_err < self.HOMING_TOL_ANG:
+            self._homing_ticks_in_tol += 1
+        else:
+            self._homing_ticks_in_tol = 0
+        if self._homing_ticks_in_tol >= self.HOMING_SETTLE_TICKS:
+            self._finish_homing(True)
+        elif now - self._homing_t0 > self.HOMING_TIMEOUT_S:
+            # A soft spring may never overcome friction from the far side; releasing teleop
+            # matters more than reaching the neutral pose exactly.
+            self._finish_homing(False)
+        return f
+
+    def _finish_homing(self, at_neutral):
+        """Latches homing off and hands the handle over to the operating spring."""
+        self._homing_done = True
+        if at_neutral:
+            self.get_logger().info(
+                "[JOYSTICK HOMING] Handle parked at neutral: teleoperation released.")
+        else:
+            self.get_logger().warn(
+                "[JOYSTICK HOMING] Timed out before reaching neutral: releasing teleoperation "
+                "anyway, so the handle starts off-centre and commands a twist immediately.")
+
     def compute_spring(self):
         """Spring-damper wrench (Haption base frame) pulling the handle to the home pose."""
         f = np.zeros(6)
@@ -169,6 +242,25 @@ class HapticForceManagerBlending(Node):
 
     def control_loop(self):
         """150 Hz: renders the homing spring, adds the cues, clips, publishes, buffers."""
+        # Broadcast the homing gate every tick: the teleop node must not turn the handle motion
+        # the homing spring itself is producing into a commanded twist.
+        gate = Bool()
+        gate.data = not self._homing_done
+        self.homing_pub.publish(gate)
+
+        # Startup homing phase: only the parking spring is rendered, nothing else.
+        if not self._homing_done:
+            f_home = self._compute_homing_wrench()
+            f_home[0:3] = np.clip(f_home[0:3], -self.MAX_FORCE, self.MAX_FORCE)
+            f_home[3:6] = np.clip(f_home[3:6], -self.MAX_TORQUE, self.MAX_TORQUE)
+            home_msg = Wrench()
+            home_msg.force.x, home_msg.force.y, home_msg.force.z = (
+                float(f_home[0]), float(f_home[1]), float(f_home[2]))
+            home_msg.torque.x, home_msg.torque.y, home_msg.torque.z = (
+                float(f_home[3]), float(f_home[4]), float(f_home[5]))
+            self.force_pub.publish(home_msg)
+            return
+
         self.KP_LIN = float(self.get_parameter('KP_LIN').value)
         self.KP_ANG = float(self.get_parameter('KP_ANG').value)
         f = self.compute_spring()

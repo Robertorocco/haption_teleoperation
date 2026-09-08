@@ -266,11 +266,9 @@ class WorkspaceVisualizer(Node):
         ax = self.ax5
         ax.cla()
 
-        # 1. Draw TIAGo actual WS (Cyan)
         self._draw_box(ax, TIAGO_MIN, TIAGO_MAX, 'cyan', alpha=0.07, lw=0.8)
 
-        # 2. Draw Haption WS mapped via Bridge Logic (Magenta)
-        # We map the min and max points, then find the new bounding box
+        # Map both corners, then take min/max: the mapping can flip an axis.
         p1 = self.map_haption_to_tiago_bridge(HAPTION_MIN)
         p2 = self.map_haption_to_tiago_bridge(HAPTION_MAX)
         mn_hb = np.minimum(p1, p2)
@@ -279,14 +277,11 @@ class WorkspaceVisualizer(Node):
         self._draw_box(ax, mn_hb, mx_hb, 'magenta', alpha=0.07, lw=1.5)
         ax.scatter(*self.center_tiago_bridge, c='k', s=60, marker='+', zorder=4, label='Bridge Center')
 
-        # 3. Draw actual TIAGo EE (Cyan)
         ax.scatter(*self.tiago_pos, c='cyan', s=140, marker='o', zorder=6, label='TIAGo EE', edgecolors='k', linewidths=0.6)
         
-        # 4. Draw mapped Haption EE (Magenta X)
         h_mapped_bridge = self.map_haption_to_tiago_bridge(self.haption_pos)
         ax.scatter(*h_mapped_bridge, c='magenta', s=140, marker='X', zorder=6, label='Haption EE (Bridge)', edgecolors='k', linewidths=0.6)
 
-        # Distance indicator
         dist_b = np.linalg.norm(self.tiago_pos - h_mapped_bridge)
         mid_b  = (self.tiago_pos + h_mapped_bridge) / 2
         ax.text(*mid_b, f' Δ={dist_b:.3f} m', fontsize=7, color='gray')
@@ -303,17 +298,13 @@ class WorkspaceVisualizer(Node):
         ax = self.ax6
         ax.cla()
 
-        # 1. Draw actual TIAGo orientation (Solid Lines)
         self._draw_pure_rotation(ax, self.tiago_rot, scale=1.0, linestyle='-')
 
-        # 2. Apply Base Flip AND Tool Alignment to Haption
-        # First: Flip the base frame 180 around Z (like in the bridge)
+        # Base-flip (Z by 180, as in the bridge) then tool alignment: order is BaseFlip * HaptionRaw * ToolAlignment.
         R_base_flip = R.from_euler('z', np.pi).as_matrix()
         
-        # Math: BaseFlip * HaptionRaw * ToolAlignment
         haption_fixed_rot = R_base_flip @ self.haption_rot @ self.R_haption_to_tiago_tool
 
-        # 3. Draw mapped Haption orientation (Dashed Lines)
         self._draw_pure_rotation(ax, haption_fixed_rot, scale=0.8, linestyle='--')
 
         ax.set_xlim([-1.2, 1.2])

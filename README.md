@@ -71,6 +71,12 @@ Then pick the teleop + force-manager pair matching the condition set in `triago_
 force manager opens live Matplotlib plot windows by default; add `--ros-args -p plot:=false`
 to skip them entirely (headless runs, or to save CPU during an actual study session).
 
+> **Startup homing.** Whichever force manager you launch parks the handle at its neutral pose
+> first, with a gentle spring (2 N / 0.15 Nm ceiling, faded in over 1 s), and publishes
+> `device/homing_active` while it runs. The teleop node stays frozen until that clears, so every
+> session starts from the same handle configuration and no homing motion reaches the robot. If
+> friction stops the handle short, it gives up after 5 s, warns, and releases teleop anyway.
+
 ### 🕹️ JOYSTICK
 
 ```bash
@@ -119,6 +125,23 @@ ros2 run haption_teleoperation haption_plotter.py       # debug plotting
 The robot side (`main_qp_controller*.py`, `main_shared_autonomy.py`) must run from
 `triago_control`; see that repo's README for the full launch sequence.
 
+## Live tuning
+
+Every parameter below is re-read each tick — sweep it with `ros2 param set <node> <param> <value>`
+while the node runs, no rebuild needed:
+
+| Parameter | Node | Default | Effect |
+|---|---|---|---|
+| `K_home_lin` / `K_home_ang` | any force manager | `20` N/m / `0.5` Nm/rad | startup homing spring, tanh-capped at 2 N / 0.15 Nm |
+| `K_align` | clutch force managers | `0.3` Nm/rad | clutch orientation-alignment torque |
+| `Kp_sync` / `Kp_sync_ang` | clutch force managers | `15` N/m / `0.1` Nm/rad | EE-tracking tether |
+| `KP_LIN` / `KP_ANG` | joystick force managers | `30` N/m / `0.75` Nm/rad | centering spring toward home |
+| `slew_lin` / `slew_ang` | `virtuose_server_node` | `10` N/s / `6` Nm/s | wrench slew-rate limit (`0` disables) |
+| `damping_lin` / `damping_ang` | `virtuose_server_node` | `0.35` Ns/m / `0.025` Nm·s/rad | local viscous damping |
+
+Keep `slew_ang` above ~4.7 Nm/s: the vibration cues toggle every tick, and a slower limit
+attenuates them.
+
 ## Device topics
 
 | Topic | Type | Direction | Content |
@@ -130,3 +153,7 @@ The robot side (`main_qp_controller*.py`, `main_shared_autonomy.py`) must run fr
 | `virtuose/deadman` | `std_msgs/Bool` | out | grip presence sensor (true while held) |
 | `virtuose/articular_position` | `Float64MultiArray` | out | 6 device joint positions (rad) |
 | `virtuose/force_cmd` | `geometry_msgs/Wrench` | in | 6-DOF wrench applied to the handle |
+
+One further topic is internal to this package: `device/homing_active` (`std_msgs/Bool`), published
+by the active force manager and consumed by the teleop node to freeze commands during startup
+homing.

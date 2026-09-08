@@ -24,6 +24,9 @@ matplotlib.use('TkAgg')
 # linear and axial vectors alike (so it may be applied directly to a rotation vector).
 _FRAME_FLIP = np.array([-1.0, -1.0, 1.0])
 
+# TCP approach axis: the gripper's local +X, the convention used across the whole platform.
+_APPROACH_AXIS = np.array([1.0, 0.0, 0.0])
+
 class HapticForceManagerCB(Node):
     # Blending-only force manager: shared autonomy blends the reference, the handle feels only F_sync.
     def __init__(self):
@@ -68,7 +71,7 @@ class HapticForceManagerCB(Node):
         self.GUIDE_PROX_FAR  = 0.60   # m
         self.GUIDE_PROX_NEAR = 0.10   # m
 
-        # Debug: guidance-only mode is meaningless in CB (guidance deleted).
+        # Debug: guidance-only mode is meaningless in CB, which never applies guidance.
         self.DEBUG_ONLY_GUIDE = False
 
         self.GUIDE_CONF_LO   = 0.30
@@ -98,27 +101,50 @@ class HapticForceManagerCB(Node):
         self.is_clutching = False
         self.was_clutching_last_frame = False
         self.f_clutch_frozen = np.zeros(6)
-        # Live-tunable so the align stiffness can be swept without a rebuild. Reference points on
-        # this device: clutch sync angular = 0.1 Nm/rad (live-validated), joystick homing spring
-        # = 0.75 Nm/rad, and Kp_sync_ang = 0.9 was measured UNSTABLE -- so keep well under that.
+        # Live-tunable align stiffness. Reference points: clutch sync=0.1 Nm/rad, joystick
+        # homing=0.75 Nm/rad; this gain is stable only below roughly 0.9 Nm/rad.
         self.K_align = float(self.declare_parameter('K_align', 0.3).value)  # Nm/rad
         # Soft ceiling below the 0.5 Nm device clip: a stiff spring that hard-clips becomes
         # bang-bang (max torque flipping sign across the target), which self-excites.
         self.MAX_ALIGN_TORQUE = 0.35  # Nm
-        # Handle<->gripper orientation correspondence, captured once on the first clutch press and
-        # never re-anchored. CLUTCH teleop integrates orientation incrementally and never stores an
-        # absolute handle<->gripper relation, so the convention has to be pinned down explicitly.
+        # Handle<->gripper orientation correspondence, captured once and never re-anchored: CLUTCH
+        # teleop integrates orientation incrementally, so this anchor is the only absolute reference.
         self._align_ref_real = None
         self._align_ref_haption = None
-        # True: clutch renders zero linear force + a live torque aligning the handle with the
-        # real gripper, so the operator repositions freely while orientation self-aligns.
-        # False: legacy behaviour, the whole wrench frozen at 50% for the press duration.
+        # Handle-local image of the gripper's approach axis, fixed once with the anchor pair.
+        self._align_axis_local = None
+        # True: clutch renders zero linear force plus a live torque aligning the handle with the
+        # gripper. False: the whole wrench is frozen at 50% for the press duration instead.
         self.ENABLE_CLUTCH_ALIGN = True
         self.CLUTCH_ALIGN_FADE_MARGIN = 0.35  # rad: align torque fades out inside this joint-limit margin
+
+        # Gripper delta -> handle delta gain: teleop_triago_clutch integrates the handle twist into
+        # the robot reference through its K_rot, so the inverse map divides by the same factor.
+        self.CLUTCH_ROT_SCALE = 1.0  # must mirror teleop_triago_clutch.K_rot
+        # Startup homing pins the handle at a fixed neutral pose (joystick spring law), making the
+        # handle<->gripper correspondence deterministic; gains are soft since nobody may be holding it yet.
+        self.HOME_POS = np.array(cfg.JOYSTICK_NEUTRAL_POSITION_M, dtype=float)
+        self.HOME_ROT = R.from_quat(cfg.JOYSTICK_NEUTRAL_ORIENTATION_XYZW)  # xyzw
+        self.HOMING_KP_LIN = float(self.declare_parameter('K_home_lin', 20.0).value)  # N/m
+        self.HOMING_KP_ANG = float(self.declare_parameter('K_home_ang', 0.5).value)   # Nm/rad
+        # Soft ceilings far under the device clip, approached through a tanh on the magnitude so
+        # the pull never slams when the handle starts on the far side of the workspace.
+        self.MAX_HOMING_FORCE = 2.0    # N
+        self.MAX_HOMING_TORQUE = 0.15  # Nm
+        self.HOMING_FADE_S = 1.0       # whole wrench fades in over this window: t=0 is never a step
+        self.HOMING_TIMEOUT_S = 5.0    # give up rather than leave teleop frozen forever
+        self._homing_t0 = None
+        self.HOMING_TOL_LIN = 0.02   # m
+        self.HOMING_TOL_ANG = 0.10   # rad
+        self.HOMING_SETTLE_TICKS = 30  # 0.2 s held inside tolerance before the phase latches off
+        self._homing_ticks_in_tol = 0
+        # One-shot: latches when homing ends and never re-arms; skipped when clutch-align is off.
+        self._homing_done = not self.ENABLE_CLUTCH_ALIGN
+        self.pos_haption = None
         self.rot_haption = None
 
 
-        # Legacy virtual-fixture stiffness values (not used).
+        # Virtual-fixture stiffness, unused by the velocity-field guidance.
         self.K_guide_force = 45.0   # N/m
         self.K_guide_torque = 0.15  # Nm/rad
 
@@ -139,9 +165,8 @@ class HapticForceManagerCB(Node):
         self.Kp_sync = float(self.declare_parameter('Kp_sync', 15.0).value)      # N/m
         self.Kd_sync = 0.0
         self.Kp_sync_ang = float(self.declare_parameter('Kp_sync_ang', 0.1).value)  # Nm/rad
-        # Damping is rendered by virtuose_server_node instead: a damper is only passive when
-        # the force is applied in the same tick the velocity was measured, which cannot hold
-        # across a process boundary. Tune it there (ros2 param set damping_lin/damping_ang).
+        # Damping is rendered by virtuose_server_node instead (same-tick passivity can't hold
+        # across a process boundary); tune it there via ros2 param set damping_lin/damping_ang.
         self.ENABLE_GLOBAL_DAMPING = False
 
         # Adaptive sync-share parameters (kept for reference; attenuation is not applied).
@@ -210,6 +235,8 @@ class HapticForceManagerCB(Node):
         self.create_subscription(Float64MultiArray, '/arm_left/cartesian_reference', self.target_cb_left, 10)
 
         self.force_pub = self.create_publisher(Wrench, 'virtuose/force_cmd', 10)
+        # Gates the teleop node's integration so the homing motion never drives the robot.
+        self.homing_pub = self.create_publisher(Bool, 'device/homing_active', 10)
 
         self.dt = 1.0 / 150.0
         self.timer = self.create_timer(self.dt, self.control_loop)
@@ -329,8 +356,10 @@ class HapticForceManagerCB(Node):
         self._last_blend_policy_pct = 100.0 * p_weight / total if total > 1e-9 else 0.0
 
     def haption_pose_cb(self, msg):
-        """Stores the handle orientation (geometry_msgs/Pose) for the clutch alignment torque."""
+        """Stores the handle pose (geometry_msgs/Pose) for the homing spring and alignment torque."""
+        p = msg.position
         q = msg.orientation
+        self.pos_haption = np.array([p.x, p.y, p.z])
         self.rot_haption = R.from_quat([q.x, q.y, q.z, q.w])
 
     def button_cb(self, msg):
@@ -524,32 +553,114 @@ class HapticForceManagerCB(Node):
     # =========================
     # MAIN LOOP
     # =========================
+    @staticmethod
+    def _tanh_cap(vec, max_norm):
+        """Saturates a vector's magnitude smoothly, preserving its direction exactly."""
+        n = float(np.linalg.norm(vec))
+        if n < 1e-9:
+            return np.zeros(3)
+        return (max_norm * np.tanh(n / max_norm)) * (vec / n)
+
+    def _compute_homing_wrench(self):
+        """Gentle startup spring to the neutral handle pose: tanh-capped and faded in from zero."""
+        f = np.zeros(6)
+        if self.pos_haption is None or self.rot_haption is None:
+            return f
+
+        now = time.time()
+        if self._homing_t0 is None:
+            self._homing_t0 = now
+        # Fade in so the handle is never grabbed at full strength on the very first tick.
+        fade = min(1.0, (now - self._homing_t0) / self.HOMING_FADE_S)
+
+        # Home and handle are both in the Haption frame, so no frame mapping is needed.
+        err_pos = self.HOME_POS - self.pos_haption
+        err_rotvec = (self.HOME_ROT * self.rot_haption.inv()).as_rotvec()
+        f[0:3] = fade * self._tanh_cap(self.HOMING_KP_LIN * err_pos, self.MAX_HOMING_FORCE)
+        f[3:6] = fade * self._tanh_cap(self.HOMING_KP_ANG * err_rotvec, self.MAX_HOMING_TORQUE)
+
+        # Settle time, not a bare threshold: the handle must hold the pose, not just cross it.
+        lin_err = float(np.linalg.norm(err_pos))
+        ang_err = float(np.linalg.norm(err_rotvec))
+        if lin_err < self.HOMING_TOL_LIN and ang_err < self.HOMING_TOL_ANG:
+            self._homing_ticks_in_tol += 1
+        else:
+            self._homing_ticks_in_tol = 0
+        if self._homing_ticks_in_tol >= self.HOMING_SETTLE_TICKS:
+            self._finish_homing(True)
+        elif now - self._homing_t0 > self.HOMING_TIMEOUT_S:
+            # A soft spring may never overcome friction from the far side; releasing teleop
+            # matters more than reaching the neutral pose exactly.
+            self._finish_homing(False)
+        return f
+
+    def _finish_homing(self, at_neutral):
+        """Latches homing off and pins the handle<->gripper correspondence at (handle, live gripper)."""
+        self._homing_done = True
+        if self.rot_real is None:
+            self.get_logger().warn(
+                "[CLUTCH HOMING] Homing ended with no EE pose yet: the correspondence "
+                "falls back to capture on the first clutch press.")
+            return
+        self._align_ref_haption = self.HOME_ROT if at_neutral else self.rot_haption
+        self._align_ref_real = self.rot_real
+        self._capture_align_axis()
+        if at_neutral:
+            self.get_logger().info(
+                "[CLUTCH HOMING] Handle parked at neutral: handle<->gripper orientation "
+                "correspondence pinned there, identical every run.")
+        else:
+            self.get_logger().warn(
+                "[CLUTCH HOMING] Timed out before reaching neutral: correspondence pinned at the "
+                "handle's current pose instead, so it is not reproducible across runs.")
+
+    def _capture_align_axis(self):
+        """Handle-local axis matching the gripper's approach axis: only the anchor pair relates the two frames."""
+        self._align_axis_local = self._align_ref_haption.inv().apply(
+            _FRAME_FLIP * self._align_ref_real.apply(_APPROACH_AXIS))
+
+    def _approach_swing_error(self, target_rot_haption):
+        """Shortest rotation aligning the handle's approach axis with the target's, leaving the twist about it free."""
+        n_cur = self.rot_haption.apply(self._align_axis_local)
+        n_tgt = target_rot_haption.apply(self._align_axis_local)
+        axis = np.cross(n_cur, n_tgt)
+        s = float(np.linalg.norm(axis))
+        c = float(np.dot(n_cur, n_tgt))
+        if s < 1e-9:
+            if c > 0.0:
+                return np.zeros(3)
+            # Anti-parallel: the swing axis is degenerate, so fall back to the full error's
+            # component perpendicular to the approach axis.
+            err = (target_rot_haption * self.rot_haption.inv()).as_rotvec()
+            return err - float(np.dot(err, n_cur)) * n_cur
+        # arctan2 keeps the error in radians, so K_align and the tanh ceiling keep their meaning.
+        return (axis / s) * np.arctan2(s, c)
+
     def _compute_clutch_align_torque(self):
         """Live torque (Haption frame) aligning the handle with the REAL gripper orientation while clutching."""
         if self.rot_haption is None or self.rot_real is None:
             return np.zeros(3)
 
-        # Frame-map the ROTVEC, not the matrix: conjugating a rotation by the 180-deg Z map
-        # flips its axis x/y and leaves the angle intact, so the error stays a true rotation
-        # in one frame. Multiplying differently-framed matrices makes the torque non-restorative.
-        # Capture the correspondence on first use: the two frames' zero orientations are unrelated,
-        # so only DELTAS may be mapped between them. Mapping rot_real absolutely would assume
-        # gripper-identity == handle-identity and aim at a constant-offset (wrong) orientation.
+        # Fallback capture (homing normally pins this): only DELTAS carry meaning across the two
+        # frames, since their zero orientations are unrelated and cannot be mapped directly.
         if self._align_ref_real is None:
             self._align_ref_real = self.rot_real
             self._align_ref_haption = self.rot_haption
+            self._capture_align_axis()
             self.get_logger().info(
                 "[CLUTCH ALIGN] Handle<->gripper orientation correspondence captured "
                 "(current handle pose now means 'matched'; tracks gripper deltas from here).")
 
-        # Same two-anchor structure as the joystick home tracking: frame-map the delta's ROTVEC
-        # (axis flips, angle intact), then apply it onto the captured handle reference.
-        delta_triago = (self.rot_real * self._align_ref_real.inv()).as_rotvec()
+        # Frame-map the delta's ROTVEC (angle-preserving under the Z-flip, unlike a matrix product),
+        # then divide by CLUTCH_ROT_SCALE to invert how the teleop integrated the handle twist.
+        delta_triago = ((self.rot_real * self._align_ref_real.inv()).as_rotvec()
+                        / self.CLUTCH_ROT_SCALE)
         target_rot_haption = R.from_rotvec(_FRAME_FLIP * delta_triago) * self._align_ref_haption
-        err_rotvec = (target_rot_haption * self.rot_haption.inv()).as_rotvec()
+        # 5-DOF alignment (task_dim=5 in the QP): only the approach axis is aligned, so roll about
+        # it -- unreachable for the wrist and not worth tracking while clutching -- induces no torque.
+        err_rotvec = self._approach_swing_error(target_rot_haption)
 
-        # tanh on the MAGNITUDE (axis preserved exactly, so the torque stays restorative):
-        # proportional for small errors, smoothly saturating instead of hitting the hard clip.
+        # tanh on the MAGNITUDE keeps the axis exact and saturates smoothly instead of hard-clipping.
         self.K_align = float(self.get_parameter('K_align').value)
         err_norm = float(np.linalg.norm(err_rotvec))
         if err_norm < 1e-9:
@@ -567,6 +678,31 @@ class HapticForceManagerCB(Node):
 
     def control_loop(self):
         """150 Hz: renders F_sync only (blended-reference tether), applies clutch/grasp handling, publishes."""
+        # Broadcast the homing gate every tick: the teleop node must not integrate the handle
+        # motion the homing spring itself is producing.
+        gate = Bool()
+        gate.data = not self._homing_done
+        self.homing_pub.publish(gate)
+
+        # Startup homing phase: only the parking spring is rendered, nothing else.
+        if not self._homing_done:
+            f_home = self._compute_homing_wrench()
+            fn = np.linalg.norm(f_home[0:3])
+            if fn > self.MAX_TOTAL_FORCE:
+                f_home[0:3] *= self.MAX_TOTAL_FORCE / fn
+            tn = np.linalg.norm(f_home[3:6])
+            if tn > self.MAX_TOTAL_TORQUE:
+                f_home[3:6] *= self.MAX_TOTAL_TORQUE / tn
+            f_home[0:3] = np.clip(f_home[0:3], -self.MAX_FORCE, self.MAX_FORCE)
+            f_home[3:6] = np.clip(f_home[3:6], -self.MAX_TORQUE, self.MAX_TORQUE)
+            home_msg = Wrench()
+            home_msg.force.x, home_msg.force.y, home_msg.force.z = (
+                float(f_home[0]), float(f_home[1]), float(f_home[2]))
+            home_msg.torque.x, home_msg.torque.y, home_msg.torque.z = (
+                float(f_home[3]), float(f_home[4]), float(f_home[5]))
+            self.force_pub.publish(home_msg)
+            return
+
         self.Kp_sync = float(self.get_parameter('Kp_sync').value)
         self.Kp_sync_ang = float(self.get_parameter('Kp_sync_ang').value)
         f_sync = self.compute_F_sync()
@@ -582,7 +718,7 @@ class HapticForceManagerCB(Node):
             f_guide_s = np.zeros(6)
             f_fix_s = np.zeros(6)
         elif self.DEBUG_ONLY_GUIDE:
-            # Guidance-only debug path is meaningless in CB (guidance deleted).
+            # Guidance-only debug path is meaningless in CB, which never applies guidance.
             self._grasp_start_pos = None
             f_total_normal = np.zeros(6)
             f_cbf_s = np.zeros(6)
@@ -590,7 +726,7 @@ class HapticForceManagerCB(Node):
             f_fix_s = np.zeros(6)
         else:
             self._grasp_start_pos = None
-            # CB renders only F_sync: guidance and fixture deleted, F_cbf telemetry-only.
+            # CB renders only F_sync: no guidance or fixture forces, F_cbf is telemetry-only.
             # The blended reference from shared autonomy is what the tether targets.
             f_cbf_s = np.zeros(6)
             f_guide_s = np.zeros(6)

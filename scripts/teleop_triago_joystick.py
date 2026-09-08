@@ -42,6 +42,9 @@ class TeleopJoystick(Node):
         # While shared autonomy drives a grasp, twist publishing is suspended (home keeps updating).
         self.grasp_active = False
 
+        # Set while the force manager parks the handle at its neutral pose at startup.
+        self.homing_active = False
+
         self.freq = 150.0
         self.dt = 1.0 / self.freq
         self.task_dim = 6.0
@@ -54,13 +57,8 @@ class TeleopJoystick(Node):
         self.MAX_REF_LEAD_LIN = 0.10   # m    cap on how far the latch may lead the real EE
         self.MAX_REF_LEAD_ANG = 0.35   # rad  same cap for orientation
 
-        # Safety cap on the raw handle-vs-home rotvec, applied BEFORE the deadband in
-        # _compute_user_twist. as_rotvec() always returns the shortest-path angle (norm
-        # in [0, pi]); as the true relative angle crosses pi it flips to the opposite
-        # direction, which would read as a sudden twist reversal at a large deflection.
-        # The commanded twist already saturates (V_MAX_ANG) well below this cap, so it
-        # only bounds worst-case severity if home drifts far from the handle -- it never
-        # changes behavior in the normal operating range.
+        # Bounds the raw rotvec below pi, where as_rotvec's shortest-path angle would flip
+        # direction and read as a sudden reversal; normal operation stays well under it via V_MAX_ANG.
         self.ROT_DELTA_SAFETY_CAP = 1.2  # rad (~69 deg), ~2x the saturation deflection
 
         self.active_arm = 'right'
@@ -69,6 +67,7 @@ class TeleopJoystick(Node):
         self.create_subscription(Twist, 'virtuose/velocity', self.vel_cb, 10)
         self.create_subscription(Float64MultiArray, '/qp_debug/ee_real', self.ee_cb, 10)
         self.create_subscription(Bool, '/shared_autonomy/grasp_active', self.grasp_active_cb, 10)
+        self.create_subscription(Bool, 'device/homing_active', self.homing_cb, 10)
         self.create_subscription(String, '/shared_autonomy/active_arm', self.active_arm_cb, 10)
 
         # Blending on -> publish pure user twist for the blender; blending off -> drive the QP directly.
@@ -119,6 +118,17 @@ class TeleopJoystick(Node):
             self._ref_valid = False
             self.get_logger().info(
                 "[JOYSTICK] Grasp done: teleop resuming (home stayed synced to the gripper).")
+
+    def homing_cb(self, msg):
+        """Tracks the force manager's startup homing phase, logging only on transitions."""
+        if bool(msg.data) != self.homing_active:
+            self.homing_active = bool(msg.data)
+            if self.homing_active:
+                self.get_logger().info(
+                    "[JOYSTICK] Device homing: handle being parked at neutral, teleop frozen.")
+            else:
+                self.get_logger().info(
+                    "[JOYSTICK] Device homed: handle at neutral, teleoperation active.")
 
     def handle_pose_cb(self, msg):
         """Stores the latest handle pose (Haption base frame)."""
@@ -238,6 +248,11 @@ class TeleopJoystick(Node):
         if self.ee_rot is not None:
             self._update_home_orientation()
             self._publish_home_pose()
+
+        # The force manager is parking the handle at neutral: displacement maps to velocity here,
+        # so publishing now would turn the homing motion into a full-speed robot command.
+        if self.homing_active:
+            return
 
         if self.grasp_active:
             return

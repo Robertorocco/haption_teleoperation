@@ -5,6 +5,7 @@
 #include <chrono>
 #include <array>
 #include <algorithm>
+#include <cmath>
 #include "VirtuoseAPI.h"
 
 // ROS 2 Libraries
@@ -18,7 +19,9 @@
 using namespace std;
 using namespace std::chrono_literals;
 
-#define VIRTUOSE_IPADDRESS         ("127.0.0.1#53210")
+// Connects to the LOCAL SvcHaptic bridge daemon, not the device directly: the port after '#'
+// is that daemon's per-unit portToApi, so the IP token here always stays 127.0.0.1.
+#define VIRTUOSE_IPADDRESS         ("127.0.0.1#53211")
 #define VIRTUOSE_FREQUENCY         (150) // Hz
 
 // Driver-level safety bound on the total wrench actually sent to the device.
@@ -45,6 +48,14 @@ public:
         RCLCPP_INFO(this->get_logger(),
             "Local damping: lin=%.4f Ns/m, ang=%.4f Nms/rad (tune with ros2 param set).",
             damping_lin_, damping_ang_);
+
+        slew_lin_ = this->declare_parameter("slew_lin", slew_lin_);
+        slew_ang_ = this->declare_parameter("slew_ang", slew_ang_);
+        RCLCPP_INFO(this->get_logger(),
+            "Command slew limit: lin=%.2f N/s, ang=%.2f Nm/s -> full scale in %.2f s / %.2f s "
+            "(0 disables).", slew_lin_, slew_ang_,
+            slew_lin_ > 0.0 ? MAX_FORCE_N / slew_lin_ : 0.0,
+            slew_ang_ > 0.0 ? MAX_TORQUE_NM / slew_ang_ : 0.0);
 
         if (debug_mode_) RCLCPP_INFO(this->get_logger(), "Setting up ROS 2 topics...");
 
@@ -88,12 +99,18 @@ private:
     // Latest wrench command, applied to the handle every tick.
     float current_force[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
-    // Viscous damping computed here rather than in a force-manager node: a damper is only
-    // passive when the force is applied in the same tick the velocity was measured. Crossing
-    // a process boundary adds a jittery 1-2 tick delay, which renders as discrete tugs
-    // instead of continuous viscosity. Live-tunable via ros2 param set.
+    // Damping is computed here, not in a force-manager node, since a damper is only passive
+    // when applied in the same tick its velocity was measured. Live-tunable via ros2 param set.
     double damping_lin_ = 0.35;   // Ns/m
     double damping_ang_ = 0.025;  // Nms/rad
+
+    // Slew-rate limit on the commanded wrench: every force manager shares current_force, so a mode
+    // switch steps it in one tick; slew_ang floors near 4.7 Nm/s, the vibration cues' own toggle rate.
+    double slew_lin_ = 10.0;      // N/s   -> full 5 N in 0.5 s
+    double slew_ang_ = 6.0;       // Nm/s  -> above the 4.7 Nm/s cue floor
+    // Wrench actually rendered, ramping toward current_force; starts at zero so the first
+    // command after startup fades in rather than stepping.
+    float applied_force_[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
     rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr pose_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr velocity_pub_;
@@ -143,7 +160,8 @@ private:
     int VirtuoseStateInterface(float *pose, float *velocity, int *button_right, int *button_left){
         virtGetPosition(VC, pose);
         virtGetPhysicalSpeed(VC, velocity);
-        // Device button 1 is the left one, 2 the right; topics keep right = clutch, left = grasp trigger.
+        // Device button 1 is physically the left one, 2 the right: read swapped so the topic
+        // contract holds, virtuose/button_right = clutch and button_left = grasp trigger.
         virtGetButton(VC, 1, button_left);
         virtGetButton(VC, 2, button_right);
 
@@ -164,7 +182,21 @@ private:
         return result;
     }
 
-    // Stores the latest commanded wrench; it is applied by the timer loop.
+    // Moves a 3-vector toward its target by at most max_step, limiting the change vector's
+    // magnitude so a transition keeps its direction instead of skewing axis by axis.
+    static void SlewLimit(float *applied, const float *target, float max_step) {
+        float d[3] = {target[0] - applied[0], target[1] - applied[1], target[2] - applied[2]};
+        const float n = std::sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+        if (max_step > 0.0f && n > max_step) {
+            const float k = max_step / n;
+            d[0] *= k; d[1] *= k; d[2] *= k;
+        }
+        applied[0] += d[0];
+        applied[1] += d[1];
+        applied[2] += d[2];
+    }
+
+    // Stores the latest commanded wrench; applied to the device by the timer loop.
     void ForceCallback(const geometry_msgs::msg::Wrench::SharedPtr msg) {
         current_force[0] = msg->force.x;
         current_force[1] = msg->force.y;
@@ -248,10 +280,19 @@ private:
         // tick ends, so no transport delay sits between measurement and reaction.
         this->get_parameter("damping_lin", damping_lin_);
         this->get_parameter("damping_ang", damping_ang_);
+        this->get_parameter("slew_lin", slew_lin_);
+        this->get_parameter("slew_ang", slew_ang_);
+
+        // Limited on the command side only: damping is added afterwards so it keeps reaching
+        // the device in the same tick its velocity was measured.
+        const float dt = 1.0f / (float)VIRTUOSE_FREQUENCY;
+        SlewLimit(&applied_force_[0], &current_force[0], (float)slew_lin_ * dt);
+        SlewLimit(&applied_force_[3], &current_force[3], (float)slew_ang_ * dt);
+
         float total_force[6];
         for (int i = 0; i < 3; i++) {
-            total_force[i]     = current_force[i]     - (float)damping_lin_ * velocity[i];
-            total_force[i + 3] = current_force[i + 3] - (float)damping_ang_ * velocity[i + 3];
+            total_force[i]     = applied_force_[i]     - (float)damping_lin_ * velocity[i];
+            total_force[i + 3] = applied_force_[i + 3] - (float)damping_ang_ * velocity[i + 3];
         }
         for (int i = 0; i < 3; i++) {
             total_force[i]     = std::max(-MAX_FORCE_N,   std::min(MAX_FORCE_N,   total_force[i]));

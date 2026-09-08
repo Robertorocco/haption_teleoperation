@@ -30,20 +30,24 @@ class TeleopClutch(Node):
 
         self.clutch_engaged = False
 
+        # Set while the force manager parks the handle at its neutral pose at startup.
+        self.homing_active = False
+
         # While shared autonomy drives an autonomous grasp, teleop is suspended and re-anchors on resume.
         self.grasp_active = False
 
         self.freq = 150.0  # Hz
         self.dt = 1.0 / self.freq
 
-        self.K_trans = 1.0  # translational scale factor
-        self.K_rot = 1.0    # rotational scale factor
+        self.K_trans = 1.0
+        self.K_rot = 1.0
 
         # 6.0 = full 6D tracking | 5.0 = free rotation about the approach axis.
         self.task_dim = 6.0
 
         self.create_subscription(Twist, 'virtuose/velocity', self.twist_callback, 10)
         self.create_subscription(Bool, 'virtuose/button_right', self.button_callback, 10)
+        self.create_subscription(Bool, 'device/homing_active', self.homing_callback, 10)
 
         # Real EE pose, used once per (re)anchor to start integration from where the robot is.
         self.create_subscription(Float64MultiArray, '/qp_debug/ee_real', self.ee_callback, 10)
@@ -116,6 +120,15 @@ class TeleopClutch(Node):
             else:
                 self.get_logger().info(" CLUTCH RELEASED: Teleoperation tracking resumed.")
 
+    def homing_callback(self, msg):
+        """Tracks the force manager's startup homing phase, logging only on transitions."""
+        if bool(msg.data) != self.homing_active:
+            self.homing_active = bool(msg.data)
+            if self.homing_active:
+                self.get_logger().info(" DEVICE HOMING: handle being parked at neutral, teleop frozen.")
+            else:
+                self.get_logger().info(" DEVICE HOMED: handle at neutral, teleoperation active.")
+
     def grasp_active_callback(self, msg):
         """Suspends teleop during autonomous grasp; re-anchors at the post-grasp pose on resume."""
         if msg.data and not self.grasp_active:
@@ -128,6 +141,11 @@ class TeleopClutch(Node):
 
     def integration_loop(self):
         """150 Hz: integrates the twist into the pose reference and publishes the 13-float protocol."""
+        # The force manager is driving the handle to its neutral pose: integrating that motion
+        # would command it straight to the robot.
+        if self.homing_active:
+            return
+
         # Yield authority while shared autonomy drives the grasp.
         if self.grasp_active:
             return

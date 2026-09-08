@@ -18,7 +18,6 @@ void sig_handler(int) {
 
 int main()
 {
-    // Register the signal handler for Ctrl+C
     signal(SIGINT, sig_handler);
 
     // ====================================> Open Connection
