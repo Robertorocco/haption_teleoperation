@@ -9,7 +9,7 @@ from std_msgs.msg import Float64MultiArray, Bool, String
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-# Cross-package condition selector: single source of truth for the 2x2x2 study cell.
+# Cross-package condition selector: single source of truth for the 2x3 study cell.
 import triago_control.qp_controller.config as cfg
 
 

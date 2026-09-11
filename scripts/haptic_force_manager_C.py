@@ -13,7 +13,7 @@ from collections import deque
 import matplotlib.pyplot as plt
 import matplotlib
 
-# Cross-package condition selector: single source of truth for the 2x2x2 study cell.
+# Cross-package condition selector: single source of truth for the 2x3 study cell.
 import triago_control.qp_controller.config as cfg
 
 # TkAgg keeps Matplotlib off the ROS spin thread.

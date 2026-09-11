@@ -32,7 +32,7 @@ haption_teleoperation/
 180° rotation about Z (negate X and Y, keep Z). The same map carries motion commands
 (device → robot) and rendered forces (robot → device).
 
-## The 2×2×2 study matrix
+## The 2×3 study matrix
 
 The active experiment condition is selected **once**, in `triago_control`'s
 `qp_controller/config.py` (section 1b), by three orthogonal flags:
@@ -42,16 +42,18 @@ The active experiment condition is selected **once**, in `triago_control`'s
 - `ASSIST_BLENDING` — channel B: reference-level user↔policy blending (robot side).
 
 Every teleop and force-manager node validates the selected cell at startup and refuses
-to run on a mismatch. The eight force managers are named `haptic_force_manager_<CELL>`,
-where `<CELL>` = `C`/`J` (mode) + `F` if feedback + `B` if blending:
+to run on a mismatch. Force managers are named `haptic_force_manager_<CELL>`, where
+`<CELL>` = `C`/`J` (mode) + `F` if feedback + `B` if blending. The study itself is 2×3
+(2 modes × 3 assistance combinations `{F, B, FB}` = 6 cells); `C`/`J` (no assistance)
+still work end-to-end but are excluded from the study:
 
 | Cell | Mode | Operator feels |
 |---|---|---|
-| `C`   | clutch   | EE sync tether + cues (baseline) |
+| `C`   | clutch   | EE sync tether + cues (baseline, **not in the study**) |
 | `CF`  | clutch   | tether + guidance bias |
 | `CB`  | clutch   | tether (to the blended reference) |
 | `CFB` | clutch   | tether + guidance bias, reference blended |
-| `J`   | joystick | homing spring + cues (baseline) |
+| `J`   | joystick | homing spring + cues (baseline, **not in the study**) |
 | `JF`  | joystick | spring + guidance bias |
 | `JB`  | joystick | homing spring, reference blended |
 | `JFB` | joystick | spring + guidance bias, reference blended |
