@@ -2,7 +2,7 @@
 
 > **This file is maintained by the AI agent.**
 
-**Branch strategy (from 2026-07-30)**: `virtuose-6d-baseline` is a frozen checkpoint of every value tuned on the physical **Haption Virtuose 6D** (the large desk/floor-mounted device) — diff against it anytime (e.g. `git diff virtuose-6d-baseline -- scripts/teleop_triago_clutch.py`) rather than trusting numbers restated in prose here, which will drift as the retune proceeds. Active development is now shifting to the **Haption Desktop 6D Compact** (smaller workspace, same control API) plus a sim-only human-subject user study, on `main` / `feature/sim-user-study` — device-specific tuning (workspace scaling, deadbands, spring/damping constants, force limits, calibration transforms, range-of-motion assumptions) inherited from the Virtuose 6D should be treated as suspect until re-validated on the Compact, not assumed to transfer. This mirrors the sibling `triago_control` repo's `real-hw` / `feature/sim-user-study` split (checked out in lockstep for the study), but the axis here is the **device model** (Virtuose 6D → Desktop 6D Compact), not real-vs-sim.
+**Official branches** (same names as `triago_control`, checked out in lockstep): `feature/sim-user-study` (mirrored by `main`) holds the study parameters for the **Haption Desktop 6D Compact** and the final thesis version; `real-hw` is the frozen code, values, and logic run on the physical robot with the full-size **Virtuose 6D** (only documentation changes). Diff `real-hw` (e.g. `git diff real-hw -- scripts/teleop_triago_clutch.py`) rather than restating its numbers here. Device-specific tuning inherited from the Virtuose 6D (workspace scaling, deadbands, spring and damping constants, force limits, calibration, range of motion) is suspect on the Compact until re-validated.
 
 ## 0. Maintenance Rules
 
@@ -126,9 +126,9 @@ Haption pose ─┐
 
 ### 3.3 CLUTCH · Sync only — No-Guidance Baseline (`CLUTCH, F=0, B=0`, `haptic_force_manager_C.py`)
 
-A control-condition strategy for the user study: **pure manual teleoperation with NO predictive assistance**. Runs the SAME `teleop_triago_clutch.py` as §3.1 (clutch-indexing to `/arm_*/cartesian_reference`, `ASSIST_BLENDING=False`), but pairs it with a stripped force manager whose only goal-directed wrenches are removed: NO `F_guide`, no `F_fixture`, no `F_cbf`, no adaptive sync-share. It renders `F_sync` with the **unified clutch sync spring** (`Kp_sync=15`, `Kp_sync_ang=0.45`, §3.0), so `main_shared_autonomy`'s guidance topics are irrelevant here.
+A control-condition strategy for the user study: **pure manual teleoperation with NO predictive assistance**. Runs the SAME `teleop_triago_clutch.py` as §3.1 (clutch-indexing to `/arm_*/cartesian_reference`, `ASSIST_BLENDING=False`), but pairs it with a stripped force manager whose only goal-directed wrenches are removed: NO `F_guide`, no `F_fixture`, no `F_cbf`, no adaptive sync-share. It renders `F_sync` with the **unified clutch sync spring** (`Kp_sync=15`, `Kp_sync_ang=0.1`, §3.0), so `main_shared_autonomy`'s guidance topics are irrelevant here.
 
-To stay comparable with the other clutch cells it KEEPS the unified non-guidance features (§3.0): the clutch **orientation-alignment torque** (`K_align=5`, now treated as a sync effect and therefore present here too), the `grasp_active` EE-following wrench (feel the autonomous grasp/lift/abort — active only if the grasp state machine is running), the clutch-freeze (50% on press), the constant global viscous damping (`0.35/0.05`), the `5 N/0.5 Nm` cap = device clip, arm switching, and the 180°-Z frame map.
+To stay comparable with the other clutch cells it KEEPS the unified non-guidance features (§3.0): the clutch **orientation-alignment torque** (`K_align=0.3`, now treated as a sync effect and therefore present here too), the `grasp_active` EE-following wrench (feel the autonomous grasp/lift/abort — active only if the grasp state machine is running), the clutch-hold alignment-torque-only rendering (`ENABLE_CLUTCH_ALIGN=True`), the driver-side global viscous damping (`0.35/0.025`), the `5 N/0.5 Nm` cap = device clip, arm switching, and the 180°-Z frame map.
 
 ### 3.4 CLUTCH · Full guidance (`CLUTCH, F=1, B=1`, `haptic_force_manager_CFB.py`)
 
@@ -256,7 +256,7 @@ Measured on the Desktop 6D Compact. The wrist is not uniformly wider than the pr
 | J5 | -1.023 | +0.880 |
 | J6 | -2.229 | +2.213 |
 
-Vibration warning at `LIMIT_OUTER=0.25 rad` from a limit; maximum at `LIMIT_INNER=0.15 rad`.
+Vibration cue buzzes continuously while a device joint sits within `LIMIT_OUTER=0.10 rad` of a bound (flat 0.009 Nm square wave, no inner threshold).
 
 **Cartesian workspace** (Haption base frame, centre `[0.25, -0.01, 0.00]`, also mirrored in `scripts/workspace_debug_visualizer.py`):
 
@@ -339,13 +339,13 @@ ros2 run haption_teleoperation haption_plotter.py        # debug plotting
 
 ## 13. Git Workflow
 
-- Push directly to `main` (no feature branches / PRs for this repo).
+- Branches as in the header; commit messages are one line, imperative, <72 chars.
 - **After every push**, ALWAYS provide the user with the exact commands to sync their local machine:
 
 ```bash
 cd ~/exchange/ros2-ws/src/haption_teleoperation
 git checkout -- .
-git pull origin main
+git pull origin <branch>
 cd ~/exchange/ros2-ws
 colcon build --packages-select haption_teleoperation
 source install/setup.bash

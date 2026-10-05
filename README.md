@@ -8,8 +8,10 @@ The two packages run together and communicate over live ROS 2 topics.
 
 ## Branches
 
-- **`virtuose-6d-baseline`** — frozen checkpoint of every gain/parameter as tuned on the physical **Haption Virtuose 6D**. Full commit history back to project start is preserved here; never developed on directly. Diff against it to see exactly what a Desktop 6D Compact retune has changed, e.g. `git diff virtuose-6d-baseline -- scripts/teleop_triago_clutch.py`.
-- **`main`** / **`feature/sim-user-study`** — active development: adapting to the new **Haption Desktop 6D Compact** (smaller footprint, same control API) plus simulation-only work for a human-subject user study. Both point to the same commit as `virtuose-6d-baseline`'s tip and diverge from here forward. Checked out in lockstep with `triago_control`'s branch of the same name for the study.
+Two official branches, matching the [`triago_control`](https://github.com/Robertorocco/triago_control) branches of the same name (check out the same branch in both repositories):
+
+- **`feature/sim-user-study`** (mirrored by **`main`**) — the final thesis version: the parameters used in the human-subject study, for the simulation setup with the **Haption Desktop 6D Compact**.
+- **`real-hw`** — the code, values, and logic that ran on the **physical robot** with the full-size **Haption Virtuose 6D**. Frozen: only documentation changes. To see what the Desktop 6D Compact retune changed, e.g. `git diff real-hw -- scripts/teleop_triago_clutch.py`.
 
 ## Architecture
 
