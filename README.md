@@ -1,10 +1,16 @@
 # haption_teleoperation
 
 Operator-side half of the TRIAGo shared-autonomy teleoperation system: it drives a
-**Haption Virtuose 6-DOF** haptic device and renders force feedback, while the sibling
+**Haption Virtuose 6D** haptic device and renders force feedback, while the sibling
 package [`triago_control`](https://github.com/Robertorocco/triago_control) runs the
 QP-CLF-CBF safety controller and the shared-autonomy inference stack on the robot side.
 The two packages run together and communicate over live ROS 2 topics.
+
+## Branches
+
+This is the **`real-hw`** branch: the code, values, and logic that ran on the **physical robot** with the full-size **Haption Virtuose 6D**. It is frozen; only documentation changes here. It matches the [`triago_control`](https://github.com/Robertorocco/triago_control) branch of the same name (check out the same branch in both repositories).
+
+- **`feature/sim-user-study`** (mirrored by **`main`**) — the final thesis version: the study parameters, for the simulation setup with the **Haption Desktop 6D Compact**. To see what that retune changed: `git diff real-hw feature/sim-user-study -- scripts/teleop_triago_clutch.py`.
 
 ## Architecture
 
