@@ -1,10 +1,34 @@
-# haption_teleoperation
+<p align="center">
+  <img src="docs/media/banner.png" alt="Haptic teleoperation for ROS 2 with clutch and joystick mappings" width="100%">
+</p>
 
-Operator-side half of the TRIAGo shared-autonomy teleoperation system: it drives a
-**Haption Desktop 6D Compact** haptic device and renders force feedback, while the sibling
-package [`triago_control`](https://github.com/Robertorocco/triago_control) runs the
-QP-CLF-CBF safety controller and the shared-autonomy inference stack on the robot side.
-The two packages run together and communicate over live ROS 2 topics.
+<h1 align="center">haption_teleoperation</h1>
+
+<p align="center">
+  <b>Turn a 6-DOF haptic device into a ROS 2 teleoperation interface with force feedback.</b><br>
+  The operator-side half of a shared-autonomy stack for the bimanual TRIAGo robot.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/ROS_2-Humble-22314E?logo=ros&logoColor=white" alt="ROS 2 Humble">
+  <img src="https://img.shields.io/badge/C++-ROS_2_node-00599C?logo=cplusplus&logoColor=white" alt="C++">
+  <img src="https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white" alt="Python 3.10">
+  <img src="https://img.shields.io/badge/device-Haption_6D-555555" alt="Haption 6D device">
+</p>
+
+<p align="center">
+  <img src="docs/media/clutch_vs_joystick.gif" alt="Operator using the haptic handle in clutch and joystick mappings, with the simulation on a laptop" width="100%">
+  <br><sub>The two mappings, sped up, with the simulated robot on the laptop.</sub>
+</p>
+
+---
+
+**haption_teleoperation** drives a Haption haptic device at 150 Hz and renders force feedback, while the sibling package [`triago_control`](https://github.com/Robertorocco/triago_control) runs the QP-CLF-CBF safety filter and the shared-autonomy stack on the robot side. The two packages run together over live ROS 2 topics. See the [`triago_control` README](https://github.com/Robertorocco/triago_control#see-it-work) for the robot in action and the user-study results.
+
+- **Clutch mapping:** position control, with a button to reposition the hand.
+- **Joystick mapping:** spring-centred rate control, with no repositioning.
+- **Force rendering:** a base wrench per mapping, an optional guidance force toward the inferred goal, vibrotactile cues, and a slew limit.
+- **One condition selector:** every node checks the active study cell at startup and refuses to run on a mismatch.
 
 ## Branches
 
